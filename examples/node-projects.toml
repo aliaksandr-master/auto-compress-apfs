@@ -1,0 +1,19 @@
+# Example: compress node_modules directories below ~/projects.
+# Keys left out keep their built-in defaults (see config/default.toml).
+
+patterns = ["~/projects/**/node_modules"]
+
+# `node_modules` is in the default exclude list and an exclude always wins over a pattern,
+# so this list is the default one WITHOUT `node_modules`.
+exclude = [
+    ".git",
+    "target",
+    "*.{xz,gz,tgz,zip,zst,bz2,lz4,lzma,txz,tbz2,tbz,whl,jar,xip,parquet,png,jpg,jpeg,7z,rar,dmg,mp4,mov,webp,heic,pkg}",
+    "*.crdownload",
+    "*.part",
+    "*.download",
+]
+
+# `npm install` rewrites packages; stop compressing a file found decompressed again on
+# 3 consecutive run days (it is listed in quarantine.txt next to this config).
+quarantine_after = 3

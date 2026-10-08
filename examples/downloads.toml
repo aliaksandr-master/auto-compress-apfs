@@ -1,0 +1,22 @@
+# Example: compress ~/Downloads.
+# ~/Downloads is a privacy-protected (TCC) folder: the binary needs Full Disk Access (or
+# Downloads access) in System Settings > Privacy & Security; without it the run logs one
+# ERROR naming the binary to allow.
+# Keys left out keep their built-in defaults (see config/default.toml).
+
+patterns = ["~/Downloads"]
+
+# Archives, media and partial downloads are excluded by default; *.iso and *.torrent added.
+exclude = [
+    "node_modules",
+    ".git",
+    "target",
+    "*.{xz,gz,tgz,zip,zst,bz2,lz4,lzma,txz,tbz2,tbz,whl,jar,xip,parquet,png,jpg,jpeg,7z,rar,dmg,mp4,mov,webp,heic,pkg}",
+    "*.crdownload",
+    "*.part",
+    "*.download",
+    "*.{iso,torrent}",
+]
+
+# A download may still be in progress; skip files modified in the last 10 minutes.
+min_age_secs = 600

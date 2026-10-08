@@ -1,0 +1,24 @@
+# Example: compress every Python virtualenv below ~/projects.
+# Copy to ~/.config/auto-compress-apfs/default.toml (or pass --config PATH) and adjust the paths.
+# Keys left out keep their built-in defaults (see config/default.toml).
+
+# A matched directory means every regular file below it, recursively.
+# `**` matches any number of directories, so this finds nested venvs too.
+patterns = ["~/projects/**/.venv", "~/projects/**/venv"]
+
+# Setting `exclude` replaces the default list, so the defaults are repeated here.
+exclude = [
+    "node_modules",
+    ".git",
+    "target",
+    "*.{xz,gz,tgz,zip,zst,bz2,lz4,lzma,txz,tbz2,tbz,whl,jar,xip,parquet,png,jpg,jpeg,7z,rar,dmg,mp4,mov,webp,heic,pkg}",
+    "*.crdownload",
+    "*.part",
+    "*.download",
+]
+
+# Freshly installed packages may still be written to; leave them alone for an hour.
+min_age_secs = 3600
+
+# Note: venvs created by uv share disk blocks with the uv cache (APFS clones); compressing
+# them can grow disk usage until the cache copy is gone. See "Risks and limits" in README.md.

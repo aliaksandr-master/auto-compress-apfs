@@ -1,0 +1,20 @@
+# Example: compress the uv package cache.
+# New venvs that uv clones from a compressed cache get already-compressed files.
+# Caveat: venvs already cloned from the cache stop sharing APFS blocks with it, so disk usage can grow until those venvs are recreated.
+# Keys left out keep their built-in defaults (see config/default.toml).
+
+patterns = ["~/.cache/uv"]
+
+# Setting `exclude` replaces the default list, so the defaults are repeated here.
+exclude = [
+    "node_modules",
+    ".git",
+    "target",
+    "*.{xz,gz,tgz,zip,zst,bz2,lz4,lzma,txz,tbz2,tbz,whl,jar,xip,parquet,png,jpg,jpeg,7z,rar,dmg,mp4,mov,webp,heic,pkg}",
+    "*.crdownload",
+    "*.part",
+    "*.download",
+]
+
+# Keep at least 20 GiB free while compressing (each batch needs room for its copies).
+min_free_bytes = 21474836480

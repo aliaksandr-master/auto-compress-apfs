@@ -1,0 +1,26 @@
+[package]
+name = "auto-compress-apfs"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Turns on APFS transparent compression for files matched by glob patterns, using /usr/bin/ditto"
+license = "Apache-2.0"
+authors = ["Aliaksandr Master <alxe.master@gmail.com>"]
+readme = "README.md"
+keywords = ["apfs", "compression", "macos", "filesystem", "cli"]
+categories = ["command-line-utilities", "filesystem", "compression"]
+repository = "https://github.com/aliaksandr-master/auto-compress-apfs"
+homepage = "https://github.com/aliaksandr-master/auto-compress-apfs"
+include = ["/src", "/config/default.toml", "/README.md", "/CHANGELOG.md", "/LICENSE", "/examples"]
+
+[dependencies]
+globset = "0.4"
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+panic = "abort"
+strip = true

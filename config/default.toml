@@ -1,0 +1,74 @@
+# auto-compress-apfs configuration.
+# Every key is optional; the values below are the built-in defaults.
+# A leading `~` or `~/` in patterns, exclude, allow_volumes and log_dir expands to $HOME.
+
+# Glob patterns of what to compress. `*`, `?`, `[...]` never cross `/`, `**` matches any number
+# of directories, `{a,b}` is an alternation. A matched DIRECTORY means every regular file below
+# it, recursively. Patterns must be absolute after `~` expansion.
+# Empty by default: nothing is compressed until you add patterns here (or pass --search).
+# Example: patterns = ["~/projects/**/.venv", "~/.cache/uv"]; more in examples/ of the source.
+# `~/Downloads` is a privacy-protected (TCC) folder: the binary needs Full Disk Access (or
+# Downloads access) in System Settings > Privacy & Security, otherwise the run logs one ERROR
+# naming the binary to allow. Hypothesis: every rebuild produces a new ad-hoc signature, so
+# macOS may ask for that permission again after it.
+# Other protected folders (~/Desktop, ~/Documents, ~/Pictures, ~/Movies, ~/Music, ~/Library)
+# are never entered unless a pattern's literal prefix lies inside them.
+patterns = []
+
+# Never descended into (directories) or compressed (files), inside matches as well.
+# A pattern without `/` matches an entry NAME at any depth (`*.log`, `node_modules`).
+# A pattern with `/` is a full-path glob (`~/projects/**/big-venv`); `X/**` also excludes X itself.
+# Exclude always wins over a matching pattern. The default list skips already-compressed
+# formats, archives and partial downloads.
+exclude = [
+    "node_modules",
+    ".git",
+    "target",
+    "*.{xz,gz,tgz,zip,zst,bz2,lz4,lzma,txz,tbz2,tbz,whl,jar,xip,parquet,png,jpg,jpeg,7z,rar,dmg,mp4,mov,webp,heic,pkg}",
+    "*.crdownload",
+    "*.part",
+    "*.download",
+]
+
+# Only the internal data volume (the one holding /System/Volumes/Data) is ever walked.
+# Mount points listed here allow further LOCAL apfs volumes; network, cloud and non-apfs
+# filesystems are refused even when listed. /Volumes, ~/Library/CloudStorage,
+# ~/Library/Mobile Documents, /System, /dev, /Network and /net are never walked.
+allow_volumes = []
+
+# A compressed file found decompressed again (rewritten) on this many consecutive run days is
+# added to quarantine.txt next to this config and never compressed again until released by
+# hand. 0 disables the quarantine.
+quarantine_after = 3
+
+# Free space (bytes) that must remain after a ditto call; batches that would go below are
+# skipped. Default 10 GiB.
+min_free_bytes = 10737418240
+
+# Never cross into another mounted filesystem while searching.
+one_file_system = true
+
+# Worker threads for the walk and for ditto batches; 0 = number of CPUs.
+threads = 0
+
+# Maximum number of files per /usr/bin/ditto call.
+batch_size = 1000
+
+# Byte-compare the compressed copy with the original before replacing it.
+verify = true
+
+# Files smaller than this (bytes) are ignored; empty files cannot be compressed.
+min_size = 1
+
+# Files modified less than this many seconds ago are skipped (they may still be written to).
+min_age_secs = 300
+
+# Log directory; the log is <log_dir>/auto-compress-apfs.log.
+log_dir = "~/Library/Logs/auto-compress-apfs"
+
+# Rotate the current log when it would grow beyond this many bytes (>= 65536).
+log_max_bytes = 4194304
+
+# Rotated logs kept (.log.1 .. .log.N, at most 9).
+# log_max_bytes * (log_keep + 1) + 1 MiB must not exceed 10 MiB.
+log_keep = 1
