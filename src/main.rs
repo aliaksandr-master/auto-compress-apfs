@@ -14,7 +14,7 @@ mod state;
 mod sys;
 mod walk;
 
-use classify::{Class, Rules};
+use classify::{Class, DITTO_MAX_SIZE, Rules};
 use compress::{Compressor, Outcome};
 use config::Config;
 use logger::{Level, Logger};
@@ -704,6 +704,7 @@ struct Summary {
     found: u64,
     already_compressed: u64,
     too_small: u64,
+    too_large: u64,
     too_new: u64,
     skipped: u64,
     incompressible: u64,
@@ -928,6 +929,14 @@ fn run(
                 );
             }
             Class::TooSmall => sum.too_small += 1,
+            Class::TooLarge => {
+                sum.too_large += 1;
+                log.debug(format_args!(
+                    "{}: larger than {} MiB (ditto does not compress it), skipped",
+                    c.path.display(),
+                    DITTO_MAX_SIZE >> 20
+                ));
+            }
             Class::TooNew => {
                 sum.too_new += 1;
                 let what = if c.key.mtime_sec > now {
@@ -1035,7 +1044,7 @@ fn run(
     let elapsed = started.elapsed().as_secs_f64();
     log.info(format_args!(
         "summary found={} already_compressed={} to_compress={} compressed={} incompressible={} \
-         too_small={} too_new={} skipped={} errors={} bytes_before={} bytes_after={} \
+         too_small={} too_large={} too_new={} skipped={} errors={} bytes_before={} bytes_after={} \
          ditto_calls={} stale_staging={} quarantined={} requarantined_new={} refused_roots={} \
          dataless={} excluded={} flagged={} skipped_low_space={} dry_run={} elapsed={elapsed:.3}s",
         sum.found,
@@ -1044,6 +1053,7 @@ fn run(
         out.compressed,
         sum.incompressible + out.incompressible,
         sum.too_small,
+        sum.too_large,
         sum.too_new,
         sum.skipped + out.skipped,
         out.errors,

@@ -945,3 +945,61 @@ fn clean_lists_and_removes_leftovers() {
     assert!(log.contains(" dry_run=false"), "{log}");
     assert!(!log.contains(" INFO summary "), "{log}");
 }
+
+#[test]
+fn too_large_for_ditto_is_skipped_and_uncached() {
+    // `DITTO_MAX_SIZE` in src/classify.rs (a bin crate, not importable here).
+    const DITTO_MAX_SIZE: u64 = 512 << 20;
+    let env = Env::new("large", "");
+    let venv = env.base.join("tree/Work_l/.venv");
+    fs::write(
+        &env.config,
+        fs::read_to_string(&env.config).unwrap()
+            + &format!("patterns = [\"{}\"]\nexclude = []\n", venv.display()),
+    )
+    .unwrap();
+    fs::create_dir_all(&venv).unwrap();
+    // Sparse: no real disk use.
+    let big = venv.join("big.bin");
+    fs::File::create(&big)
+        .unwrap()
+        .set_len(DITTO_MAX_SIZE + 1)
+        .unwrap();
+    // A cache entry from earlier runs, when ditto was still tried on it.
+    let m = lstat(&big);
+    fs::create_dir_all(env.cache().parent().unwrap()).unwrap();
+    fs::write(
+        env.cache(),
+        format!(
+            "{}\t{}\t{}\t{}\t{}\n",
+            m.dev(),
+            m.ino(),
+            m.size(),
+            m.mtime(),
+            m.mtime_nsec()
+        ),
+    )
+    .unwrap();
+
+    let s = env.run(&["compress", "--apply", "-v"]);
+    assert_eq!(s["too_large"], "1", "{s:?}");
+    assert_eq!(s["incompressible"], "0", "{s:?}");
+    assert_eq!(s["ditto_calls"], "0", "{s:?}");
+    let now = lstat(&big);
+    assert!(!compressed(&big));
+    assert_eq!((now.ino(), now.size()), (m.ino(), DITTO_MAX_SIZE + 1));
+    let ino = m.ino().to_string();
+    let cache = fs::read_to_string(env.cache()).unwrap();
+    assert!(
+        !cache.lines().any(|l| l.split('\t').nth(1) == Some(&ino)),
+        "{cache}"
+    );
+    assert!(
+        env.log_text().contains(&format!(
+            "{}: larger than 512 MiB (ditto does not compress it), skipped",
+            big.display()
+        )),
+        "{}",
+        env.log_text()
+    );
+}

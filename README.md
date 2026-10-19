@@ -107,8 +107,10 @@ holds the lock exits 0 at once.
      process turns off their materialization (`setiopolicy_np`), so an accidental read fails
      instead of downloading.
 3. **Classify** from the `lstat` data of the walk, without extra syscalls: already compressed,
-   flagged, dataless, too small, hardlinked, owned by another user, setuid/setgid, modified in
-   the last `min_age_secs`, known incompressible (cache), quarantined, or to compress.
+   flagged, dataless, too small, larger than 512 MiB (measured on current macOS: ditto leaves
+   those uncompressed and has no option to change it), hardlinked, owned by another user,
+   setuid/setgid, modified in the last `min_age_secs`, known incompressible (cache), quarantined,
+   or to compress.
 4. **Compress in batches.** Files of one match root (and device) are copied by one
    `ditto --hfsCompression -- <files...> <root>/.acz-staging-<pid>-<n>/` call (up to `batch_size`
    files and 2 GiB of data; basenames unique per batch ignoring case, because APFS volumes are
@@ -262,9 +264,9 @@ ad-hoc signature changes with every rebuild, so macOS may ask again after a rebu
   `YYYY-MM-DDTHH:MM:SS.mmm+HH:MM LEVEL message`. INFO `compressed <path> <size> -> <allocated>` per
   file, ERROR with path and reason per failure, a start line and a `summary` line per run
   (`found`, `already_compressed`, `to_compress`, `compressed`, `incompressible`, `too_small`,
-  `too_new`, `skipped`, `errors`, `bytes_before`, `bytes_after`, `ditto_calls`, `stale_staging`,
-  `quarantined`, `requarantined_new`, `refused_roots`, `dataless`, `excluded`, `flagged`,
-  `skipped_low_space`, `dry_run`, `elapsed`).
+  `too_large`, `too_new`, `skipped`, `errors`, `bytes_before`, `bytes_after`, `ditto_calls`,
+  `stale_staging`, `quarantined`, `requarantined_new`, `refused_roots`, `dataless`, `excluded`,
+  `flagged`, `skipped_low_space`, `dry_run`, `elapsed`).
 - Rotation: at `log_max_bytes` (4 MiB) the log moves to `.log.1` (`log_keep` = 1 rotated file).
   `<log_dir>/launchd.log` (for stdout/stderr redirected there, if any) is emptied at the start of
   every run, preview or `--apply`, once it exceeds 1 MiB; it is the 1 MiB reserve in the bound.
