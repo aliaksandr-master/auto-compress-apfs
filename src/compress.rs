@@ -34,7 +34,7 @@ const MAX_BATCH_DATA: u64 = 2 << 30;
 /// Consecutive failed single-file retries after which the rest of a batch is given up.
 const MAX_RETRY_FAILURES: u32 = 3;
 /// Marker directory inside a staging dir holding a rescued file; stale cleanup keeps such a dir.
-const KEEP_MARKER: &str = ".acz-keep";
+pub(crate) const KEEP_MARKER: &str = ".acz-keep";
 
 /// A file replaced by its compressed copy: the identity and sizes for `state.tsv`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,7 +120,7 @@ enum Commit {
 
 /// Per-worker verify buffers, allocated on first use and reused for every file.
 #[derive(Default)]
-struct Buffers {
+pub(crate) struct Buffers {
     a: Vec<u8>,
     b: Vec<u8>,
 }
@@ -313,7 +313,7 @@ fn read_full(f: &mut File, buf: &mut [u8]) -> io::Result<usize> {
     Ok(n)
 }
 
-enum Verify {
+pub(crate) enum Verify {
     Same,
     Changed,
     Mismatch,
@@ -965,7 +965,7 @@ impl<'a> Compressor<'a> {
 
     /// Swap-back failed: the file that was at the path now sits in staging. Mark the staging
     /// dir with the [`KEEP_MARKER`] directory first (so stale cleanup never removes it), then move it to a
-    /// rescue dir that is never cleaned, walked or removed by this tool.
+    /// rescue dir that `compress` never cleans, walks or removes (only `clean --apply` deletes it).
     fn rescue(&self, c: &Candidate, staged: &Path, err: &io::Error) -> Commit {
         let staging = staged.parent().unwrap_or(Path::new("/"));
         // A directory, so it can never truncate or clobber a user file of that name.
@@ -1030,7 +1030,7 @@ fn metadata_diff(c: &Candidate, sm: &Metadata) -> Option<&'static str> {
 
 /// Opens the original once (no symlink follow), checks it is still the walked inode and
 /// byte-compares it with the staged copy.
-fn verify(c: &Candidate, staged: &Path, bufs: &mut Buffers) -> io::Result<Verify> {
+pub(crate) fn verify(c: &Candidate, staged: &Path, bufs: &mut Buffers) -> io::Result<Verify> {
     let mut orig = match File::options()
         .read(true)
         .custom_flags(O_NOFOLLOW)

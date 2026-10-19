@@ -747,3 +747,201 @@ fn empty_patterns_print_a_hint_and_touch_nothing() {
     assert_eq!(s["to_compress"], "1", "{s:?}");
     assert!(!compressed(&f));
 }
+
+/// Every entry below `dir` with its inode; symlinks are listed, not followed.
+fn snapshot(dir: &Path) -> Vec<(PathBuf, u64)> {
+    let mut out = Vec::new();
+    for e in fs::read_dir(dir).unwrap().flatten() {
+        let p = e.path();
+        out.push((p.clone(), lstat(&p).ino()));
+        if e.file_type().unwrap().is_dir() {
+            out.extend(snapshot(&p));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Sets mtime/atime two days back; APFS lowers the birthtime with them (checked, so a non-APFS
+/// temp dir fails here). The ctime cannot be set back.
+fn backdate(p: &Path) {
+    let past = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 86400);
+    fs::File::open(p)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(past).set_accessed(past))
+        .unwrap();
+    let past = past
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    assert!(lstat(p).st_birthtime() <= past, "{}", p.display());
+}
+
+#[test]
+fn clean_lists_and_removes_leftovers() {
+    let env = Env::new("clean", "");
+    let tree = env.base.join("tree");
+    let venv = tree.join("v/.venv");
+    fs::write(
+        &env.config,
+        fs::read_to_string(&env.config).unwrap()
+            + &format!("patterns = [\"{}\"]\nexclude = []\n", venv.display()),
+    )
+    .unwrap();
+    let put = |p: &Path, data: &[u8]| {
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, data).unwrap();
+    };
+    put(&venv.join("a.txt"), compressible("a").as_bytes());
+    // Fresh staging dir holding a copy: possibly a running compress, never removed.
+    let live = venv.join(".acz-staging-1-2");
+    put(&live.join("a.txt"), compressible("a").as_bytes());
+    // Old empty staging and rescue dirs: removed.
+    let old = venv.join(".acz-staging-1-3");
+    fs::create_dir_all(&old).unwrap();
+    backdate(&old);
+    let old_rescue = venv.join(".acz-rescue-1-6");
+    fs::create_dir_all(&old_rescue).unwrap();
+    backdate(&old_rescue);
+    // Rescue dirs holding files: backdated, but their files' ctime is fresh, so they are inside
+    // the 6h live guard and kept (removal of such a dir is covered by the unit tests).
+    let rescue = venv.join(".acz-rescue-1-4");
+    put(&rescue.join("kept.txt"), b"unique user data");
+    fs::create_dir_all(rescue.join(".acz-keep")).unwrap();
+    let partial = venv.join("sub/.acz-rescue-1-5");
+    put(&partial.join(".BC.T_abc"), b"partial");
+    for p in [
+        rescue.join("kept.txt"),
+        rescue.join(".acz-keep"),
+        partial.join(".BC.T_abc"),
+    ] {
+        backdate(&p);
+    }
+    backdate(&rescue);
+    backdate(&partial);
+    // Never touched: a symlink with a rescue name, names outside the regex, a leftover outside
+    // the patterns, a leftover holding a uchg file.
+    let target = env.base.join("target");
+    put(&target.join("t.txt"), b"target");
+    std::os::unix::fs::symlink(&target, venv.join(".acz-rescue-2-2")).unwrap();
+    fs::create_dir_all(venv.join(".acz-rescue-x")).unwrap();
+    fs::create_dir_all(venv.join(".acz-staging-1-2-3")).unwrap();
+    let outside = tree.join("other/.acz-rescue-3-3");
+    fs::create_dir_all(&outside).unwrap();
+    let locked = venv.join(".acz-rescue-4-4/locked.txt");
+    put(&locked, b"locked");
+    assert!(
+        Command::new("/usr/bin/chflags")
+            .arg("uchg")
+            .arg(&locked)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let before = snapshot(&env.base.join("tree"));
+
+    // 1. Preview: lists, classifies, changes nothing.
+    let out = env.exec(&["clean"], None);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    for want in [
+        &format!("{}   staging, pid 1\n", live.display()),
+        &format!("{}   rescue, pid 1\n", rescue.display()),
+        "  has live copy  1, ",
+        "  no copy found  1, 16 B\n",
+        &format!("    {}\n", rescue.join("kept.txt").display()),
+        "  ditto partial  1, 7 B\n",
+        "  BLOCKED        changed less than 6h ago (last change ",
+        "may belong to a running compress; never removed\n",
+        "flag uchg",
+        "  created        ",
+        "s ago)\n",
+        "d 0h ago)\n",
+        "found 6 leftover dirs (2 staging, 4 rescue)",
+        "Nothing changed. Run 'auto-compress-apfs clean --apply' to delete these 2 dirs",
+    ] {
+        assert!(stdout.contains(want), "{want:?} missing in:\n{stdout}");
+    }
+    assert_eq!(snapshot(&env.base.join("tree")), before);
+    let log = env.log_text();
+    assert!(
+        log.contains(
+            "clean_summary found=6 removed=0 failed=0 blocked=4 freed_bytes=0 dry_run=true"
+        ),
+        "{log}"
+    );
+
+    // 2. A held run lock: --apply exits 1 and removes nothing.
+    let lock_dir = env
+        .home
+        .join("Library/Application Support/auto-compress-apfs");
+    fs::create_dir_all(&lock_dir).unwrap();
+    let lock = fs::File::create(lock_dir.join("run.lock")).unwrap();
+    lock.try_lock().unwrap();
+    let out = env.exec(&["clean", "--apply"], None);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("a run is in progress"));
+    assert_eq!(snapshot(&env.base.join("tree")), before);
+    drop(lock);
+
+    // 3. --apply: removes the unblocked leftovers, exits 1 for the blocked ones, among them a
+    // rescue dir created seconds before.
+    let fresh = venv.join(".acz-rescue-5-5/orig.txt");
+    put(&fresh, b"only original");
+    let out = env.exec(&["clean", "--apply"], None);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    for want in [
+        format!(
+            "auto-compress-apfs: kept {}: blocked: changed less than 6h ago",
+            fresh.parent().unwrap().display()
+        ),
+        format!("auto-compress-apfs: kept {}: blocked: ", rescue.display()),
+        "auto-compress-apfs: exit 1 only because 5 leftover dirs are blocked; nothing failed"
+            .into(),
+    ] {
+        assert!(stderr.contains(&want), "{want:?} missing in:\n{stderr}");
+    }
+    assert_eq!(fs::read(&fresh).unwrap(), b"only original");
+    for gone in [&old, &old_rescue] {
+        assert!(!gone.exists(), "{} not removed", gone.display());
+    }
+    assert_eq!(
+        fs::read(rescue.join("kept.txt")).unwrap(),
+        b"unique user data"
+    );
+    assert!(partial.join(".BC.T_abc").exists());
+    assert_eq!(
+        fs::read(live.join("a.txt")).unwrap(),
+        compressible("a").as_bytes()
+    );
+    assert_eq!(fs::read(&locked).unwrap(), b"locked");
+    assert!(
+        lstat(&venv.join(".acz-rescue-2-2"))
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(fs::read(target.join("t.txt")).unwrap(), b"target");
+    for kept in [
+        venv.join(".acz-rescue-x"),
+        venv.join(".acz-staging-1-2-3"),
+        outside.clone(),
+        venv.join("a.txt"),
+    ] {
+        assert!(kept.exists(), "{} removed", kept.display());
+    }
+    let log = env.log_text();
+    assert!(
+        log.contains(&format!(
+            "INFO clean: removed leftover dir {}",
+            old_rescue.display()
+        )),
+        "{log}"
+    );
+    assert!(
+        log.contains("clean_summary found=7 removed=2 failed=0 blocked=5 "),
+        "{log}"
+    );
+    assert!(log.contains(" dry_run=false"), "{log}");
+    assert!(!log.contains(" INFO summary "), "{log}");
+}

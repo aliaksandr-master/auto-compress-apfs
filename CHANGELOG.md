@@ -6,6 +6,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `clean`: lists the leftover `.acz-staging-*` and `.acz-rescue-*` directories below the
+  configured patterns with their age, size and which files have no copy elsewhere; with
+  `--apply` deletes them under the run lock. Directories holding flagged, dataless or
+  foreign-filesystem entries, and staging or rescue directories changed less than 6 hours ago,
+  are never deleted.
+
 ## [0.2.0] - 2026-10-09
 
 First public release.

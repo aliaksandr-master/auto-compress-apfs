@@ -35,7 +35,7 @@ fn saved(orig: u64, disk: u64) -> String {
 }
 
 /// `YYYY-MM-DD HH:MM` local time, `-` when unknown.
-fn when(secs: i64) -> String {
+pub(crate) fn when(secs: i64) -> String {
     match (secs > 0).then(|| sys::local_time(secs)).flatten() {
         Some(t) => format!(
             "{:04}-{:02}-{:02} {:02}:{:02}",

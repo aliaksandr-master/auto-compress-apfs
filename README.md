@@ -154,6 +154,7 @@ auto-compress-apfs [compress] [OPTIONS]    preview (default); with --apply: comp
 auto-compress-apfs stat [--top N] [--all] [--config PATH]
 auto-compress-apfs quarantine list [--config PATH]
 auto-compress-apfs quarantine clear <PATH>|--all [--config PATH]
+auto-compress-apfs clean [--apply] [--config PATH]
 auto-compress-apfs -h|--help | -V|--version
 ```
 
@@ -195,6 +196,33 @@ auto-compress-apfs -h|--help | -V|--version
   160), and the quarantine.
 - `quarantine list` prints the quarantine; `quarantine clear <PATH>|--all` releases entries and
   resets their streak (takes the run lock; exits 1 while a run holds it).
+- `clean` lists the leftover `.acz-staging-<pid>-<n>` and `.acz-rescue-<pid>-<n>` directories the
+  walk of the config's patterns finds (same guard and excludes as `compress`): per directory its
+  kind and pid, when it was created, last modified and last written (how long ago), the mtime range
+  of its files (copies keep the original's mtime), file count, logical and on-disk size, and its
+  regular files classified as ditto partial files (`.BC.T_*`), files with a same-named,
+  byte-identical live file below the directory's parent (`has live copy`), and files with no copy
+  found, which are listed by path; symlinks and special files are listed on a line of their own,
+  directories are not counted. The classification is informational and compares at most 4 GiB of
+  leftover data per run (8 compares per file); past that a directory is marked `INCOMPLETE`. The
+  preview changes nothing (it takes no lock and writes only the log, and the config when missing)
+  and ends with the exact command:
+  `Nothing changed. Run 'auto-compress-apfs clean --apply' to delete these N dirs ...`.
+  `clean --apply` takes the run lock before the walk (exits 1 while a run holds it) and deletes
+  every listed directory that is not blocked, files without a copy included. A directory is
+  blocked (listed with the reason, never deleted) when anything in it carries `uchg`, `uappnd`,
+  `schg`, `sappnd`, `restricted` or is dataless, lies on another filesystem than its parent or
+  cannot be read, and when it or anything in it changed less than 6 hours ago, staging and rescue
+  dirs alike (it may belong to a `compress` run of another `HOME`, whose lock `clean` does not
+  see, and may hold the only copy of a file). Right before each delete the name must still match
+  the exact pattern and the path must still be the same directory (not a symlink, same device and
+  inode) on its parent's filesystem; a directory swapped in between that check and the delete
+  would be deleted instead (a symlink at the leftover's own path is never followed). Each
+  delete is an INFO line `clean: removed leftover dir ...`; the run ends with
+  `clean_summary found= removed= failed= blocked= freed_bytes= dry_run=`. Every directory left
+  in place is printed to stderr with its reason. Exit code of `clean --apply`: 1 when a directory
+  was blocked or could not be (fully) removed (stderr says when it is only because of blocked
+  ones), else 0.
 
 Exit code 0 when the run finished (per-file errors are logged, not fatal) and when another run holds
 the lock; 1 on a fatal error (bad config, log cannot be opened, unreadable `quarantine.txt`, or
@@ -302,9 +330,10 @@ quarantine after three run days.
   Spotlight reindexes them. Hypothesis, not verified: the `com.apple.macl` attribute may not
   survive the copy, so per-file app grants on files in `~/Downloads` may be lost.
 - **Rescue dirs.** `.acz-rescue-<pid>-<n>/` directories hold files the tool did not dare to
-  delete. The tool never walks, compresses or removes them, so they stay until a human removes
-  them: read the ERROR/WARN lines that name them, restore what you need, then delete the dir by
-  hand. One can hold up to a whole batch of copies (up to 2 GiB). They appear when
+  delete. `compress` never walks, compresses or removes them, so they stay until a human removes
+  them: read the ERROR/WARN lines that name them (or run `clean`, which lists them with the files
+  that have no copy elsewhere), restore what you need, then delete the dir by hand or with
+  `clean --apply`. One can hold up to a whole batch of copies (up to 2 GiB). They appear when
   - a swap could not be reversed after a detected race (practically never); the staging dir is
     first marked with an `.acz-keep` directory and then renamed; if that rename fails it keeps its
     `.acz-staging-*` name and stale cleanup leaves it alone (WARN `kept rescue staging dir`);
@@ -313,6 +342,10 @@ quarantine after three run days.
     deleting it.
 - Leftover `.acz-staging-<pid>-<n>` directories holding only compressed copies (a crash mid-run)
   are removed by the next run.
+- `clean` only finds leftovers in directories the walk of the current patterns reads. Not listed
+  (remove those by hand): a leftover in a directory no longer walked (patterns changed, excluded
+  since), and one next to a pattern without glob characters that names a single file (that file
+  is a walk root, its directory is never listed).
 - Residual limitation: if the process dies in the microsecond window between a swap and its
   post-check, AND the original had been replaced concurrently by an inode that is itself already
   compressed, the swapped-out file in staging looks exactly like a staged copy, and the next run's

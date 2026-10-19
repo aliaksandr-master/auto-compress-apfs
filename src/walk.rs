@@ -407,9 +407,9 @@ impl Guard {
     }
 }
 
-/// True for names produced by this tool for staging dirs: `^\.acz-staging-\d+-\d+$`.
-pub fn is_stale_staging_name(name: &[u8]) -> bool {
-    let Some(rest) = name.strip_prefix(STAGING_PREFIX.as_bytes()) else {
+/// True for `name` = `prefix` followed by `\d+-\d+` and nothing else.
+fn is_tool_dir_name(name: &[u8], prefix: &str) -> bool {
+    let Some(rest) = name.strip_prefix(prefix.as_bytes()) else {
         return false;
     };
     let digits = |s: &[u8]| !s.is_empty() && s.iter().all(u8::is_ascii_digit);
@@ -417,6 +417,16 @@ pub fn is_stale_staging_name(name: &[u8]) -> bool {
         Some(i) => digits(&rest[..i]) && digits(&rest[i + 1..]),
         None => false,
     }
+}
+
+/// True for names produced by this tool for staging dirs: `^\.acz-staging-\d+-\d+$`.
+pub fn is_stale_staging_name(name: &[u8]) -> bool {
+    is_tool_dir_name(name, STAGING_PREFIX)
+}
+
+/// True for names produced by this tool for rescue dirs: `^\.acz-rescue-\d+-\d+$`.
+pub fn is_rescue_name(name: &[u8]) -> bool {
+    is_tool_dir_name(name, RESCUE_PREFIX)
 }
 
 #[derive(Clone)]
@@ -478,6 +488,8 @@ pub struct WalkResult {
     pub candidates: Vec<Candidate>,
     /// Leftover staging dirs of crashed runs.
     pub stale_staging: Vec<PathBuf>,
+    /// Rescue dirs (exact name regex); never entered, only listed for `clean`.
+    pub rescue_dirs: Vec<PathBuf>,
     /// Tracked directories (parents of state rows) whose listing was read to the end without an
     /// error: state rows in them that this walk did not find are gone.
     pub read_dirs: HashSet<PathBuf>,
@@ -561,6 +573,9 @@ impl Walker<'_> {
                 continue;
             }
             if name.starts_with(RESCUE_PREFIX.as_bytes()) {
+                if ft.is_dir() && is_rescue_name(name) {
+                    out.rescue_dirs.push(entry.path());
+                }
                 continue;
             }
             let path = entry.path();
@@ -911,6 +926,7 @@ fn walk_with_fault(
     for part in parts {
         result.candidates.extend(part.candidates);
         result.stale_staging.extend(part.stale_staging);
+        result.rescue_dirs.extend(part.rescue_dirs);
         result.read_dirs.extend(part.read_dirs);
         result.excluded += part.excluded;
         result.dataless += part.dataless;
@@ -925,6 +941,8 @@ fn walk_with_fault(
         .sort_unstable_by(|a, b| a.path.cmp(&b.path));
     result.stale_staging.sort_unstable();
     result.stale_staging.dedup();
+    result.rescue_dirs.sort_unstable();
+    result.rescue_dirs.dedup();
     result
 }
 
@@ -986,6 +1004,23 @@ mod tests {
             "x.acz-staging-1-2",
         ] {
             assert!(!is_stale_staging_name(bad.as_bytes()), "{bad}");
+        }
+    }
+
+    #[test]
+    fn rescue_name_regex() {
+        assert!(is_rescue_name(b".acz-rescue-123-0"));
+        assert!(is_rescue_name(b".acz-rescue-99999999999999999999999-1"));
+        for bad in [
+            ".acz-rescue-",
+            ".acz-rescue-1",
+            ".acz-rescue-1-",
+            ".acz-rescue-x",
+            ".acz-rescue-1-2-3",
+            ".acz-staging-1-2",
+            "x.acz-rescue-1-2",
+        ] {
+            assert!(!is_rescue_name(bad.as_bytes()), "{bad}");
         }
     }
 
@@ -1310,6 +1345,29 @@ mod tests {
         assert!(r.read_dirs.contains(&t.dir.join("export/sub")));
         let log = t.log_text();
         assert!(!log.contains(" WARN "), "{log}");
+    }
+
+    #[test]
+    fn rescue_dirs_are_listed_not_entered() {
+        let t = Tree::new("rescue");
+        t.file("v/.venv/a.py");
+        t.file("v/.venv/.acz-rescue-1-2/kept.py");
+        t.file("v/.venv/sub/.acz-rescue-3-4/deep.py");
+        t.file("v/.venv/.acz-rescue-x/other.py");
+        t.file("v/.venv/.acz-staging-5-6/staged.py");
+        t.file("v/.venv/.acz-rescue-7-8");
+        let target = t.mkdir("elsewhere");
+        std::os::unix::fs::symlink(&target, t.dir.join("v/.venv/.acz-rescue-9-9")).unwrap();
+        let r = t.walk(&[t.pat("v/.venv")], &[], None, &accept_all(&t.dir));
+        assert_eq!(t.found(&r), ["v/.venv/a.py"]);
+        assert_eq!(
+            r.rescue_dirs,
+            [
+                t.dir.join("v/.venv/.acz-rescue-1-2"),
+                t.dir.join("v/.venv/sub/.acz-rescue-3-4")
+            ]
+        );
+        assert_eq!(r.stale_staging, [t.dir.join("v/.venv/.acz-staging-5-6")]);
     }
 
     #[test]

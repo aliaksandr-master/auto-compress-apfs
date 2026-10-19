@@ -3,6 +3,7 @@
 
 mod cache;
 mod classify;
+mod clean;
 mod compress;
 mod config;
 mod logger;
@@ -42,6 +43,7 @@ Usage:
   auto-compress-apfs stat [--top N] [--all] [--config PATH]
   auto-compress-apfs quarantine list [--config PATH]
   auto-compress-apfs quarantine clear <PATH>|--all [--config PATH]
+  auto-compress-apfs clean [--apply] [--config PATH]
   auto-compress-apfs -h|--help | -V|--version
 
 Turns on APFS transparent compression (ditto --hfsCompression) for files matched by the
@@ -63,7 +65,11 @@ compress options:
 
 stat options:
   --top N                    rows to list (default 30)
-  --all                      list every row";
+  --all                      list every row
+
+clean options:
+  --apply                    delete the listed leftover dirs that are not blocked
+                             (default: preview only, nothing is changed)";
 
 /// Options of `compress` (also the default command).
 #[derive(Debug, Default)]
@@ -89,6 +95,12 @@ struct StatArgs {
 }
 
 #[derive(Debug)]
+struct CleanArgs {
+    config: Option<PathBuf>,
+    apply: bool,
+}
+
+#[derive(Debug)]
 enum QuarantineCmd {
     List,
     /// `None` releases every entry.
@@ -99,6 +111,7 @@ enum QuarantineCmd {
 enum Cli {
     Compress(CompressArgs),
     Stat(StatArgs),
+    Clean(CleanArgs),
     Quarantine {
         config: Option<PathBuf>,
         cmd: QuarantineCmd,
@@ -236,6 +249,26 @@ fn parse_stat(mut it: impl Iterator<Item = String>) -> Result<Cli, String> {
     Ok(Cli::Stat(a))
 }
 
+fn parse_clean(mut it: impl Iterator<Item = String>) -> Result<Cli, String> {
+    let mut a = CleanArgs {
+        config: None,
+        apply: false,
+    };
+    while let Some(arg) = it.next() {
+        if let Some(exit) = help_or_version(&arg) {
+            return Ok(exit);
+        }
+        if config_opt(&arg, &mut it, &mut a.config)? {
+            continue;
+        }
+        match arg.as_str() {
+            "--apply" => a.apply = true,
+            other => return Err(format!("unknown argument `{other}`")),
+        }
+    }
+    Ok(Cli::Clean(a))
+}
+
 fn parse_quarantine(mut it: impl Iterator<Item = String>) -> Result<Cli, String> {
     let mut config = None;
     let mut words = Vec::new();
@@ -271,6 +304,7 @@ fn parse_args(it: impl Iterator<Item = String>) -> Result<Cli, String> {
     match it.peek().map(String::as_str) {
         Some("compress") => parse_compress(it.skip(1)),
         Some("stat") => parse_stat(it.skip(1)),
+        Some("clean") => parse_clean(it.skip(1)),
         Some("quarantine") => parse_quarantine(it.skip(1)),
         _ => parse_compress(it),
     }
@@ -293,6 +327,7 @@ fn main() -> ExitCode {
     let result = match cli {
         Cli::Compress(args) => return cmd_compress(&args, &home),
         Cli::Stat(args) => cmd_stat(&args, &home),
+        Cli::Clean(args) => return cmd_clean(&args, &home),
         Cli::Quarantine { config, cmd } => cmd_quarantine(config, &cmd, &home),
         Cli::Exit(code) => return code,
     };
@@ -474,6 +509,156 @@ fn cmd_compress(args: &CompressArgs, home: &Path) -> ExitCode {
     };
     log.flush();
     code
+}
+
+/// `clean`: lists the leftover staging and rescue dirs found under the config's patterns; with
+/// `--apply` deletes them (see [`clean`]). Exit 1 when the lock is busy, or with `--apply` when a
+/// dir was blocked or could not be removed.
+fn cmd_clean(args: &CleanArgs, home: &Path) -> ExitCode {
+    let config_path = config_path(args.config.as_ref(), home);
+    let (cfg, created) = match Config::load_or_create(&config_path, home) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{NAME}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Leftovers are only looked for below the patterns.
+    if cfg.patterns.is_empty() {
+        if created {
+            println!("created {}", config_path.display());
+        }
+        println!(
+            "no search patterns: add `patterns` to {}",
+            config_path.display()
+        );
+        return ExitCode::SUCCESS;
+    }
+    let log_dir = cfg.log_dir();
+    let log = match Logger::open(&log_dir, cfg.log_max_bytes, cfg.log_keep, false) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("{NAME}: cannot open log in {}: {e}", log_dir.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let code = match run_clean(args, &cfg, &config_path, created, home, &log) {
+        Ok(code) => code,
+        Err(e) => {
+            log.error(&e);
+            eprintln!("{NAME}: {e}");
+            ExitCode::FAILURE
+        }
+    };
+    log.flush();
+    code
+}
+
+fn run_clean(
+    args: &CleanArgs,
+    cfg: &Config,
+    config_path: &Path,
+    created: bool,
+    home: &Path,
+    log: &Logger,
+) -> Result<ExitCode, String> {
+    log.info(format_args!(
+        "start {NAME} {VERSION} clean config={} dry_run={}",
+        config_path.display(),
+        !args.apply
+    ));
+    if created {
+        log.info(format_args!(
+            "created default config {}",
+            config_path.display()
+        ));
+    }
+    if let Err(e) = sys::disable_dataless_materialization() {
+        log.warn(format_args!(
+            "cannot turn off materialization of dataless files: {e}"
+        ));
+    }
+    // Held across walk, scan and delete; the preview neither takes nor needs it.
+    let _lock = if args.apply {
+        match acquire_lock(&state_dir(home))? {
+            Some(f) => Some(f),
+            None => {
+                log.info("another run in progress, exiting");
+                eprintln!("{NAME}: a run is in progress, try again when it has finished");
+                return Ok(ExitCode::FAILURE);
+            }
+        }
+    } else {
+        None
+    };
+    let guard = walk::Guard::new(home, &cfg.allow_volumes, log)?;
+    let matcher = walk::Matcher::new(&cfg.patterns, &cfg.exclude, None)?;
+    let walked = walk::walk(
+        &matcher,
+        &guard,
+        cfg.one_file_system,
+        cfg.worker_threads(),
+        log,
+        None,
+    );
+    let staging = walked
+        .stale_staging
+        .iter()
+        .map(|p| (p, clean::Kind::Staging));
+    let rescue = walked.rescue_dirs.iter().map(|p| (p, clean::Kind::Rescue));
+    let mut leftovers: Vec<clean::Leftover> = staging
+        .chain(rescue)
+        .filter_map(|(p, kind)| clean::scan(p, kind, log))
+        .collect();
+    leftovers.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+    clean::classify(&mut leftovers, &walked.candidates);
+    drop(walked);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    clean::block_live(&mut leftovers, now);
+    let blocked = leftovers.iter().filter(|l| l.blocked.is_some()).count();
+    let removal = if args.apply {
+        let r = clean::remove(&leftovers, log);
+        println!(
+            "removed {} leftover dirs ({} freed), {} failed, {} blocked",
+            r.removed,
+            human(r.freed),
+            r.failed,
+            blocked
+        );
+        for (path, why) in &r.kept {
+            eprintln!("{NAME}: kept {}: {why}", path.display());
+        }
+        if r.failed == 0 && blocked > 0 {
+            eprintln!(
+                "{NAME}: exit 1 only because {blocked} leftover dirs are blocked; nothing failed"
+            );
+        }
+        r
+    } else {
+        let extra: String = args
+            .config
+            .iter()
+            .map(|p| format!(" --config {}", shell_quote(&p.display().to_string())))
+            .collect();
+        let cmd = format!("{NAME} clean --apply{extra}");
+        print!("{}", clean::render(&leftovers, home, now, &cmd));
+        clean::Removal::default()
+    };
+    log.info(format_args!(
+        "clean_summary found={} removed={} failed={} blocked={blocked} freed_bytes={} dry_run={}",
+        leftovers.len(),
+        removal.removed,
+        removal.failed,
+        removal.freed,
+        !args.apply
+    ));
+    Ok(if args.apply && (removal.failed > 0 || blocked > 0) {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    })
 }
 
 /// The run's patterns and excludes: config + CLI, or only CLI with `--ignore-global-search`.
@@ -1051,6 +1236,22 @@ mod tests {
         };
         assert_eq!(a.top, None);
         assert!(parse(&["stat", "--top", "x"]).is_err());
+        let Ok(Cli::Clean(a)) = parse(&["clean"]) else {
+            panic!()
+        };
+        assert!(!a.apply && a.config.is_none());
+        let Ok(Cli::Clean(a)) = parse(&["clean", "--config=/c.toml", "--apply"]) else {
+            panic!()
+        };
+        assert!(a.apply);
+        assert_eq!(a.config.as_deref(), Some(Path::new("/c.toml")));
+        for bad in [
+            &["clean", "--dir", "/x"][..],
+            &["clean", "x"],
+            &["clean", "--config"],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
         let ok = |args: &[&str]| matches!(parse(args), Ok(Cli::Quarantine { .. }));
         assert!(ok(&["quarantine", "list"]));
         assert!(ok(&["quarantine", "clear", "--all"]));
