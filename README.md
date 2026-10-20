@@ -227,8 +227,9 @@ auto-compress-apfs -h|--help | -V|--version
   ones), else 0.
 
 Exit code 0 when the run finished (per-file errors are logged, not fatal) and when another run holds
-the lock; 1 on a fatal error (bad config, log cannot be opened, unreadable `quarantine.txt`, or
-with `--apply` an unreadable `state.tsv`, ...).
+the lock (then `a run is in progress, exiting` goes to stderr and the log); 1 on a fatal error
+(bad config, log cannot be opened, unreadable `quarantine.txt`, or with `--apply` an unreadable
+`state.tsv`, ...).
 
 ## Configuration
 

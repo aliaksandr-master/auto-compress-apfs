@@ -882,6 +882,11 @@ fn clean_lists_and_removes_leftovers() {
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("a run is in progress"));
     assert_eq!(snapshot(&env.base.join("tree")), before);
+    // compress --apply keeps exit 0 for a busy lock (launchd) but says so on stderr.
+    let out = env.exec(&["compress", "--apply"], None);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("a run is in progress, exiting"));
+    assert_eq!(snapshot(&env.base.join("tree")), before);
     drop(lock);
 
     // 3. --apply: removes the unblocked leftovers, exits 1 for the blocked ones, among them a

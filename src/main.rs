@@ -779,6 +779,7 @@ fn run(
             Some(f) => Some(f),
             None => {
                 log.info("another run in progress, exiting");
+                eprintln!("{NAME}: a run is in progress, exiting (see the log for its progress)");
                 return Ok(());
             }
         }
