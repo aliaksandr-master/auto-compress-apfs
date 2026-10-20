@@ -6,6 +6,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-20
+
 ### Added
 
 - `clean`: lists the leftover `.acz-staging-*` and `.acz-rescue-*` directories below the
@@ -13,6 +15,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `--apply` deletes them under the run lock. Directories holding flagged, dataless or
   foreign-filesystem entries, and staging or rescue directories changed less than 6 hours ago,
   are never deleted.
+
+### Changed
+
+- Files larger than 512 MiB are skipped before ditto and counted as `too_large` in the summary
+  line: measured on current macOS, `ditto --hfsCompression` leaves them uncompressed. They no
+  longer cost a full staged copy on every first run and are no longer kept in the
+  incompressible cache.
+- `compress --apply` started while another run holds the lock prints
+  `a run is in progress, exiting` to stderr (exit code still 0).
 
 ## [0.2.0] - 2026-10-09
 
@@ -35,5 +46,6 @@ First public release.
 - Archives and other already-compressed formats are excluded by default.
 - Example configs in `examples/`.
 
-[Unreleased]: https://github.com/aliaksandr-master/auto-compress-apfs/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/aliaksandr-master/auto-compress-apfs/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/aliaksandr-master/auto-compress-apfs/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/aliaksandr-master/auto-compress-apfs/releases/tag/v0.2.0
