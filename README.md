@@ -107,8 +107,10 @@ holds the lock exits 0 at once.
      process turns off their materialization (`setiopolicy_np`), so an accidental read fails
      instead of downloading.
 3. **Classify** from the `lstat` data of the walk, without extra syscalls: already compressed,
-   flagged, dataless, too small, larger than 512 MiB (measured on current macOS: ditto leaves
-   those uncompressed and has no option to change it), hardlinked, owned by another user,
+   flagged, dataless, too small, larger than 512 MiB (measured on current macOS: ditto compresses
+   a file of exactly 512 MiB and leaves anything larger uncompressed; neither its options nor the
+   private Bom.framework copier options behind it, including AppleFSCompression's
+   `kAFSCAllowLargeResourceForks`, lift the limit), hardlinked, owned by another user,
    setuid/setgid, modified in the last `min_age_secs`, known incompressible (cache), quarantined,
    or to compress.
 4. **Compress in batches.** Files of one match root (and device) are copied by one
