@@ -23,4 +23,6 @@ lto = "fat"
 codegen-units = 1
 opt-level = 3
 panic = "abort"
-strip = true
+# Not stripped: an endpoint security agent (static scan) quarantined the stripped release binary
+# right after the build, while the same build with its symbol table kept was left alone.
+strip = false

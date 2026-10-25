@@ -16,6 +16,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- The release binary keeps its symbol table (`strip = false`): an endpoint security agent
+  quarantined the stripped build right after it was linked.
 - macOS 27: ditto clones files by default there and a clone is never compressed, so
   `--hfsCompression` alone compressed nothing and every file was cached as incompressible.
   `compress --apply` now probes ditto first with a small file next to the config
