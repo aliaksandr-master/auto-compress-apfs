@@ -110,6 +110,8 @@ impl Env {
             .env_remove("ACZ_TODAY")
             // install-launchd must never load an agent into the real login session.
             .env("ACZ_SKIP_LAUNCHCTL", "1")
+            // Not below `Library/LaunchAgents`: endpoint security flags plists written there.
+            .env("ACZ_LAUNCH_AGENTS_DIR", self.base.join("agents"))
             .env("COLUMNS", "400")
             .env("PWD", &self.base)
             .current_dir(&self.base);
@@ -451,9 +453,7 @@ fn cache_filled_with_other_ditto_args_is_dropped() {
 #[test]
 fn install_and_uninstall_launchd() {
     let env = Env::new("launchd", "");
-    let plist = env
-        .home
-        .join("Library/LaunchAgents/local.auto-compress-apfs.plist");
+    let plist = env.base.join("agents/local.auto-compress-apfs.plist");
     let script = env.config.with_file_name("run.sh");
     let out = env.exec(&["install-launchd"], None);
     assert!(out.status.success(), "{out:?}");

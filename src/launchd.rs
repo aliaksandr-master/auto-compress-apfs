@@ -114,6 +114,15 @@ fn render_plist(a: &Agent) -> String {
     )
 }
 
+/// Directory of the plist: `~/Library/LaunchAgents`, or `ACZ_LAUNCH_AGENTS_DIR` (tests: writing
+/// into a `Library/LaunchAgents` path, even below a temporary HOME, trips endpoint security
+/// persistence detection).
+pub fn agents_dir(home: &Path) -> PathBuf {
+    std::env::var_os("ACZ_LAUNCH_AGENTS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join("Library/LaunchAgents"))
+}
+
 /// Whether launchctl is left out: set `ACZ_SKIP_LAUNCHCTL` (tests must never load an agent into
 /// the real login session, in any build).
 fn skip_launchctl() -> bool {

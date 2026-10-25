@@ -444,9 +444,7 @@ fn cmd_launchd(config: Option<PathBuf>, install: bool, home: &Path) -> Result<Ex
     let config = config.map(|c| normalize(&cwd.join(c)));
     let config_path = config_path(config.as_ref(), home);
     let script = config_path.with_file_name(launchd::SCRIPT_NAME);
-    let plist = home
-        .join("Library/LaunchAgents")
-        .join(format!("{}.plist", launchd::LABEL));
+    let plist = launchd::agents_dir(home).join(format!("{}.plist", launchd::LABEL));
     // Released before the agent is loaded: its first run takes the lock itself.
     if acquire_lock(&state_dir(home))?.is_none() {
         return Err("a run is in progress, retry when it has finished".into());
