@@ -83,8 +83,9 @@ holds the lock exits 0 at once.
 2. **Hard protections** (no config or flag disables them):
    - Only the internal data volume is walked: before the first `read_dir` of a root, `statfs`
      must report `apfs`, `MNT_LOCAL` and the filesystem id of `/System/Volumes/Data` (or of a
-     local apfs mount point listed in `allow_volumes`); otherwise one WARN and the root is not
-     read. Network, cloud and external filesystems are never touched, not even with a stat of
+     local apfs mount point listed in `allow_volumes`; `/`, `/System/Volumes/Data` and any
+     ancestor of the home directory are ignored there with a WARN); otherwise one WARN and the
+     root is not read. Network, cloud and external filesystems are never touched, not even with a stat of
      their contents.
    - `~/Library/CloudStorage`, `~/Library/Mobile Documents`, `/Volumes`, `/System`, `/dev`,
      `/Network` and `/net` are never walked (checked lexically, before any syscall; they share
@@ -167,7 +168,11 @@ untouched. Only `/usr/bin/ditto` is executed, by absolute path.
 ## Usage
 
 ```
-auto-compress-apfs [compress] [OPTIONS]    preview (default); with --apply: compress
+auto-compress-apfs                         this help
+auto-compress-apfs compress [OPTIONS]      preview; with --apply: compress
+auto-compress-apfs trash [--apply] [--config PATH]
+auto-compress-apfs purge [--apply] [--config PATH]
+auto-compress-apfs run [--apply] [--config PATH]
 auto-compress-apfs stat [--top N] [--all] [--config PATH]
 auto-compress-apfs quarantine list [--config PATH]
 auto-compress-apfs quarantine clear <PATH>|--all [--config PATH]
@@ -244,6 +249,32 @@ auto-compress-apfs -h|--help | -V|--version
   was blocked or could not be (fully) removed (stderr says when it is only because of blocked
   ones), else 0.
 
+- `trash` and `purge` act on the files and directories matched by the `[trash]` and `[purge]`
+  patterns of the config (same glob and exclude syntax as for compress; an exclude wins, also
+  over a directory matched above it: such a directory is refused; excludes match the walked
+  spelling, case-sensitively, and below a matched item also its on-disk spelling). A matched directory is not
+  entered: it goes as a whole, whatever its age. Only items strictly below the home directory
+  or an `allow_volumes` mount are acted on. Without
+  `--apply` they list each item (size, file count, the pattern that matched) and the refused ones
+  with the reason, and change nothing. With `--apply`, under the run lock, `trash` moves each item
+  to `~/.Trash` (a name already there is never replaced: the moved item gets a time suffix) and
+  `purge` deletes it for good. Right before acting the path must still be the same file or
+  directory (device, inode, type, symlinks resolved) and carry no protected flag; the Trash move
+  never follows a symlink. Each item attempted is one line in `<log_dir>/removed.tsv` (time,
+  action, path, allocated bytes, pattern, Trash path or `-`, status `done`, `failed: ...` or
+  `partial: N of M entries left: ...`); nothing is done when the journal cannot be opened.
+  Refused, never acted on: a path with `.` or `..`, a mount point or an item on another
+  filesystem, `trash` items on another volume than `~/.Trash` (or without one; so items on an
+  `allow_volumes` volume can only be purged), an item holding a `.acz-staging-*` or
+  `.acz-rescue-*` entry (see `clean`), anything the compress walk would not enter, a protected
+  folder itself (`~/Downloads`, `~/Library`, ...), the home directory and any ancestor of a
+  protected location, the config file and the tool's files next to it (`run.sh`, `quarantine.txt`, the ditto
+  probe), anything inside or holding the log, state or cache directory of this tool or the Trash (and, for `trash`, anything already in the Trash), any item containing a flagged
+  (`uchg`, `uappnd`, `schg`, `sappnd`, `restricted`) or dataless entry or an entry on another
+  filesystem, and symlinks. Exit 1 when an item failed.
+- `run` is what the launchd agent starts: `trash` and `purge` when their rule has
+  `scheduled = true`, then `compress`, with the same `--apply` and `--config`. Without `--apply`
+  it previews the same steps. Exit 1 when a step failed.
 - `install-launchd` sets up the daily run for the current user (no `sudo`):
   - writes `run.sh` next to the config (mode 0755) with the absolute path of the binary it was
     started as (a symlink stays a symlink, so a rebuilt binary is picked up) and, for a
@@ -254,7 +285,7 @@ auto-compress-apfs -h|--help | -V|--version
   - reloads the agent with `/bin/launchctl bootout` + `bootstrap gui/<uid>`, replacing an agent
     with the same label.
 
-  `run.sh` starts `compress --apply` at most once per local day and never before 09:00: it records
+  `run.sh` starts `run --apply` at most once per local day and never before 09:00: it records
   the day in `last-run-day` in the state dir. A run missed during sleep is started by launchd on
   wake, one missed while the Mac was off at the next login, in both cases once (a wake or login
   before 09:00 waits for that day's 09:00 run). When the binary is gone (or not executable) it

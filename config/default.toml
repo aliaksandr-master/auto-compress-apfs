@@ -72,3 +72,25 @@ log_max_bytes = 4194304
 # Rotated logs kept (.log.1 .. .log.N, at most 9).
 # log_max_bytes * (log_keep + 1) + 1 MiB must not exceed 10 MiB.
 log_keep = 1
+
+# `trash` moves every file or directory matched by these patterns to ~/.Trash; `purge` deletes
+# them for good. Same pattern and exclude syntax as above; a matched directory goes as a whole,
+# whatever its age, unless an exclude matches something inside it (then it stays). Only items
+# strictly below the home directory or an allow_volumes mount are acted on. Nothing happens without `--apply` (`trash --apply`,
+# `purge --apply`); `scheduled = true` also runs the rule in `run`, which the launchd agent
+# starts daily (order: trash, purge, compress). Every item is written to
+# <log_dir>/removed.tsv. Hard protections apply as for compress, and an item is refused when it
+# is the home directory, a protected folder itself, an ancestor of either, is the config file or
+# one of the tool's files next to it, lies in or holds the log, state or cache directory or the
+# Trash, or holds a flagged (uchg/schg/...), a
+# dataless (cloud) or a .acz-staging-/.acz-rescue- entry. Excludes match the spelling of the
+# path as walked (and the on-disk spelling below a matched item), case-sensitively.
+[trash]
+patterns = []
+exclude = []
+scheduled = false
+
+[purge]
+patterns = []
+exclude = []
+scheduled = false

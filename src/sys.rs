@@ -28,6 +28,10 @@ pub const MNT_LOCAL: u32 = 0x0000_1000;
 pub const O_NOFOLLOW: i32 = 0x0000_0100;
 /// `renamex_np(2)`: atomically exchange the two paths.
 const RENAME_SWAP: c_uint = 0x0000_0002;
+/// `renamex_np` flag: fail with `EEXIST` instead of replacing an existing destination.
+const RENAME_EXCL: c_uint = 0x0000_0004;
+/// `renamex_np` flag: fail instead of following a symlink in any component of either path.
+const RENAME_NOFOLLOW_ANY: c_uint = 0x0000_0010;
 
 #[repr(C)]
 struct Tm {
@@ -148,6 +152,22 @@ pub fn rename_swap(a: &Path, b: &Path) -> io::Result<()> {
     // SAFETY: `a` and `b` are valid NUL-terminated strings that outlive the call; renamex_np
     // does not retain the pointers.
     let rc = unsafe { renamex_np(a.as_ptr(), b.as_ptr(), RENAME_SWAP) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Renames `from` to `to` unless `to` exists (`EEXIST` then), never following a symlink in any
+/// component of either path (`renamex_np(from, to, RENAME_EXCL | RENAME_NOFOLLOW_ANY)`); never
+/// replaces an entry. Both must be on the same filesystem.
+pub fn rename_excl(from: &Path, to: &Path) -> io::Result<()> {
+    let a = c_path(from)?;
+    let b = c_path(to)?;
+    // SAFETY: `a` and `b` are valid NUL-terminated strings that outlive the call; renamex_np
+    // does not retain the pointers.
+    let rc = unsafe { renamex_np(a.as_ptr(), b.as_ptr(), RENAME_EXCL | RENAME_NOFOLLOW_ANY) };
     if rc == 0 {
         Ok(())
     } else {

@@ -105,6 +105,8 @@ pub struct Matcher {
     descend: GlobSet,
     /// Distinct walk roots (literal prefixes of the patterns, narrowed to the scope dir).
     roots: Vec<PathBuf>,
+    /// The patterns as given, in `patterns` order.
+    pattern_strs: Vec<String>,
 }
 
 fn glob(s: &str) -> Result<Glob, String> {
@@ -192,7 +194,20 @@ impl Matcher {
             exclude_dir: build(dir)?,
             descend: build(desc)?,
             roots,
+            pattern_strs: patterns.to_vec(),
         })
+    }
+
+    /// True when an exclude matches `path` (name or full path), as during the walk.
+    pub fn excludes(&self, path: &Path, is_dir: bool) -> bool {
+        let name = path.file_name().unwrap_or(path.as_os_str());
+        self.excluded(&globset::Candidate::new(path), name, is_dir)
+    }
+
+    /// The first pattern matching `path`.
+    pub fn matching_pattern(&self, path: &Path) -> Option<&str> {
+        let i = *self.patterns.matches(path).first()?;
+        self.pattern_strs.get(i).map(String::as_str)
     }
 
     /// True when an exclude matches the entry (`path` as walked, `name` its last component).
@@ -262,6 +277,16 @@ impl Guard {
         let mut mounts = Vec::new();
         for v in allow_volumes {
             let v = Path::new(v);
+            // `/`, the data volume or an ancestor of home would lift the hard exclusions
+            // (CloudStorage, /Volumes, ...) and widen the trash/purge scope to everything.
+            if v == Path::new("/") || v == Path::new(DATA_VOLUME) || home.starts_with(v) {
+                log.warn(format_args!(
+                    "allow_volumes entry {} ignored: the root, the data volume or an ancestor of \
+                     the home directory",
+                    v.display()
+                ));
+                continue;
+            }
             match sys::statfs(v) {
                 Ok(fs) if local_apfs(&fs) && fs.mount_on == v => {
                     allowed.push(fs.fsid);
@@ -350,6 +375,26 @@ impl Guard {
         self.hard_excluded.iter().chain(&self.tcc).any(|h| h == p)
     }
 
+    /// Accepted `allow_volumes` mount points.
+    pub fn allowed_mounts(&self) -> &[PathBuf] {
+        &self.allowed_mounts
+    }
+
+    /// Why `path` (a matched entry) must never be trashed or purged: it lies in a never-walked
+    /// subtree, or it is a protected location or an ancestor of one (lexical, data prefix
+    /// stripped).
+    pub fn removal_refused(&self, path: &Path) -> Option<String> {
+        let p = without_data_prefix(path);
+        if self.hard_excluded(&p) {
+            return Some("lies in a protected location".into());
+        }
+        self.hard_excluded
+            .iter()
+            .chain(&self.tcc)
+            .find(|h| h.starts_with(p.as_ref()))
+            .map(|h| format!("is or contains protected location {}", h.display()))
+    }
+
     /// Checks of a root against its on-disk path `canon` (realpath: symlinks in any component
     /// resolved, on-disk case). Refused when `canon` lies in a never-walked subtree, inside a TCC
     /// folder the lexical root does not lie in, or above a protected path that the walk would
@@ -390,7 +435,7 @@ impl Guard {
 
     /// `Ok` when `path` is on an allowed filesystem: apfs, local, and the data volume or an
     /// accepted `allow_volumes` entry.
-    fn filesystem_allowed(&self, path: &Path) -> Result<(), String> {
+    pub(crate) fn filesystem_allowed(&self, path: &Path) -> Result<(), String> {
         let fs = (self.probe)(path).map_err(|e| format!("cannot statfs: {e}"))?;
         if fs.fstype != "apfs" {
             Err(format!("filesystem type {} is not apfs", fs.fstype))
@@ -501,6 +546,29 @@ pub struct WalkResult {
     pub refused_roots: u64,
     /// Directories not entered because of uchg/uappnd/schg/sappnd/restricted, with their flags.
     pub flagged_dirs: Vec<(PathBuf, u32)>,
+    /// [`walk_entries`] only: files and directories matched by a pattern (a matched directory
+    /// is not entered). Sorted by path, each once; nested matches (from overlapping roots) kept.
+    pub matched: Vec<Matched>,
+}
+
+/// A file or directory matched by a pattern, as the walk saw it (`lstat`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Matched {
+    pub path: PathBuf,
+    pub is_dir: bool,
+    pub dev: u64,
+    pub ino: u64,
+}
+
+impl Matched {
+    fn new(path: PathBuf, m: &Metadata) -> Self {
+        Self {
+            path,
+            is_dir: m.is_dir(),
+            dev: m.dev(),
+            ino: m.ino(),
+        }
+    }
 }
 
 struct Walker<'a> {
@@ -512,6 +580,8 @@ struct Walker<'a> {
     track_dirs: Option<&'a HashSet<PathBuf>>,
     /// Test hook: every entry of this directory's listing reads as an error.
     fault: Option<&'a Path>,
+    /// Collect matched entries (files and dirs, never entered) instead of compress candidates.
+    entries: bool,
 }
 
 impl Walker<'_> {
@@ -595,6 +665,26 @@ impl Walker<'_> {
             if self.matcher.excluded(&c, &file_name, ft.is_dir()) {
                 out.excluded += 1;
                 continue;
+            }
+            if self.entries {
+                if matched {
+                    match self.lstat(&path, &entry) {
+                        // Another filesystem (a mount point): never acted on, as in `enter`.
+                        Some(m) if m.dev() != job.root_dev => {
+                            self.log.info(format_args!(
+                                "{}: on another filesystem, not matched",
+                                path.display()
+                            ));
+                            out.refused_roots += 1;
+                        }
+                        Some(m) => out.matched.push(Matched::new(path, &m)),
+                        None => complete = false,
+                    }
+                    continue;
+                }
+                if ft.is_file() {
+                    continue;
+                }
             }
             if ft.is_file() {
                 let root = match inside {
@@ -834,6 +924,16 @@ impl Walker<'_> {
             self.refuse(root, &reason, out);
             return None;
         }
+        // Entries: only a root the patterns match itself is an item; below an ancestor's match
+        // it is searched like any other root.
+        if self.entries && self.matcher.patterns.is_match(root) {
+            if symlink {
+                return None;
+            }
+            out.matched.push(Matched::new(root.to_path_buf(), &meta));
+            return None;
+        }
+        let matched = matched && !self.entries;
         if matched && meta.is_file() && !symlink {
             let parent: Arc<Path> = Arc::from(root.parent().unwrap_or(Path::new("/")));
             out.candidates
@@ -872,9 +972,32 @@ pub fn walk(
         log,
         track_dirs,
         None,
+        false,
     )
 }
 
+/// Like [`walk`], but collects the files and directories matched by a pattern (for `trash`
+/// and `purge`); a matched directory is not entered.
+pub fn walk_entries(
+    matcher: &Matcher,
+    guard: &Guard,
+    one_file_system: bool,
+    threads: usize,
+    log: &Logger,
+) -> WalkResult {
+    walk_with_fault(
+        matcher,
+        guard,
+        one_file_system,
+        threads,
+        log,
+        None,
+        None,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn walk_with_fault(
     matcher: &Matcher,
     guard: &Guard,
@@ -883,6 +1006,7 @@ fn walk_with_fault(
     log: &Logger,
     track_dirs: Option<&HashSet<PathBuf>>,
     fault: Option<&Path>,
+    entries: bool,
 ) -> WalkResult {
     let walker = Walker {
         matcher,
@@ -891,6 +1015,7 @@ fn walk_with_fault(
         log,
         track_dirs,
         fault,
+        entries,
     };
     let mut result = WalkResult::default();
     let jobs: Vec<Job> = matcher
@@ -932,7 +1057,13 @@ fn walk_with_fault(
         result.dataless += part.dataless;
         result.refused_roots += part.refused_roots;
         result.flagged_dirs.extend(part.flagged_dirs);
+        result.matched.extend(part.matched);
     }
+    // Overlapping roots can find an entry twice; one nested in another matched entry is kept
+    // here (the outer one may be refused) and dropped by the caller when the outer one is not.
+    result.matched.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+    let mut ids = HashSet::new();
+    result.matched.retain(|m| ids.insert((m.dev, m.ino)));
     result
         .candidates
         .retain(|c| seen.insert((c.key.dev, c.key.ino)));
@@ -1248,7 +1379,16 @@ mod tests {
         let m = Matcher::new(&[t.pat("v/.venv")], &[], None).unwrap();
         let guard = t.guard(&t.dir.join("home"));
         let fault = venv.join("a");
-        let r = walk_with_fault(&m, &guard, true, 2, &t.log, Some(&track), Some(&fault));
+        let r = walk_with_fault(
+            &m,
+            &guard,
+            true,
+            2,
+            &t.log,
+            Some(&track),
+            Some(&fault),
+            false,
+        );
         // `a` failed midway, `c` is untracked, `.venv` itself untracked.
         assert_eq!(r.read_dirs, HashSet::from([venv.join("b")]));
         assert!(t.log_text().contains("injected read error"));

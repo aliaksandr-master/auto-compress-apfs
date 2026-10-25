@@ -6,11 +6,25 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- `auto-compress-apfs` without arguments prints the help instead of a compress preview; use
+  `compress` for the preview. Options without a command still mean `compress`.
+- The launchd agent's `run.sh` runs `run --apply` instead of `compress --apply`;
+  `check-launchd` reports `REINSTALL` for an agent installed by an earlier version.
+
 ### Added
 
+- `trash` and `purge`: files and directories matched by the new `[trash]` / `[purge]` config
+  rules (patterns, exclude) are listed, and with `--apply` moved to `~/.Trash` or deleted for
+  good, a directory as a whole; each item is re-checked right before and written to
+  `<log_dir>/removed.tsv`. Protected locations, their ancestors, the home directory, the tool's
+  own directories and items with flagged or dataless entries are refused.
+- `run`: `trash` and `purge` for rules with `scheduled = true`, then `compress`; this is what
+  the launchd agent runs.
 - `install-launchd`: writes `run.sh` next to the config and a per-user launchd agent
   (`~/Library/LaunchAgents/local.auto-compress-apfs.plist`) that starts it at login and daily at
-  09:00. `run.sh` runs `compress --apply` once per day from 09:00 on, so a run missed while the
+  09:00. `run.sh` runs `run --apply` once per day from 09:00 on, so a run missed while the
   Mac was asleep or off starts once later; when the binary is gone it only logs to
   `launchd.log` and exits 0. `uninstall-launchd` unloads the agent and removes both files.
 - `check-launchd`: read-only; prints `OK` (exit 0) when the agent is installed, loaded and

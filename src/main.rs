@@ -10,6 +10,7 @@ mod launchd;
 mod logger;
 mod progress;
 mod quarantine;
+mod remove;
 mod stat;
 mod state;
 mod sys;
@@ -40,7 +41,12 @@ const PREVIEW_TOP_ROOTS: usize = 20;
 
 const USAGE: &str = "\
 Usage:
-  auto-compress-apfs [compress] [OPTIONS]    preview (default); with --apply: compress
+  auto-compress-apfs                         this help
+  auto-compress-apfs compress [OPTIONS]      preview; with --apply: compress (options
+                                             without a command also mean compress)
+  auto-compress-apfs trash [--apply] [--config PATH]
+  auto-compress-apfs purge [--apply] [--config PATH]
+  auto-compress-apfs run [--apply] [--config PATH]
   auto-compress-apfs stat [--top N] [--all] [--config PATH]
   auto-compress-apfs quarantine list [--config PATH]
   auto-compress-apfs quarantine clear <PATH>|--all [--config PATH]
@@ -75,8 +81,13 @@ clean options:
   --apply                    delete the listed leftover dirs that are not blocked
                              (default: preview only, nothing is changed)
 
+trash / purge: files and directories matched by the [trash] / [purge] patterns of the config
+(a directory as a whole) are listed; with --apply moved to ~/.Trash / deleted for good, each
+written to <log_dir>/removed.tsv. Protected locations and the tool's own dirs are refused.
+run: trash and purge when their rule has `scheduled = true`, then compress (what launchd runs).
+
 install-launchd: writes run.sh next to the config and a per-user launchd agent that starts it
-at login and daily at 09:00; run.sh runs `compress --apply` once a day from 09:00 on (a missed
+at login and daily at 09:00; run.sh runs `run --apply` once a day from 09:00 on (a missed
 run starts once later) and only logs to launchd.log when the binary is gone.
 uninstall-launchd: unloads the agent and removes it and run.sh.
 check-launchd: read-only; prints OK (exit 0) when the agent is installed, loaded and written by
@@ -131,6 +142,10 @@ enum Cli {
     Compress(CompressArgs),
     Stat(StatArgs),
     Clean(CleanArgs),
+    /// `trash` or `purge` (same options as `clean`).
+    Remove(CleanArgs, remove::Action),
+    /// `run`: the configured steps in order, as the launchd agent starts them.
+    Run(CleanArgs),
     Quarantine {
         config: Option<PathBuf>,
         cmd: QuarantineCmd,
@@ -339,6 +354,21 @@ fn parse_launchd(mut it: impl Iterator<Item = String>, cmd: LaunchdCmd) -> Resul
 fn parse_args(it: impl Iterator<Item = String>) -> Result<Cli, String> {
     let mut it = it.peekable();
     match it.peek().map(String::as_str) {
+        None => {
+            println!("{USAGE}");
+            Ok(Cli::Exit(ExitCode::SUCCESS))
+        }
+        Some(c @ ("trash" | "purge" | "run")) => {
+            let c = c.to_owned();
+            match parse_clean(it.skip(1))? {
+                Cli::Clean(a) => Ok(match c.as_str() {
+                    "trash" => Cli::Remove(a, remove::Action::Trash),
+                    "purge" => Cli::Remove(a, remove::Action::Purge),
+                    _ => Cli::Run(a),
+                }),
+                other => Ok(other),
+            }
+        }
         Some("compress") => parse_compress(it.skip(1)),
         Some("stat") => parse_stat(it.skip(1)),
         Some("clean") => parse_clean(it.skip(1)),
@@ -368,6 +398,8 @@ fn main() -> ExitCode {
         Cli::Compress(args) => return cmd_compress(&args, &home),
         Cli::Stat(args) => cmd_stat(&args, &home),
         Cli::Clean(args) => return cmd_clean(&args, &home),
+        Cli::Remove(args, action) => return cmd_remove(&args, action, &home),
+        Cli::Run(args) => return cmd_run(&args, &home),
         Cli::Quarantine { config, cmd } => cmd_quarantine(config, &cmd, &home),
         Cli::Launchd { config, cmd } => cmd_launchd(config, cmd, &home),
         Cli::Exit(code) => return code,
@@ -715,6 +747,202 @@ fn cmd_clean(args: &CleanArgs, home: &Path) -> ExitCode {
     };
     log.flush();
     code
+}
+
+/// `trash` / `purge`: preview by default; with `--apply` under the run lock. Exit 1 when the
+/// config cannot be loaded, the log cannot be opened, the lock is busy, or an item failed.
+fn cmd_remove(args: &CleanArgs, action: remove::Action, home: &Path) -> ExitCode {
+    let config_path = config_path(args.config.as_ref(), home);
+    let (cfg, created) = match Config::load_or_create(&config_path, home) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{NAME}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if created {
+        println!("created {}", config_path.display());
+    }
+    let rule = match action {
+        remove::Action::Trash => &cfg.trash,
+        remove::Action::Purge => &cfg.purge,
+    };
+    if rule.patterns.is_empty() {
+        println!(
+            "no [{}] patterns: add them to {}",
+            action.name(),
+            config_path.display()
+        );
+        return ExitCode::SUCCESS;
+    }
+    let log_dir = cfg.log_dir();
+    let log = match Logger::open(&log_dir, cfg.log_max_bytes, cfg.log_keep, false) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("{NAME}: cannot open log in {}: {e}", log_dir.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let code = match run_remove(args, action, &cfg, &config_path, home, &log) {
+        Ok(code) => code,
+        Err(e) => {
+            log.error(&e);
+            eprintln!("{NAME}: {e}");
+            ExitCode::FAILURE
+        }
+    };
+    log.flush();
+    code
+}
+
+fn run_remove(
+    args: &CleanArgs,
+    action: remove::Action,
+    cfg: &Config,
+    config_path: &Path,
+    home: &Path,
+    log: &Logger,
+) -> Result<ExitCode, String> {
+    let name = action.name();
+    log.info(format_args!(
+        "start {NAME} {VERSION} {name} config={} dry_run={}",
+        config_path.display(),
+        !args.apply
+    ));
+    // Deleting or moving never reads file data, but a stray read must not download.
+    if let Err(e) = sys::disable_dataless_materialization() {
+        log.warn(format_args!(
+            "cannot turn off materialization of dataless files: {e}"
+        ));
+    }
+    let _lock = if args.apply {
+        match acquire_lock(&state_dir(home))? {
+            Some(f) => Some(f),
+            None => {
+                log.info("another run in progress, exiting");
+                eprintln!("{NAME}: a run is in progress, try again when it has finished");
+                return Ok(ExitCode::FAILURE);
+            }
+        }
+    } else {
+        None
+    };
+    let rule = match action {
+        remove::Action::Trash => &cfg.trash,
+        remove::Action::Purge => &cfg.purge,
+    };
+    let guard = walk::Guard::new(home, &cfg.allow_volumes, log)?;
+    let matcher = walk::Matcher::new(&rule.patterns, &rule.exclude, None)?;
+    let walked = walk::walk_entries(
+        &matcher,
+        &guard,
+        cfg.one_file_system,
+        cfg.worker_threads(),
+        log,
+    );
+    // The tool's own files next to the config, not that whole directory (it may be HOME).
+    let config_dir = config_path.parent().unwrap_or(Path::new("/"));
+    let own = [
+        config_path.to_path_buf(),
+        config_dir.join(launchd::SCRIPT_NAME),
+        quarantine_file(config_path),
+        config_dir.join("ditto-probe.txt"),
+        config_dir.join("ditto-probe.out"),
+        cfg.log_dir(),
+        state_dir(home),
+        home.join("Library/Caches").join(NAME),
+    ];
+    let trash_dir = home.join(".Trash");
+    let mut scope = vec![home.to_path_buf()];
+    scope.extend(guard.allowed_mounts().iter().cloned());
+    let keep = remove::Keep {
+        scope: &scope,
+        own: &own,
+        trash_dir: &trash_dir,
+    };
+    let items = remove::plan(walked.matched, &matcher, &guard, &keep, action);
+    let blocked = items.iter().filter(|i| i.blocked.is_some()).count() as u64;
+    let out = if args.apply {
+        let journal = cfg.log_dir().join(remove::JOURNAL_NAME);
+        let out = remove::apply(&items, action, &trash_dir, &journal, log)?;
+        println!(
+            "{name}: {} done ({}), {} failed, {} blocked; journal {}",
+            out.done,
+            human(out.bytes),
+            out.failed,
+            out.blocked,
+            journal.display()
+        );
+        out
+    } else {
+        let extra: String = args
+            .config
+            .iter()
+            .map(|p| format!(" --config {}", shell_quote(&p.display().to_string())))
+            .collect();
+        print!(
+            "{}",
+            remove::render(
+                &items,
+                home,
+                action,
+                &format!("{NAME} {name} --apply{extra}")
+            )
+        );
+        remove::Outcome {
+            blocked,
+            ..Default::default()
+        }
+    };
+    log.info(format_args!(
+        "{name}_summary found={} done={} failed={} blocked={} bytes={} dry_run={}",
+        items.len(),
+        out.done,
+        out.failed,
+        out.blocked,
+        out.bytes,
+        !args.apply
+    ));
+    Ok(if out.failed > 0 {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+/// `run`: `trash` and `purge` when their rule is `scheduled`, then `compress`, each with the
+/// same `--apply` and `--config`. Exit 1 when any step failed.
+fn cmd_run(args: &CleanArgs, home: &Path) -> ExitCode {
+    let config_path = config_path(args.config.as_ref(), home);
+    let cfg = match Config::load_or_create(&config_path, home) {
+        Ok((c, _)) => c,
+        Err(e) => {
+            eprintln!("{NAME}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut failed = false;
+    for (action, rule) in [
+        (remove::Action::Trash, &cfg.trash),
+        (remove::Action::Purge, &cfg.purge),
+    ] {
+        if rule.scheduled && !rule.patterns.is_empty() {
+            println!("== {} ==", action.name());
+            failed |= cmd_remove(args, action, home) != ExitCode::SUCCESS;
+        }
+    }
+    println!("== compress ==");
+    let compress = CompressArgs {
+        config: args.config.clone(),
+        apply: args.apply,
+        ..CompressArgs::default()
+    };
+    failed |= cmd_compress(&compress, home) != ExitCode::SUCCESS;
+    if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
 }
 
 fn run_clean(
@@ -1413,7 +1641,20 @@ mod tests {
         assert!(!a.apply && a.verbose);
         let a = compress(&["--config=/y.toml"]);
         assert_eq!(a.config.as_deref(), Some(Path::new("/y.toml")));
-        assert!(!compress(&[]).apply);
+        assert!(matches!(parse(&[]), Ok(Cli::Exit(_))), "no arguments: help");
+        assert!(!compress(&["compress"]).apply);
+        assert!(matches!(
+            parse(&["trash", "--apply"]),
+            Ok(Cli::Remove(a, remove::Action::Trash)) if a.apply
+        ));
+        assert!(matches!(
+            parse(&["purge"]),
+            Ok(Cli::Remove(a, remove::Action::Purge)) if !a.apply
+        ));
+        assert!(
+            matches!(parse(&["run", "--config=/c.toml"]), Ok(Cli::Run(a)) if a.config.is_some())
+        );
+        assert!(parse(&["trash", "x"]).is_err());
         assert!(compress(&["compress", "--apply"]).apply);
         assert!(parse(&["--config"]).is_err());
         assert!(parse(&["--bogus"]).is_err());

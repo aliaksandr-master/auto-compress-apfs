@@ -139,7 +139,7 @@ impl Leftover {
 }
 
 /// Why an entry with these flags must never be touched, if it must not.
-fn flag_reason(path: &Path, m: &Metadata) -> Option<String> {
+pub(crate) fn flag_reason(path: &Path, m: &Metadata) -> Option<String> {
     let flags = m.st_flags();
     if flags & PROTECTED_FLAGS != 0 {
         Some(format!(

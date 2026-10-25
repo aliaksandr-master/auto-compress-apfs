@@ -274,8 +274,13 @@ fn pipeline() {
         "{stdout}"
     );
     assert!(stdout.contains("to compress these 5 files ("), "{stdout}");
-    // The default command is the same preview.
-    let (s, _) = env.run_day(&[], None);
+    // Without arguments: the help, and nothing is walked.
+    let out = env.exec(&[], None);
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).starts_with("Usage:"));
+    // `run` without --apply is the same preview (no trash/purge rule is scheduled).
+    let (s, stdout) = env.run_day(&["run"], None);
+    assert!(stdout.starts_with("== compress =="), "{stdout}");
     assert_eq!(
         (s["dry_run"].as_str(), s["to_compress"].as_str()),
         ("true", "5")
@@ -480,7 +485,7 @@ fn install_and_uninstall_launchd() {
     let bin = env!("CARGO_BIN_EXE_auto-compress-apfs");
     assert!(s.contains(&format!("BIN={bin}\n")), "{s}");
     // The default config is not passed: such runs stay unrestricted.
-    assert!(s.contains("exec \"$BIN\" compress --apply\n"), "{s}");
+    assert!(s.contains("exec \"$BIN\" run --apply\n"), "{s}");
     // check-launchd: OK after install, REINSTALL for a changed script, INSTALL when removed.
     let check = |env: &Env| {
         let out = env.exec(&["check-launchd"], None);
@@ -588,6 +593,76 @@ fn check_launchd_follows_the_installed_config_and_writes_nothing() {
     // An invalid one: the check fails with exit 2.
     fs::write(&other, "not = [valid").unwrap();
     assert_eq!(check(&["check-launchd"]).0, Some(2));
+    force_remove(&env.base);
+}
+
+#[test]
+fn trash_purge_and_run() {
+    let env = Env::new("remove", "");
+    // Inside HOME: trash and purge never act outside it (or an allow_volumes mount).
+    let tree = env.home.join("junk");
+    let dl = tree.join("dl");
+    fs::create_dir_all(dl.join("old/sub")).unwrap();
+    fs::write(dl.join("old/sub/a.txt"), "a").unwrap();
+    fs::write(dl.join("x.dmg"), "x").unwrap();
+    fs::write(dl.join("keep.log"), "k").unwrap();
+    fs::create_dir_all(tree.join("cache/c1")).unwrap();
+    fs::write(tree.join("cache/c1/f"), "f").unwrap();
+    let body = fs::read_to_string(&env.config).unwrap();
+    let rules = format!(
+        "\n[trash]\npatterns = [\"{dl}/*\", \"{home}\"]\nexclude = [\"*.log\"]\nscheduled = true\n\
+         \n[purge]\npatterns = [\"{cache}/*\"]\nscheduled = false\n",
+        dl = dl.display(),
+        home = env.home.display(),
+        cache = tree.join("cache").display(),
+    );
+    fs::write(&env.config, format!("{body}{rules}")).unwrap();
+    let trash = env.home.join(".Trash");
+    fs::create_dir_all(&trash).unwrap();
+    let journal = env.log.with_file_name("removed.tsv");
+    // Preview: lists, refuses the home directory itself, changes nothing.
+    let out = env.exec(&["trash"], None);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        text.contains("dir ") && text.contains("old") && text.contains("x.dmg"),
+        "{text}"
+    );
+    assert!(
+        text.contains("BLOCKED") && !text.contains("keep.log"),
+        "{text}"
+    );
+    assert!(dl.join("x.dmg").exists() && !journal.exists());
+    // run --apply: the scheduled trash rule, not the unscheduled purge one, then compress.
+    let out = env.exec(&["run", "--apply"], None);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        text.contains("== trash ==") && !text.contains("== purge =="),
+        "{text}"
+    );
+    assert!(text.contains("== compress =="), "{text}");
+    assert!(!dl.join("old").exists() && !dl.join("x.dmg").exists());
+    assert!(dl.join("keep.log").exists() && env.home.exists());
+    assert!(trash.join("old/sub/a.txt").exists() && trash.join("x.dmg").exists());
+    assert!(tree.join("cache/c1").exists());
+    let j = fs::read_to_string(&journal).unwrap();
+    assert!(j.lines().all(|l| l.ends_with("\tdone")), "{j}");
+    // purge --apply deletes for good; the journal has a line per item.
+    let out = env.exec(&["purge", "--apply"], None);
+    assert!(out.status.success(), "{out:?}");
+    assert!(!tree.join("cache/c1").exists());
+    let j = fs::read_to_string(&journal).unwrap();
+    assert_eq!(
+        j.lines().filter(|l| l.contains("\ttrash\t")).count(),
+        2,
+        "{j}"
+    );
+    assert_eq!(
+        j.lines().filter(|l| l.contains("\tpurge\t")).count(),
+        1,
+        "{j}"
+    );
     force_remove(&env.base);
 }
 

@@ -38,6 +38,20 @@ pub struct Config {
     pub log_dir: String,
     pub log_max_bytes: u64,
     pub log_keep: u32,
+    /// `trash`: matched files and directories are moved to `~/.Trash`.
+    pub trash: Rule,
+    /// `purge`: matched files and directories are deleted for good.
+    pub purge: Rule,
+}
+
+/// Patterns and excludes of `trash` or `purge` (same syntax as the compress ones). A matched
+/// directory is acted on as a whole; `scheduled` puts the rule into `run`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Rule {
+    pub patterns: Vec<String>,
+    pub exclude: Vec<String>,
+    pub scheduled: bool,
 }
 
 impl Default for Config {
@@ -67,6 +81,8 @@ impl Default for Config {
             log_dir: "~/Library/Logs/auto-compress-apfs".into(),
             log_max_bytes: 4 * MIB,
             log_keep: 1,
+            trash: Rule::default(),
+            purge: Rule::default(),
         }
     }
 }
@@ -105,6 +121,10 @@ impl Config {
             .iter_mut()
             .chain(cfg.exclude.iter_mut())
             .chain(cfg.allow_volumes.iter_mut())
+            .chain(cfg.trash.patterns.iter_mut())
+            .chain(cfg.trash.exclude.iter_mut())
+            .chain(cfg.purge.patterns.iter_mut())
+            .chain(cfg.purge.exclude.iter_mut())
         {
             *p = expand_tilde(p, home);
         }
@@ -118,6 +138,14 @@ impl Config {
             return Err(format!("pattern `{p}` is not absolute after `~` expansion"));
         }
         validate_excludes(&self.exclude)?;
+        for (name, rule) in [("trash", &self.trash), ("purge", &self.purge)] {
+            if let Some(p) = rule.patterns.iter().find(|p| !p.starts_with('/')) {
+                return Err(format!(
+                    "[{name}] pattern `{p}` is not absolute after `~` expansion"
+                ));
+            }
+            validate_excludes(&rule.exclude).map_err(|e| format!("[{name}] {e}"))?;
+        }
         if let Some(v) = self.allow_volumes.iter().find(|v| !v.starts_with('/')) {
             return Err(format!(
                 "allow_volumes entry `{v}` is not absolute after `~` expansion"
