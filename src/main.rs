@@ -798,10 +798,19 @@ fn run(
         .join("Library/Caches")
         .join(NAME)
         .join(cache::CACHE_NAME);
-    let known = cache::load(&cache_path).unwrap_or_else(|e| {
+    let mut known = cache::load(&cache_path).unwrap_or_else(|e| {
         log.warn(format_args!("cannot read {}: {e}", cache_path.display()));
         HashSet::new()
     });
+    // Entries cached by ditto with other options may be compressible files: re-check them.
+    let args_path = cache_path.with_file_name(cache::ARGS_NAME);
+    if apply && !known.is_empty() && cache::filled_with_other_args(&args_path, ditto_args) {
+        log.info(format_args!(
+            "incompressible cache was filled with other ditto options, dropped {} entries",
+            known.len()
+        ));
+        known.clear();
+    }
     let state_path = state_dir(home).join(state::STATE_NAME);
     // Fail closed: an --apply run never overwrites a state it could not read (a missing file
     // is an empty state); a preview goes on without the history.
@@ -1011,8 +1020,14 @@ fn run(
         )
         .run(todo);
         let keys = keep_cached.iter().chain(&out.new_incompressible);
-        if let Err(e) = cache::store(&cache_path, keys) {
-            log.warn(format_args!("cannot write {}: {e}", cache_path.display()));
+        // The record follows the cache: a stale record only costs a re-check.
+        match cache::store(&cache_path, keys) {
+            Ok(()) => {
+                if let Err(e) = cache::store_args(&args_path, ditto_args) {
+                    log.warn(format_args!("cannot write {}: {e}", args_path.display()));
+                }
+            }
+            Err(e) => log.warn(format_args!("cannot write {}: {e}", cache_path.display())),
         }
         for c in &out.committed {
             let row = Row::new(c.dev, c.ino, c.size, c.after, now);

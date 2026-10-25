@@ -390,6 +390,62 @@ fn rewrite(p: &Path, round: u32) {
     assert!(!compressed(p));
 }
 
+/// The cache line of `p` (`dev ino size mtime_sec mtime_nsec`).
+fn cache_line(p: &Path) -> String {
+    let m = lstat(p);
+    format!(
+        "{}\t{}\t{}\t{}\t{}\n",
+        m.dev(),
+        m.ino(),
+        m.size(),
+        m.mtime(),
+        m.mtime_nsec()
+    )
+}
+
+#[test]
+fn cache_filled_with_other_ditto_args_is_dropped() {
+    let env = Env::new("cache", "");
+    let dir = env.base.join("tree/Work_c/.venv");
+    fs::write(
+        &env.config,
+        fs::read_to_string(&env.config).unwrap().replace(
+            "\nthreads",
+            &format!("patterns = [\"{}\"]\nexclude = []\nthreads", dir.display()),
+        ),
+    )
+    .unwrap();
+    fs::create_dir_all(&dir).unwrap();
+    let a = dir.join("a.py");
+    fs::write(&a, compressible("a")).unwrap();
+    fs::create_dir_all(env.cache().parent().unwrap()).unwrap();
+    let record = env.cache().with_file_name("ditto-args.txt");
+    // A record of other options: the compressible file cached by them is compressed.
+    fs::write(env.cache(), cache_line(&a)).unwrap();
+    fs::write(&record, "--other\n").unwrap();
+    let s = env.apply();
+    assert_eq!(
+        (s["compressed"].as_str(), s["incompressible"].as_str()),
+        ("1", "0"),
+        "{s:?}"
+    );
+    assert!(env.log_text().contains("dropped 1 entries"));
+    let probed = fs::read_to_string(&record).unwrap();
+    assert!(probed.starts_with("--hfsCompression"), "{probed}");
+    // A record of the probed options: the cache is trusted.
+    let b = dir.join("b.py");
+    fs::write(&b, compressible("b")).unwrap();
+    fs::write(env.cache(), cache_line(&b)).unwrap();
+    let s = env.apply();
+    assert_eq!(
+        (s["compressed"].as_str(), s["incompressible"].as_str()),
+        ("0", "1"),
+        "{s:?}"
+    );
+    assert!(!compressed(&b));
+    force_remove(&env.base);
+}
+
 #[test]
 fn quarantine_after_three_run_days() {
     let env = Env::new("quar", "");

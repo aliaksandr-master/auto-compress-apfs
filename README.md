@@ -121,7 +121,10 @@ holds the lock exits 0 at once.
    the config dir is not writable or not on APFS the probe runs in the state dir (one WARN line).
    A config dir synced elsewhere (dotfiles repo, cloud folder) gets these two entries too. When
    no set compresses, the run stops before the walk with exit code 1 and changes nothing:
-   otherwise every file would be cached as incompressible.
+   otherwise every file would be cached as incompressible. The options that filled the
+   incompressible cache are recorded next to it (`ditto-args.txt`); a cache filled with other
+   options, or one without a record while the probe needs `--noclone`, is dropped once and its
+   files are checked again. A preview runs no ditto and keeps showing the cache until then.
 5. **Compress in batches.** Files of one match root (and device) are copied by one
    `ditto <probed options> -- <files...> <root>/.acz-staging-<pid>-<n>/` call (up to `batch_size`
    files and 2 GiB of data; basenames unique per batch ignoring case, because APFS volumes are

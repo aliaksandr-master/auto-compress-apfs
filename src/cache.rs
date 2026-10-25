@@ -7,6 +7,24 @@ use std::io::{self, BufWriter, Write};
 use std::path::Path;
 
 pub const CACHE_NAME: &str = "incompressible.tsv";
+/// Next to the cache: the ditto options that filled it, on one line.
+pub const ARGS_NAME: &str = "ditto-args.txt";
+
+/// Whether the cache was filled by ditto with options other than `args`, per the record at
+/// `path`. Without a record the cache is trusted only for `--hfsCompression` alone: before the
+/// record existed, macOS 27 ditto compressed nothing with it and every file was cached.
+pub fn filled_with_other_args(path: &Path, args: &[&str]) -> bool {
+    match fs::read_to_string(path) {
+        Ok(text) => text.trim_end() != args.join(" "),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => args != ["--hfsCompression"],
+        Err(_) => true,
+    }
+}
+
+/// Atomically records `args` as the options that filled the cache.
+pub fn store_args(path: &Path, args: &[&str]) -> io::Result<()> {
+    write_atomic(path, |w| writeln!(w, "{}", args.join(" ")))
+}
 
 /// Parses cache text; malformed lines are ignored.
 pub fn parse(text: &str) -> HashSet<FileKey> {
@@ -77,6 +95,29 @@ pub fn write_atomic(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn args_record_decides_whether_the_cache_is_trusted() {
+        let dir = std::env::temp_dir().join(format!("acz-cache-args-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(ARGS_NAME);
+        // No record (a cache from before it existed): trusted only for `--hfsCompression`.
+        assert!(filled_with_other_args(
+            &path,
+            &["--hfsCompression", "--noclone"]
+        ));
+        assert!(!filled_with_other_args(&path, &["--hfsCompression"]));
+        store_args(&path, &["a", "b"]).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "a b\n");
+        assert!(!filled_with_other_args(&path, &["a", "b"]));
+        assert!(filled_with_other_args(&path, &["a"]));
+        // An unreadable record is not trusted.
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(filled_with_other_args(&path, &["--hfsCompression"]));
+        fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn roundtrip_with_corrupt_lines() {

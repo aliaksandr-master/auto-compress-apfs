@@ -14,6 +14,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`ditto-probe.txt`, copy in `ditto-probe.out/`) and uses `--hfsCompression --noclone` or
   `--hfsCompression`, whichever compresses; when neither does, the run stops before the walk
   with exit code 1 and changes nothing.
+- The incompressible cache filled by such runs is dropped once and its files are checked again;
+  the options that filled the cache are now recorded next to it (`ditto-args.txt`).
 
 ## [0.3.0] - 2026-10-20
 
