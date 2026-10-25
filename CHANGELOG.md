@@ -6,6 +6,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `install-launchd`: writes `run.sh` next to the config and a per-user launchd agent
+  (`~/Library/LaunchAgents/local.auto-compress-apfs.plist`) that starts it at login and daily at
+  09:00. `run.sh` runs `compress --apply` once per day from 09:00 on, so a run missed while the
+  Mac was asleep or off starts once later; when the binary is gone it only logs to
+  `launchd.log` and exits 0. `uninstall-launchd` unloads the agent and removes both files.
+
 ### Fixed
 
 - macOS 27: ditto clones files by default there and a clone is never compressed, so

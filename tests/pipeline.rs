@@ -108,6 +108,8 @@ impl Env {
         cmd.args(args)
             .env("HOME", &self.home)
             .env_remove("ACZ_TODAY")
+            // install-launchd must never load an agent into the real login session.
+            .env("ACZ_SKIP_LAUNCHCTL", "1")
             .env("COLUMNS", "400")
             .env("PWD", &self.base)
             .current_dir(&self.base);
@@ -443,6 +445,66 @@ fn cache_filled_with_other_ditto_args_is_dropped() {
         "{s:?}"
     );
     assert!(!compressed(&b));
+    force_remove(&env.base);
+}
+
+#[test]
+fn install_and_uninstall_launchd() {
+    let env = Env::new("launchd", "");
+    let plist = env
+        .home
+        .join("Library/LaunchAgents/local.auto-compress-apfs.plist");
+    let script = env.config.with_file_name("run.sh");
+    let out = env.exec(&["install-launchd"], None);
+    assert!(out.status.success(), "{out:?}");
+    // launchctl was not run (ACZ_SKIP_LAUNCHCTL).
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("launchctl skipped") && !stdout.contains("loaded local."));
+    let lint = Command::new("/usr/bin/plutil")
+        .arg("-lint")
+        .arg(&plist)
+        .output()
+        .unwrap();
+    assert!(lint.status.success(), "{lint:?}");
+    let p = fs::read_to_string(&plist).unwrap();
+    assert!(
+        p.contains(&format!("<string>{}</string>", script.display())),
+        "{p}"
+    );
+    assert!(
+        p.contains(&format!("{}/launchd.log", env.base.join("logs").display())),
+        "{p}"
+    );
+    assert_eq!(lstat(&script).mode() & 0o777, 0o755);
+    let s = fs::read_to_string(&script).unwrap();
+    let bin = env!("CARGO_BIN_EXE_auto-compress-apfs");
+    assert!(s.contains(&format!("BIN={bin}\n")), "{s}");
+    // The default config is not passed: such runs stay unrestricted.
+    assert!(s.contains("exec \"$BIN\" compress --apply\n"), "{s}");
+    // Uninstall neither needs a valid config nor writes one.
+    fs::write(&env.config, "not = [valid").unwrap();
+    let out = env.exec(&["uninstall-launchd"], None);
+    assert!(out.status.success(), "{out:?}");
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("loaded local."));
+    assert!(!plist.exists() && !script.exists());
+    assert_eq!(fs::read_to_string(&env.config).unwrap(), "not = [valid");
+    // A second uninstall finds nothing and is fine.
+    assert!(env.exec(&["uninstall-launchd"], None).status.success());
+    assert!(
+        !env.exec(&["install-launchd", "--bogus"], None)
+            .status
+            .success()
+    );
+    // Both refuse while a run holds the lock.
+    let lock = fs::File::create(env.state().with_file_name("run.lock")).unwrap();
+    lock.try_lock().unwrap();
+    for cmd in ["install-launchd", "uninstall-launchd"] {
+        let out = env.exec(&[cmd], None);
+        assert!(!out.status.success(), "{cmd}: {out:?}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("a run is in progress"));
+    }
+    assert!(!plist.exists());
+    drop(lock);
     force_remove(&env.base);
 }
 

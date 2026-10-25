@@ -6,6 +6,7 @@ mod classify;
 mod clean;
 mod compress;
 mod config;
+mod launchd;
 mod logger;
 mod progress;
 mod quarantine;
@@ -44,6 +45,8 @@ Usage:
   auto-compress-apfs quarantine list [--config PATH]
   auto-compress-apfs quarantine clear <PATH>|--all [--config PATH]
   auto-compress-apfs clean [--apply] [--config PATH]
+  auto-compress-apfs install-launchd [--config PATH]
+  auto-compress-apfs uninstall-launchd [--config PATH]
   auto-compress-apfs -h|--help | -V|--version
 
 Turns on APFS transparent compression (ditto --hfsCompression) for files matched by the
@@ -69,7 +72,12 @@ stat options:
 
 clean options:
   --apply                    delete the listed leftover dirs that are not blocked
-                             (default: preview only, nothing is changed)";
+                             (default: preview only, nothing is changed)
+
+install-launchd: writes run.sh next to the config and a per-user launchd agent that starts it
+at login and daily at 09:00; run.sh runs `compress --apply` once a day from 09:00 on (a missed
+run starts once later) and only logs to launchd.log when the binary is gone.
+uninstall-launchd: unloads the agent and removes it and run.sh.";
 
 /// Options of `compress` (also the default command).
 #[derive(Debug, Default)]
@@ -115,6 +123,11 @@ enum Cli {
     Quarantine {
         config: Option<PathBuf>,
         cmd: QuarantineCmd,
+    },
+    /// `install-launchd` (`true`) or `uninstall-launchd`.
+    Launchd {
+        config: Option<PathBuf>,
+        install: bool,
     },
     Exit(ExitCode),
 }
@@ -299,6 +312,19 @@ fn parse_quarantine(mut it: impl Iterator<Item = String>) -> Result<Cli, String>
     Ok(Cli::Quarantine { config, cmd })
 }
 
+fn parse_launchd(mut it: impl Iterator<Item = String>, install: bool) -> Result<Cli, String> {
+    let mut config = None;
+    while let Some(arg) = it.next() {
+        if let Some(exit) = help_or_version(&arg) {
+            return Ok(exit);
+        }
+        if !config_opt(&arg, &mut it, &mut config)? {
+            return Err(format!("unknown argument `{arg}`"));
+        }
+    }
+    Ok(Cli::Launchd { config, install })
+}
+
 fn parse_args(it: impl Iterator<Item = String>) -> Result<Cli, String> {
     let mut it = it.peekable();
     match it.peek().map(String::as_str) {
@@ -306,6 +332,8 @@ fn parse_args(it: impl Iterator<Item = String>) -> Result<Cli, String> {
         Some("stat") => parse_stat(it.skip(1)),
         Some("clean") => parse_clean(it.skip(1)),
         Some("quarantine") => parse_quarantine(it.skip(1)),
+        Some("install-launchd") => parse_launchd(it.skip(1), true),
+        Some("uninstall-launchd") => parse_launchd(it.skip(1), false),
         _ => parse_compress(it),
     }
 }
@@ -329,6 +357,7 @@ fn main() -> ExitCode {
         Cli::Stat(args) => cmd_stat(&args, &home),
         Cli::Clean(args) => return cmd_clean(&args, &home),
         Cli::Quarantine { config, cmd } => cmd_quarantine(config, &cmd, &home),
+        Cli::Launchd { config, install } => cmd_launchd(config, install, &home),
         Cli::Exit(code) => return code,
     };
     match result {
@@ -404,6 +433,44 @@ fn cmd_stat(a: &StatArgs, home: &Path) -> Result<ExitCode, String> {
         .and_then(|c| c.parse().ok())
         .unwrap_or(stat::DEFAULT_WIDTH);
     print!("{}", stat::render(&st, &q, a.top, width));
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `install-launchd` / `uninstall-launchd` for the effective config (see [`launchd`]). Both
+/// refuse while a run holds the lock: unloading the agent would kill that run. Uninstall
+/// neither reads nor creates the config.
+fn cmd_launchd(config: Option<PathBuf>, install: bool, home: &Path) -> Result<ExitCode, String> {
+    let cwd = current_dir()?;
+    let config = config.map(|c| normalize(&cwd.join(c)));
+    let config_path = config_path(config.as_ref(), home);
+    let script = config_path.with_file_name(launchd::SCRIPT_NAME);
+    let plist = home
+        .join("Library/LaunchAgents")
+        .join(format!("{}.plist", launchd::LABEL));
+    // Released before the agent is loaded: its first run takes the lock itself.
+    if acquire_lock(&state_dir(home))?.is_none() {
+        return Err("a run is in progress, retry when it has finished".into());
+    }
+    if !install {
+        launchd::uninstall(&plist, &script)?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    let (cfg, created) = Config::load_or_create(&config_path, home)?;
+    if created {
+        println!("created {}", config_path.display());
+    }
+    // Lexically normalized, not canonicalized: a symlink stays a symlink.
+    let bin = std::env::current_exe()
+        .map(|b| normalize(&b))
+        .map_err(|e| format!("cannot locate this binary: {e}"))?;
+    launchd::install(&launchd::Agent {
+        bin,
+        config,
+        script,
+        plist,
+        launchd_log: cfg.log_dir().join(logger::LAUNCHD_LOG_NAME),
+        last_run: state_dir(home).join(launchd::LAST_RUN_NAME),
+    })?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -1143,7 +1210,7 @@ fn probe_ditto(config_path: &Path, home: &Path, log: &Logger) -> Result<DittoArg
 }
 
 /// Quotes an argument for a POSIX shell when it needs it.
-fn shell_quote(s: &str) -> String {
+pub(crate) fn shell_quote(s: &str) -> String {
     let plain = !s.is_empty()
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"-_./=:,+@%".contains(&b));

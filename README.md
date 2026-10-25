@@ -37,6 +37,7 @@ shows the installed version, `auto-compress-apfs --version` the one on your `PAT
 **Uninstall:**
 
 ```sh
+auto-compress-apfs uninstall-launchd    # only if install-launchd was used
 cargo uninstall auto-compress-apfs
 rm -rf ~/.config/auto-compress-apfs ~/Library/Logs/auto-compress-apfs \
        ~/Library/Caches/auto-compress-apfs "$HOME/Library/Application Support/auto-compress-apfs"
@@ -171,6 +172,8 @@ auto-compress-apfs stat [--top N] [--all] [--config PATH]
 auto-compress-apfs quarantine list [--config PATH]
 auto-compress-apfs quarantine clear <PATH>|--all [--config PATH]
 auto-compress-apfs clean [--apply] [--config PATH]
+auto-compress-apfs install-launchd [--config PATH]
+auto-compress-apfs uninstall-launchd [--config PATH]
 auto-compress-apfs -h|--help | -V|--version
 ```
 
@@ -239,6 +242,33 @@ auto-compress-apfs -h|--help | -V|--version
   in place is printed to stderr with its reason. Exit code of `clean --apply`: 1 when a directory
   was blocked or could not be (fully) removed (stderr says when it is only because of blocked
   ones), else 0.
+
+- `install-launchd` sets up the daily run for the current user (no `sudo`):
+  - writes `run.sh` next to the config (mode 0755) with the absolute path of the binary it was
+    started as (a symlink stays a symlink, so a rebuilt binary is picked up) and, for a
+    non-default config, its `--config`;
+  - writes `~/Library/LaunchAgents/local.auto-compress-apfs.plist`, which starts `/bin/sh run.sh`
+    at load (login, install) and daily at 09:00 local time, with stdout and stderr appended to
+    `<log_dir>/launchd.log` and `Nice` 10;
+  - reloads the agent with `/bin/launchctl bootout` + `bootstrap gui/<uid>`, replacing an agent
+    with the same label.
+
+  `run.sh` starts `compress --apply` at most once per local day and never before 09:00: it records
+  the day in `last-run-day` in the state dir. A run missed during sleep is started by launchd on
+  wake, one missed while the Mac was off at the next login, in both cases once (a wake or login
+  before 09:00 waits for that day's 09:00 run). When the binary is gone (or not executable) it
+  only appends a line to `launchd.log` and exits 0. Otherwise it `exec`s the binary, whose errors
+  land in `launchd.log` through stderr. With `exec` the job's process is the binary itself, so a
+  Full Disk Access or Downloads grant for the binary should apply to the scheduled run as it did
+  to a job starting the binary directly (not verified: if the log shows `Operation not permitted`
+  in a protected folder, grant access to the binary again; if that does not help, the run is
+  attributed to `/bin/sh`, and running the binary directly from a launchd job is the way out).
+  Installing after 09:00 on a day
+  without a recorded run (also the first day after a scheduler that did not record it) starts
+  one right away. `uninstall-launchd` boots the agent out and removes the plist and `run.sh`
+  (anything already gone is fine; it does not read the config); pass the same `--config` as to
+  `install-launchd`. Both commands refuse while a run holds the lock, since unloading the agent
+  would stop that run.
 
 Exit code 0 when the run finished (per-file errors are logged, not fatal) and when another run holds
 the lock (then `a run is in progress, exiting` goes to stderr and the log); 1 on a fatal error

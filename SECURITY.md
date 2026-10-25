@@ -14,6 +14,7 @@ config that reproduce it.
 - Guard bypass: a walk or compression outside the documented hard protections (other volumes,
   network or cloud storage, `/Volumes`, system paths, privacy-protected folders without an
   explicit root, flagged or dataless items).
-- Executing anything other than `/usr/bin/ditto`.
+- Executing anything other than `/usr/bin/ditto` (and `/bin/launchctl`, only from
+  `install-launchd` / `uninstall-launchd`).
 
 Only the latest released version is supported.
