@@ -47,6 +47,7 @@ Usage:
   auto-compress-apfs clean [--apply] [--config PATH]
   auto-compress-apfs install-launchd [--config PATH]
   auto-compress-apfs uninstall-launchd [--config PATH]
+  auto-compress-apfs check-launchd [--config PATH]
   auto-compress-apfs -h|--help | -V|--version
 
 Turns on APFS transparent compression (ditto --hfsCompression) for files matched by the
@@ -77,7 +78,10 @@ clean options:
 install-launchd: writes run.sh next to the config and a per-user launchd agent that starts it
 at login and daily at 09:00; run.sh runs `compress --apply` once a day from 09:00 on (a missed
 run starts once later) and only logs to launchd.log when the binary is gone.
-uninstall-launchd: unloads the agent and removes it and run.sh.";
+uninstall-launchd: unloads the agent and removes it and run.sh.
+check-launchd: read-only; prints OK (exit 0) when the agent is installed, loaded and written by
+this version, else INSTALL or REINSTALL with the reason and the command to run (exit 1);
+exit 2 when the check itself failed.";
 
 /// Options of `compress` (also the default command).
 #[derive(Debug, Default)]
@@ -115,6 +119,13 @@ enum QuarantineCmd {
     Clear(Option<String>),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaunchdCmd {
+    Install,
+    Uninstall,
+    Check,
+}
+
 #[derive(Debug)]
 enum Cli {
     Compress(CompressArgs),
@@ -124,10 +135,10 @@ enum Cli {
         config: Option<PathBuf>,
         cmd: QuarantineCmd,
     },
-    /// `install-launchd` (`true`) or `uninstall-launchd`.
+    /// `install-launchd`, `uninstall-launchd` or `check-launchd`.
     Launchd {
         config: Option<PathBuf>,
-        install: bool,
+        cmd: LaunchdCmd,
     },
     Exit(ExitCode),
 }
@@ -312,7 +323,7 @@ fn parse_quarantine(mut it: impl Iterator<Item = String>) -> Result<Cli, String>
     Ok(Cli::Quarantine { config, cmd })
 }
 
-fn parse_launchd(mut it: impl Iterator<Item = String>, install: bool) -> Result<Cli, String> {
+fn parse_launchd(mut it: impl Iterator<Item = String>, cmd: LaunchdCmd) -> Result<Cli, String> {
     let mut config = None;
     while let Some(arg) = it.next() {
         if let Some(exit) = help_or_version(&arg) {
@@ -322,7 +333,7 @@ fn parse_launchd(mut it: impl Iterator<Item = String>, install: bool) -> Result<
             return Err(format!("unknown argument `{arg}`"));
         }
     }
-    Ok(Cli::Launchd { config, install })
+    Ok(Cli::Launchd { config, cmd })
 }
 
 fn parse_args(it: impl Iterator<Item = String>) -> Result<Cli, String> {
@@ -332,8 +343,9 @@ fn parse_args(it: impl Iterator<Item = String>) -> Result<Cli, String> {
         Some("stat") => parse_stat(it.skip(1)),
         Some("clean") => parse_clean(it.skip(1)),
         Some("quarantine") => parse_quarantine(it.skip(1)),
-        Some("install-launchd") => parse_launchd(it.skip(1), true),
-        Some("uninstall-launchd") => parse_launchd(it.skip(1), false),
+        Some("install-launchd") => parse_launchd(it.skip(1), LaunchdCmd::Install),
+        Some("uninstall-launchd") => parse_launchd(it.skip(1), LaunchdCmd::Uninstall),
+        Some("check-launchd") => parse_launchd(it.skip(1), LaunchdCmd::Check),
         _ => parse_compress(it),
     }
 }
@@ -357,7 +369,7 @@ fn main() -> ExitCode {
         Cli::Stat(args) => cmd_stat(&args, &home),
         Cli::Clean(args) => return cmd_clean(&args, &home),
         Cli::Quarantine { config, cmd } => cmd_quarantine(config, &cmd, &home),
-        Cli::Launchd { config, install } => cmd_launchd(config, install, &home),
+        Cli::Launchd { config, cmd } => cmd_launchd(config, cmd, &home),
         Cli::Exit(code) => return code,
     };
     match result {
@@ -439,17 +451,20 @@ fn cmd_stat(a: &StatArgs, home: &Path) -> Result<ExitCode, String> {
 /// `install-launchd` / `uninstall-launchd` for the effective config (see [`launchd`]). Both
 /// refuse while a run holds the lock: unloading the agent would kill that run. Uninstall
 /// neither reads nor creates the config.
-fn cmd_launchd(config: Option<PathBuf>, install: bool, home: &Path) -> Result<ExitCode, String> {
+fn cmd_launchd(config: Option<PathBuf>, cmd: LaunchdCmd, home: &Path) -> Result<ExitCode, String> {
     let cwd = current_dir()?;
     let config = config.map(|c| normalize(&cwd.join(c)));
     let config_path = config_path(config.as_ref(), home);
     let script = config_path.with_file_name(launchd::SCRIPT_NAME);
     let plist = launchd::agents_dir(home).join(format!("{}.plist", launchd::LABEL));
+    if cmd == LaunchdCmd::Check {
+        return check_launchd(config.as_deref(), &plist, &script, home);
+    }
     // Released before the agent is loaded: its first run takes the lock itself.
     if acquire_lock(&state_dir(home))?.is_none() {
         return Err("a run is in progress, retry when it has finished".into());
     }
-    if !install {
+    if cmd == LaunchdCmd::Uninstall {
         launchd::uninstall(&plist, &script)?;
         return Ok(ExitCode::SUCCESS);
     }
@@ -470,6 +485,89 @@ fn cmd_launchd(config: Option<PathBuf>, install: bool, home: &Path) -> Result<Ex
         last_run: state_dir(home).join(launchd::LAST_RUN_NAME),
     })?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// `check-launchd`: read-only. The script checked is the one the installed plist starts
+/// (else the one next to the config). Compares the installed run.sh and plist with what this
+/// version would write for the binary and config run.sh names, and asks launchd whether the
+/// agent is loaded. Exit 0: nothing to do; 1: run `install-launchd` (the printed command keeps
+/// the installed config); 2: the check itself failed (unreadable file, invalid config).
+fn check_launchd(
+    config: Option<&Path>,
+    plist: &Path,
+    script: &Path,
+    home: &Path,
+) -> Result<ExitCode, String> {
+    let script = fs::read_to_string(plist)
+        .ok()
+        .and_then(|t| launchd::plist_script(&t))
+        .unwrap_or_else(|| script.to_path_buf());
+    let script = script.as_path();
+    let agent_for = |bin: PathBuf, installed_config: Option<PathBuf>| {
+        let path = config_path(installed_config.as_ref(), home);
+        let text = match fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Err(format!(
+                    "{} named by run.sh is missing",
+                    path.display()
+                )));
+            }
+            Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+        };
+        let cfg = Config::parse(&text, home)
+            .map_err(|e| format!("invalid config {}: {e}", path.display()))?;
+        Ok(Ok(launchd::Agent {
+            bin,
+            config: installed_config,
+            script: script.to_path_buf(),
+            plist: plist.to_path_buf(),
+            launchd_log: cfg.log_dir().join(logger::LAUNCHD_LOG_NAME),
+            last_run: state_dir(home).join(launchd::LAST_RUN_NAME),
+        }))
+    };
+    let ask_launchd = !launchd::skip_launchctl();
+    let verdict = match launchd::check(plist, script, ask_launchd, agent_for) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{NAME}: check-launchd failed: {e}");
+            return Ok(ExitCode::from(2));
+        }
+    };
+    // Keep the config the installed agent runs; fall back to --config for a new install.
+    let config = match launchd::installed_config(script) {
+        Some(installed) => installed,
+        None => config.map(Path::to_path_buf),
+    };
+    let fix = match config {
+        Some(c) => format!(
+            "{NAME} install-launchd --config {}",
+            shell_quote(&c.to_string_lossy())
+        ),
+        None => format!("{NAME} install-launchd"),
+    };
+    Ok(match verdict {
+        launchd::Verdict::UpToDate => {
+            let loaded = if ask_launchd {
+                "loaded"
+            } else {
+                "launchd not asked"
+            };
+            println!(
+                "OK: the launchd agent is installed ({loaded}) and up to date ({})",
+                plist.display()
+            );
+            ExitCode::SUCCESS
+        }
+        launchd::Verdict::Install(why) => {
+            println!("INSTALL: {why}; run: {fix}");
+            ExitCode::FAILURE
+        }
+        launchd::Verdict::Reinstall(why) => {
+            println!("REINSTALL: {why}; run: {fix}");
+            ExitCode::FAILURE
+        }
+    })
 }
 
 /// `quarantine list` (read-only) and `quarantine clear` (under the run lock; also resets the

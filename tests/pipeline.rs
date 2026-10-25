@@ -481,6 +481,23 @@ fn install_and_uninstall_launchd() {
     assert!(s.contains(&format!("BIN={bin}\n")), "{s}");
     // The default config is not passed: such runs stay unrestricted.
     assert!(s.contains("exec \"$BIN\" compress --apply\n"), "{s}");
+    // check-launchd: OK after install, REINSTALL for a changed script, INSTALL when removed.
+    let check = |env: &Env| {
+        let out = env.exec(&["check-launchd"], None);
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        )
+    };
+    let (ok, text) = check(&env);
+    assert!(ok && text.starts_with("OK: "), "{text}");
+    fs::write(&script, s.replace("exec ", "")).unwrap();
+    let (ok, text) = check(&env);
+    assert!(
+        !ok && text.starts_with("REINSTALL: ") && text.contains("another version"),
+        "{text}"
+    );
+    fs::write(&script, &s).unwrap();
     // Uninstall neither needs a valid config nor writes one.
     fs::write(&env.config, "not = [valid").unwrap();
     let out = env.exec(&["uninstall-launchd"], None);
@@ -488,6 +505,8 @@ fn install_and_uninstall_launchd() {
     assert!(!String::from_utf8_lossy(&out.stdout).contains("loaded local."));
     assert!(!plist.exists() && !script.exists());
     assert_eq!(fs::read_to_string(&env.config).unwrap(), "not = [valid");
+    let (ok, text) = check(&env);
+    assert!(!ok && text.starts_with("INSTALL: "), "{text}");
     // A second uninstall finds nothing and is fine.
     assert!(env.exec(&["uninstall-launchd"], None).status.success());
     assert!(
@@ -505,6 +524,70 @@ fn install_and_uninstall_launchd() {
     }
     assert!(!plist.exists());
     drop(lock);
+    force_remove(&env.base);
+}
+
+#[test]
+fn check_launchd_follows_the_installed_config_and_writes_nothing() {
+    let env = Env::new("check", "");
+    let check = |args: &[&str]| {
+        let out = env.exec(args, None);
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        )
+    };
+    // A fresh HOME: nothing installed, and the check creates nothing.
+    let fresh = env.base.join("fresh");
+    fs::create_dir_all(&fresh).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_auto-compress-apfs"))
+        .arg("check-launchd")
+        .env("HOME", &fresh)
+        .env("ACZ_SKIP_LAUNCHCTL", "1")
+        .env("ACZ_LAUNCH_AGENTS_DIR", fresh.join("agents"))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stdout).starts_with("INSTALL: "));
+    assert_eq!(
+        fs::read_dir(&fresh).unwrap().count(),
+        0,
+        "check-launchd wrote into HOME"
+    );
+    // Installed with another config: a check without --config follows the plist.
+    let other = env.base.join("other/c.toml");
+    fs::create_dir_all(other.parent().unwrap()).unwrap();
+    fs::copy(&env.config, &other).unwrap();
+    let other_arg = other.to_string_lossy().into_owned();
+    assert!(
+        env.exec(&["install-launchd", "--config", &other_arg], None)
+            .status
+            .success()
+    );
+    let (code, text) = check(&["check-launchd"]);
+    assert_eq!(code, Some(0), "{text}");
+    assert!(text.contains("launchd not asked"), "{text}");
+    // A stale script: the fix keeps the installed config.
+    let script = other.with_file_name("run.sh");
+    let s = fs::read_to_string(&script).unwrap();
+    fs::write(&script, s.replace("exec ", "")).unwrap();
+    let (code, text) = check(&["check-launchd"]);
+    assert_eq!(code, Some(1), "{text}");
+    assert!(
+        text.contains(&format!("install-launchd --config {other_arg}")),
+        "{text}"
+    );
+    fs::write(&script, &s).unwrap();
+    // The config run.sh names is gone: reinstall (install-launchd recreates it).
+    fs::rename(&other, other.with_extension("bak")).unwrap();
+    let (code, text) = check(&["check-launchd"]);
+    assert!(
+        code == Some(1) && text.contains("named by run.sh is missing"),
+        "{text}"
+    );
+    // An invalid one: the check fails with exit 2.
+    fs::write(&other, "not = [valid").unwrap();
+    assert_eq!(check(&["check-launchd"]).0, Some(2));
     force_remove(&env.base);
 }
 

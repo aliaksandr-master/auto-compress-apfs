@@ -13,6 +13,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   09:00. `run.sh` runs `compress --apply` once per day from 09:00 on, so a run missed while the
   Mac was asleep or off starts once later; when the binary is gone it only logs to
   `launchd.log` and exits 0. `uninstall-launchd` unloads the agent and removes both files.
+- `check-launchd`: read-only; prints `OK` (exit 0) when the agent is installed, loaded and
+  written by this version, else `INSTALL` or `REINSTALL` with the reason and the command to run
+  (exit 1, keeping the config the installed agent runs); exit 2 when the check itself fails.
 
 ### Fixed
 

@@ -174,6 +174,7 @@ auto-compress-apfs quarantine clear <PATH>|--all [--config PATH]
 auto-compress-apfs clean [--apply] [--config PATH]
 auto-compress-apfs install-launchd [--config PATH]
 auto-compress-apfs uninstall-launchd [--config PATH]
+auto-compress-apfs check-launchd [--config PATH]
 auto-compress-apfs -h|--help | -V|--version
 ```
 
@@ -269,6 +270,16 @@ auto-compress-apfs -h|--help | -V|--version
   (anything already gone is fine; it does not read the config); pass the same `--config` as to
   `install-launchd`. Both commands refuse while a run holds the lock, since unloading the agent
   would stop that run.
+- `check-launchd` changes nothing and creates nothing. It reads the `run.sh` the installed plist
+  starts (without a plist, the one next to the config), takes the binary and config named there,
+  and compares `run.sh` and the plist byte for byte with what this version would write for them;
+  it also checks that the binary is executable and that launchd has the agent loaded from that
+  plist. It prints one line: `OK: ...` (exit 0), or `INSTALL: ...` (nothing installed) or
+  `REINSTALL: <reason>` (a file missing or different from what `install-launchd` writes now, the
+  config run.sh names gone, the binary gone, the agent not loaded), both exit 1 and both with the
+  command to run, which keeps the config the installed agent uses. Exit 2 (message on stderr,
+  nothing on stdout) when the check itself fails, e.g. on an invalid config. A new binary at the
+  same path needs no reinstall: `run.sh` starts whatever is there.
 
 Exit code 0 when the run finished (per-file errors are logged, not fatal) and when another run holds
 the lock (then `a run is in progress, exiting` goes to stderr and the log); 1 on a fatal error

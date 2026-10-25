@@ -7,7 +7,7 @@ use crate::shell_quote;
 use crate::sys;
 use std::fs;
 use std::io;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
@@ -125,7 +125,7 @@ pub fn agents_dir(home: &Path) -> PathBuf {
 
 /// Whether launchctl is left out: set `ACZ_SKIP_LAUNCHCTL` (tests must never load an agent into
 /// the real login session, in any build).
-fn skip_launchctl() -> bool {
+pub fn skip_launchctl() -> bool {
     std::env::var_os("ACZ_SKIP_LAUNCHCTL").is_some()
 }
 
@@ -213,6 +213,131 @@ pub fn install(a: &Agent) -> Result<(), String> {
     Ok(())
 }
 
+/// What `check-launchd` concludes.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Verdict {
+    UpToDate,
+    /// Nothing is installed or loaded.
+    Install(String),
+    /// Something is installed but missing, stale, unloaded or points to a missing binary.
+    Reinstall(String),
+}
+
+/// Undoes [`shell_quote`].
+fn shell_unquote(s: &str) -> String {
+    match s.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
+        Some(inner) => inner.replace(r"'\''", "'"),
+        None => s.to_owned(),
+    }
+}
+
+/// The binary and `--config` an installed script runs; `None` without a `BIN=` line.
+fn installed_params(script: &str) -> Option<(PathBuf, Option<PathBuf>)> {
+    let bin = script.lines().find_map(|l| l.strip_prefix("BIN="))?;
+    let config = script
+        .lines()
+        // Also the line of older scripts without `exec`.
+        .find_map(|l| l.split_once(" compress --apply --config ").map(|(_, c)| c));
+    Some((
+        PathBuf::from(shell_unquote(bin)),
+        config.map(|c| PathBuf::from(shell_unquote(c))),
+    ))
+}
+
+/// The script an installed plist starts (the argument after `/bin/sh`).
+pub fn plist_script(plist: &str) -> Option<PathBuf> {
+    let rest = plist.split_once("<string>/bin/sh</string>")?.1;
+    let arg = rest.split_once("<string>")?.1.split_once("</string>")?.0;
+    let arg = arg
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&");
+    Some(PathBuf::from(arg))
+}
+
+/// The `--config` an installed script passes (`Some(None)`: the default config); `None` when
+/// the script cannot be read or parsed.
+pub fn installed_config(script: &Path) -> Option<Option<PathBuf>> {
+    let text = fs::read_to_string(script).ok()?;
+    installed_params(&text).map(|(_, c)| c)
+}
+
+/// Whether launchd has the agent loaded from `plist`.
+fn loaded_from(plist: &Path) -> bool {
+    Command::new(LAUNCHCTL)
+        .args(["print", &format!("{}/{LABEL}", domain())])
+        .output()
+        .is_ok_and(|o| {
+            o.status.success()
+                && String::from_utf8_lossy(&o.stdout).contains(&*plist.to_string_lossy())
+        })
+}
+
+/// Read-only check of an installation. The installed script names the binary and config it
+/// runs; `agent_for` turns them into the [`Agent`] this version would install, whose script and
+/// plist must equal the installed files byte for byte. `ask_launchd` is false in tests.
+pub fn check(
+    plist: &Path,
+    script: &Path,
+    ask_launchd: bool,
+    agent_for: impl FnOnce(PathBuf, Option<PathBuf>) -> Result<Result<Agent, String>, String>,
+) -> Result<Verdict, String> {
+    let read = |p: &Path| match fs::read_to_string(p) {
+        Ok(t) => Ok(Some(t)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("cannot read {}: {e}", p.display())),
+    };
+    let (installed_script, installed_plist) = (read(script)?, read(plist)?);
+    let loaded = ask_launchd && loaded_from(plist);
+    let reinstall = |why: String| Ok(Verdict::Reinstall(why));
+    let (installed_script, installed_plist) = match (installed_script, installed_plist) {
+        (None, None) if !loaded => {
+            return Ok(Verdict::Install(
+                "the launchd agent is not installed".into(),
+            ));
+        }
+        (None, _) => return reinstall(format!("{} is missing", script.display())),
+        (_, None) => return reinstall(format!("{} is missing", plist.display())),
+        (Some(s), Some(p)) => (s, p),
+    };
+    let Some((bin, config)) = installed_params(&installed_script) else {
+        return reinstall(format!(
+            "{} was written by another version",
+            script.display()
+        ));
+    };
+    // Inner `Err`: a reason to reinstall (the config run.sh names is gone).
+    let a = match agent_for(bin, config)? {
+        Ok(a) => a,
+        Err(why) => return reinstall(why),
+    };
+    if installed_script != render_script(&a, RUN_HOUR) {
+        return reinstall(format!(
+            "{} differs from what install-launchd writes now (another version or a changed \
+             log_dir)",
+            script.display()
+        ));
+    }
+    if installed_plist != render_plist(&a) {
+        return reinstall(format!(
+            "{} differs from what install-launchd writes now (another version or a changed \
+             log_dir)",
+            plist.display()
+        ));
+    }
+    let executable = fs::metadata(&a.bin).is_ok_and(|m| m.is_file() && m.mode() & 0o111 != 0);
+    if !executable {
+        return reinstall(format!(
+            "the binary it runs, {}, is missing or not executable",
+            a.bin.display()
+        ));
+    }
+    if ask_launchd && !loaded {
+        return reinstall("the agent is not loaded in launchd".into());
+    }
+    Ok(Verdict::UpToDate)
+}
+
 /// Unloads the agent and removes `plist` and `script`; anything already gone is fine.
 pub fn uninstall(plist: &Path, script: &Path) -> Result<(), String> {
     if !skip_launchctl() {
@@ -292,6 +417,63 @@ mod tests {
         fs::write(&a.last_run, "2000-01-01\n").unwrap();
         assert!(run(&a, 24));
         assert_eq!(read(&calls).lines().count(), 2);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn installed_params_undo_the_quoting() {
+        let dir = temp_dir("params");
+        let mut a = agent(&dir, Some("/c 'q' $x/a.toml"));
+        a.bin = PathBuf::from("/b i'n/x");
+        let s = render_script(&a, RUN_HOUR);
+        assert_eq!(
+            installed_params(&s),
+            Some((a.bin.clone(), a.config.clone()))
+        );
+        a.config = None;
+        let s = render_script(&a, RUN_HOUR);
+        assert_eq!(installed_params(&s), Some((a.bin.clone(), None)));
+        assert_eq!(installed_params("#!/bin/sh\n"), None);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn check_tells_install_reinstall_and_up_to_date() {
+        let dir = temp_dir("check");
+        let a = agent(&dir, None);
+        let check = || {
+            check(&a.plist, &a.script, false, |bin, config| {
+                Ok(Ok(Agent {
+                    bin,
+                    config,
+                    ..agent(&dir, None)
+                }))
+            })
+            .unwrap()
+        };
+        assert!(matches!(check(), Verdict::Install(_)));
+        // The plist names its script; a missing config is a reason to reinstall.
+        assert_eq!(plist_script(&render_plist(&a)), Some(a.script.clone()));
+        let gone = super::check(&a.plist, &a.script, false, |_, _| {
+            Ok(Err("config gone".into()))
+        });
+        write_file(&a.script, &render_script(&a, RUN_HOUR), 0o755).unwrap();
+        assert!(matches!(check(), Verdict::Reinstall(w) if w.contains("agent.plist is missing")));
+        write_file(&a.plist, &render_plist(&a), 0o644).unwrap();
+        assert!(
+            matches!(check(), Verdict::Reinstall(w) if w.contains("is missing or not executable"))
+        );
+        write_file(&a.bin, "#!/bin/sh\n", 0o755).unwrap();
+        assert_eq!(check(), Verdict::UpToDate);
+        assert!(matches!(gone, Ok(Verdict::Install(_))));
+        let gone = super::check(&a.plist, &a.script, false, |_, _| {
+            Ok(Err("config gone".into()))
+        });
+        assert_eq!(gone, Ok(Verdict::Reinstall("config gone".into())));
+        // A script of another version (here: an older one without exec).
+        let old = render_script(&a, RUN_HOUR).replace("exec \"$BIN\"", "\"$BIN\"");
+        write_file(&a.script, &old, 0o755).unwrap();
+        assert!(matches!(check(), Verdict::Reinstall(w) if w.contains("differs from")));
         fs::remove_dir_all(&dir).unwrap();
     }
 
