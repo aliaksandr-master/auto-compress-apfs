@@ -113,8 +113,17 @@ holds the lock exits 0 at once.
    `kAFSCAllowLargeResourceForks`, lift the limit), hardlinked, owned by another user,
    setuid/setgid, modified in the last `min_age_secs`, known incompressible (cache), quarantined,
    or to compress.
-4. **Compress in batches.** Files of one match root (and device) are copied by one
-   `ditto --hfsCompression -- <files...> <root>/.acz-staging-<pid>-<n>/` call (up to `batch_size`
+4. **Probe ditto.** Before the walk, `compress --apply` copies `ditto-probe.txt` next to the
+   config (written there if missing, changed or compressed) into `ditto-probe.out/` with
+   `--hfsCompression --noclone`, then with `--hfsCompression` alone, and uses the first set that
+   yields a compressed, byte-identical copy (one INFO line names it). Since macOS 27 ditto clones
+   files by default and a clone is never compressed; older ditto may not know `--noclone`. When
+   the config dir is not writable or not on APFS the probe runs in the state dir (one WARN line).
+   A config dir synced elsewhere (dotfiles repo, cloud folder) gets these two entries too. When
+   no set compresses, the run stops before the walk with exit code 1 and changes nothing:
+   otherwise every file would be cached as incompressible.
+5. **Compress in batches.** Files of one match root (and device) are copied by one
+   `ditto <probed options> -- <files...> <root>/.acz-staging-<pid>-<n>/` call (up to `batch_size`
    files and 2 GiB of data; basenames unique per batch ignoring case, because APFS volumes are
    usually case- and normalisation-insensitive and ditto flattens all sources into one directory;
    staged copies that still end up sharing one entry are never committed, each such file is
@@ -231,7 +240,7 @@ auto-compress-apfs -h|--help | -V|--version
 Exit code 0 when the run finished (per-file errors are logged, not fatal) and when another run holds
 the lock (then `a run is in progress, exiting` goes to stderr and the log); 1 on a fatal error
 (bad config, log cannot be opened, unreadable `quarantine.txt`, or with `--apply` an unreadable
-`state.tsv`, ...).
+`state.tsv` or a ditto that does not compress, ...).
 
 ## Configuration
 

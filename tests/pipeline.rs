@@ -277,9 +277,17 @@ fn pipeline() {
         ("true", "5")
     );
     assert!(!env.state().exists());
+    let probe_src = env.config.with_file_name("ditto-probe.txt");
+    let probe_copy = env.config.with_file_name("ditto-probe.out/ditto-probe.txt");
+    assert!(!probe_src.exists(), "preview probed ditto");
 
-    // 2. Real run.
+    // 2. Real run: ditto is probed next to the config first.
     let s = env.apply();
+    assert!(!compressed(&probe_src) && compressed(&probe_copy));
+    assert!(
+        env.log_text()
+            .contains("INFO ditto compresses with: --hfsCompression")
+    );
     assert_eq!(s["compressed"], "3", "{s:?}");
     assert_eq!(s["incompressible"], "1", "{s:?}");
     assert_eq!(s["errors"], "1", "{s:?}");
@@ -418,6 +426,12 @@ fn quarantine_after_three_run_days() {
     let s = apply("2026-10-04");
     fs::set_permissions(&qdir, fs::Permissions::from_mode(0o755)).unwrap();
     assert_eq!(s["requarantined_new"], "1", "{s:?}");
+    // The ditto probe could not write next to the config either: it ran in the state dir.
+    assert!(env.log_text().contains("probing in the state dir"));
+    assert!(compressed(
+        &env.state()
+            .with_file_name("ditto-probe.out/ditto-probe.txt")
+    ));
     assert!(!compressed(&hot) && !env.quarantine().exists());
     assert!(env.log_text().contains("quarantine retried next run"));
     assert_eq!(env.streak(&hot), Some(3));

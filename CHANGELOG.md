@@ -6,6 +6,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- macOS 27: ditto clones files by default there and a clone is never compressed, so
+  `--hfsCompression` alone compressed nothing and every file was cached as incompressible.
+  `compress --apply` now probes ditto first with a small file next to the config
+  (`ditto-probe.txt`, copy in `ditto-probe.out/`) and uses `--hfsCompression --noclone` or
+  `--hfsCompression`, whichever compresses; when neither does, the run stops before the walk
+  with exit code 1 and changes nothing.
+
 ## [0.3.0] - 2026-10-20
 
 ### Added

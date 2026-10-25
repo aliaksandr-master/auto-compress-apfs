@@ -24,10 +24,20 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DITTO: &str = "/usr/bin/ditto";
+/// ditto argument sets, newest first. Since macOS 27 ditto clones files by default
+/// (`cloneFiles: true`) and a clone is never compressed, so `--noclone` is required there;
+/// older ditto may not know the option. [`probe`] picks the first set that compresses.
+pub const DITTO_ARGS: [DittoArgs; 2] = [&["--hfsCompression", "--noclone"], &["--hfsCompression"]];
+/// Source file of the start-up probe, kept uncompressed next to the config.
+const PROBE_NAME: &str = "ditto-probe.txt";
+/// Directory next to the config holding the probe's compressed copy, rebuilt by every probe.
+const PROBE_OUT: &str = "ditto-probe.out";
 /// Upper bound of source path bytes passed to one ditto call (ARG_MAX is 1 MiB incl. env).
 const MAX_ARG_BYTES: usize = 256 * 1024;
 const STDERR_KEEP: usize = 4096;
 const DITTO_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// The probe copies one small file: a hung ditto must not hold the start of a run for long.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 const VERIFY_BUF: usize = 1 << 20;
 /// Upper bound of file data copied by one ditto call (bounds staging space and timeout risk).
 const MAX_BATCH_DATA: u64 = 2 << 30;
@@ -35,6 +45,9 @@ const MAX_BATCH_DATA: u64 = 2 << 30;
 const MAX_RETRY_FAILURES: u32 = 3;
 /// Marker directory inside a staging dir holding a rescued file; stale cleanup keeps such a dir.
 pub(crate) const KEEP_MARKER: &str = ".acz-keep";
+
+/// The options passed to ditto before `--`.
+pub type DittoArgs = &'static [&'static str];
 
 /// A file replaced by its compressed copy: the identity and sizes for `state.tsv`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,6 +161,7 @@ struct DittoRun {
     status: DittoStatus,
     /// First [`STDERR_KEEP`] bytes of stderr, on one line.
     stderr: String,
+    timeout: Duration,
 }
 
 impl DittoRun {
@@ -158,7 +172,7 @@ impl DittoRun {
     fn describe(&self) -> String {
         let status = match &self.status {
             DittoStatus::Exited(s) => s.to_string(),
-            DittoStatus::TimedOut => format!("timed out after {} s", DITTO_TIMEOUT.as_secs()),
+            DittoStatus::TimedOut => format!("timed out after {} s", self.timeout.as_secs()),
             DittoStatus::SpawnFailed(e) => format!("cannot spawn {DITTO}: {e}"),
             DittoStatus::WaitFailed(e) => format!("cannot wait for {DITTO}: {e}"),
         };
@@ -212,12 +226,12 @@ fn wait_with_timeout(child: &mut Child, timeout: Duration) -> DittoStatus {
     }
 }
 
-/// `ditto --hfsCompression -- <sources...> <staging>/`; stderr drained to EOF on a helper thread.
-fn run_ditto(sources: &[&Path], staging: &Path, timeout: Duration) -> DittoRun {
+/// `ditto <args...> -- <sources...> <staging>/`; stderr drained to EOF on a helper thread.
+fn run_ditto(args: DittoArgs, sources: &[&Path], staging: &Path, timeout: Duration) -> DittoRun {
     let mut dest = staging.as_os_str().to_owned();
     dest.push("/");
     let spawned = Command::new(DITTO)
-        .arg("--hfsCompression")
+        .args(args)
         .arg("--")
         .args(sources)
         .arg(&dest)
@@ -231,6 +245,7 @@ fn run_ditto(sources: &[&Path], staging: &Path, timeout: Duration) -> DittoRun {
             return DittoRun {
                 status: DittoStatus::SpawnFailed(e),
                 stderr: String::new(),
+                timeout,
             };
         }
     };
@@ -245,7 +260,97 @@ fn run_ditto(sources: &[&Path], staging: &Path, timeout: Duration) -> DittoRun {
     let status = wait_with_timeout(&mut child, timeout);
     let stderr = reader.and_then(|r| r.join().ok()).unwrap_or_default();
     let stderr = String::from_utf8_lossy(&stderr).trim().replace('\n', " | ");
-    DittoRun { status, stderr }
+    DittoRun {
+        status,
+        stderr,
+        timeout,
+    }
+}
+
+/// Content of the probe source: plain text that always compresses.
+fn probe_content() -> Vec<u8> {
+    b"auto-compress-apfs ditto probe: this line repeats, so the file compresses well\n".repeat(2048)
+}
+
+/// Why [`probe`] found no ditto arguments.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ProbeError {
+    /// The probe files could not be written in its directory; ditto was not judged.
+    Setup(String),
+    /// No set of [`DITTO_ARGS`] produced a compressed, byte-identical copy.
+    NoCompression(String),
+}
+
+impl std::fmt::Display for ProbeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Setup(e) | Self::NoCompression(e) => f.write_str(e),
+        }
+    }
+}
+
+/// Finds the ditto arguments that compress on this system. `<dir>/ditto-probe.txt` is
+/// (re)written when missing, changed or compressed, then copied into `<dir>/ditto-probe.out/`
+/// with each set of [`DITTO_ARGS`] in turn; the first copy that is compressed and
+/// byte-identical wins and stays there until the next probe. A `dir` outside APFS is a
+/// [`ProbeError::Setup`]: no copy there could be compressed.
+pub fn probe(dir: &Path) -> Result<DittoArgs, ProbeError> {
+    probe_with(dir, &DITTO_ARGS)
+}
+
+/// [`probe`] with the candidate argument sets given.
+fn probe_with(dir: &Path, sets: &[DittoArgs]) -> Result<DittoArgs, ProbeError> {
+    match sys::statfs(dir) {
+        Ok(fs) if fs.fstype == "apfs" => {}
+        Ok(fs) => {
+            let e = format!("{} is on {}, not APFS", dir.display(), fs.fstype);
+            return Err(ProbeError::Setup(e));
+        }
+        Err(e) => {
+            return Err(ProbeError::Setup(format!(
+                "cannot statfs {}: {e}",
+                dir.display()
+            )));
+        }
+    }
+    let src = dir.join(PROBE_NAME);
+    let want = probe_content();
+    let intact = fs::symlink_metadata(&src)
+        .is_ok_and(|m| m.is_file() && m.st_flags() & UF_COMPRESSED == 0)
+        && fs::read(&src).is_ok_and(|b| b == want);
+    if !intact {
+        let _ = fs::remove_file(&src);
+        fs::write(&src, &want)
+            .map_err(|e| ProbeError::Setup(format!("cannot write {}: {e}", src.display())))?;
+    }
+    let out = dir.join(PROBE_OUT);
+    let copy = out.join(PROBE_NAME);
+    let mut failed = Vec::new();
+    for &args in sets {
+        match fs::remove_dir_all(&out) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => {
+                let e = format!("cannot remove {}: {e}", out.display());
+                return Err(ProbeError::Setup(e));
+            }
+            _ => {}
+        }
+        fs::create_dir(&out)
+            .map_err(|e| ProbeError::Setup(format!("cannot create {}: {e}", out.display())))?;
+        let run = run_ditto(args, &[&src], &out, PROBE_TIMEOUT);
+        let why = if !run.success() {
+            format!("ditto failed: {}", run.describe())
+        } else {
+            match fs::symlink_metadata(&copy) {
+                Ok(m) if !m.is_file() => "copy is not a regular file".to_owned(),
+                Ok(m) if m.st_flags() & UF_COMPRESSED == 0 => "copy is not compressed".to_owned(),
+                Ok(_) if fs::read(&copy).is_ok_and(|b| b == want) => return Ok(args),
+                Ok(_) => "copy differs from the source".to_owned(),
+                Err(e) => format!("no copy: {e}"),
+            }
+        };
+        failed.push(format!("{}: {why}", args.join(" ")));
+    }
+    Err(ProbeError::NoCompression(failed.join("; ")))
 }
 
 /// Splits one match root's files into batches: <= `max_files` files, <= `max_bytes` of source
@@ -418,6 +523,8 @@ pub struct Compressor<'a> {
     pub verify: bool,
     pub batch_size: usize,
     pub threads: usize,
+    /// ditto options chosen by [`probe`].
+    pub ditto_args: DittoArgs,
     /// Free bytes that must remain on the volume after a ditto call's data.
     pub min_free_bytes: u64,
     /// The low-space WARN was written (later ones are DEBUG).
@@ -432,6 +539,7 @@ impl<'a> Compressor<'a> {
         verify: bool,
         batch_size: usize,
         threads: usize,
+        ditto_args: DittoArgs,
         min_free_bytes: u64,
     ) -> Self {
         Self {
@@ -439,6 +547,7 @@ impl<'a> Compressor<'a> {
             verify,
             batch_size,
             threads,
+            ditto_args,
             min_free_bytes,
             low_space_warned: AtomicBool::new(false),
             unwritable: Mutex::new(HashSet::new()),
@@ -659,7 +768,7 @@ impl<'a> Compressor<'a> {
         }
         let sources: Vec<&Path> = files.iter().map(|c| c.path.as_path()).collect();
         out.ditto_calls += 1;
-        let run = run_ditto(&sources, staging, DITTO_TIMEOUT);
+        let run = run_ditto(self.ditto_args, &sources, staging, DITTO_TIMEOUT);
         let batch_ok = match &run.status {
             DittoStatus::Exited(_) => run.success(),
             DittoStatus::TimedOut | DittoStatus::SpawnFailed(_) | DittoStatus::WaitFailed(_) => {
@@ -743,7 +852,7 @@ impl<'a> Compressor<'a> {
                         break Commit::LowSpace;
                     }
                     out.ditto_calls += 1;
-                    let retry = run_ditto(&[&c.path], staging, DITTO_TIMEOUT);
+                    let retry = run_ditto(self.ditto_args, &[&c.path], staging, DITTO_TIMEOUT);
                     if !retry.success() {
                         retry_failures += 1;
                         let kind = if matches!(retry.status, DittoStatus::TimedOut) {
@@ -1071,6 +1180,60 @@ mod tests {
         dir
     }
 
+    /// The ditto options of this system, probed once per test process.
+    fn ditto_args() -> DittoArgs {
+        static ARGS: std::sync::OnceLock<DittoArgs> = std::sync::OnceLock::new();
+        ARGS.get_or_init(|| probe(&temp_dir("probe")).unwrap())
+    }
+
+    #[test]
+    fn probe_finds_compressing_args_and_restores_its_source() {
+        let dir = temp_dir("probe-restore");
+        let src = dir.join(PROBE_NAME);
+        let copy = dir.join(PROBE_OUT).join(PROBE_NAME);
+        let args = probe(&dir).unwrap();
+        assert!(DITTO_ARGS.contains(&args));
+        assert_eq!(flags(&src) & UF_COMPRESSED, 0);
+        assert_ne!(flags(&copy) & UF_COMPRESSED, 0);
+        assert_eq!(fs::read(&copy).unwrap(), probe_content());
+        // A changed source is rewritten.
+        fs::write(&src, "changed").unwrap();
+        assert_eq!(probe(&dir), Ok(args));
+        assert_eq!(fs::read(&src).unwrap(), probe_content());
+        // A compressed source would only be cloned or copied as is: it is rewritten too.
+        fs::rename(&copy, &src).unwrap();
+        assert_ne!(flags(&src) & UF_COMPRESSED, 0);
+        assert_eq!(probe(&dir), Ok(args));
+        assert_eq!(flags(&src) & UF_COMPRESSED, 0);
+        assert_ne!(flags(&copy) & UF_COMPRESSED, 0);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn probe_without_compressing_args_fails() {
+        let dir = temp_dir("probe-none");
+        // Plain ditto copies (or clones) an uncompressed source uncompressed on every macOS.
+        let r = probe_with(&dir, &[&[], &["--nohfsCompression"]]);
+        let Err(ProbeError::NoCompression(e)) = r else {
+            panic!("{r:?}")
+        };
+        assert!(
+            e.starts_with(": copy is not compressed; --nohfsCompression: "),
+            "{e}"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn probe_in_unwritable_dir_fails() {
+        let dir = temp_dir("probe-ro");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let r = probe(&dir);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(r, Err(ProbeError::Setup(e)) if e.starts_with("cannot write")));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
     fn cand(path: &str) -> Candidate {
         let m = fs::symlink_metadata("/").unwrap();
         Candidate::new(PathBuf::from(path), Arc::from(Path::new("/r")), &m)
@@ -1112,7 +1275,7 @@ mod tests {
             .map(|i| dir.join(format!("missing-file-with-a-long-name-{i}")))
             .collect();
         let refs: Vec<&Path> = missing.iter().map(PathBuf::as_path).collect();
-        let run = run_ditto(&refs, &dir, Duration::from_secs(120));
+        let run = run_ditto(ditto_args(), &refs, &dir, Duration::from_secs(120));
         assert!(matches!(run.status, DittoStatus::Exited(_)));
         assert!(!run.success());
         assert!(!run.stderr.is_empty() && run.stderr.len() <= STDERR_KEEP + 1024);
@@ -1136,7 +1299,7 @@ mod tests {
         let m = fs::symlink_metadata(&path).unwrap();
         let cand = Candidate::new(path.clone(), Arc::from(root.as_path()), &m);
         let staging = Compressor::make_staging(&root, 0).unwrap();
-        let run = run_ditto(&[&path], &staging, Duration::from_secs(120));
+        let run = run_ditto(ditto_args(), &[&path], &staging, Duration::from_secs(120));
         assert!(run.success(), "{}", run.describe());
         let log = Logger::open(&dir.join("log"), 1 << 20, 1, false).unwrap();
         Fixture {
@@ -1149,7 +1312,7 @@ mod tests {
 
     impl Fixture {
         fn compressor(&self) -> Compressor<'_> {
-            Compressor::new(&self.log, true, 10, 1, 0)
+            Compressor::new(&self.log, true, 10, 1, ditto_args(), 0)
         }
 
         /// Replaces the original by a new inode with different content.
@@ -1319,7 +1482,7 @@ mod tests {
         fs::write(&src, "compress me PLEASE\n".repeat(20_000)).unwrap();
         let staging2 = f.dir.join("staging2");
         fs::create_dir(&staging2).unwrap();
-        assert!(run_ditto(&[&src], &staging2, Duration::from_secs(120)).success());
+        assert!(run_ditto(ditto_args(), &[&src], &staging2, Duration::from_secs(120)).success());
         fs::rename(staging2.join("data.txt"), &f.staged).unwrap();
         let mut cmp = f.compressor();
         cmp.verify = false;
@@ -1345,7 +1508,7 @@ mod tests {
         fs::create_dir_all(&src_dir).unwrap();
         let src = src_dir.join(name);
         fs::write(&src, "compressible ".repeat(10_000)).unwrap();
-        assert!(run_ditto(&[&src], dest_dir, Duration::from_secs(120)).success());
+        assert!(run_ditto(ditto_args(), &[&src], dest_dir, Duration::from_secs(120)).success());
         assert_ne!(flags(&dest_dir.join(name)) & UF_COMPRESSED, 0);
     }
 
@@ -1465,7 +1628,8 @@ mod tests {
         let log = Logger::open(&dir.join("log"), 1 << 20, 1, false).unwrap();
         let files = files_in(&dir, "a", 3);
         let before: Vec<u64> = files.iter().map(|c| c.key.ino).collect();
-        let out = Compressor::new(&log, true, 100, 2, u64::MAX / 2).run(files.clone());
+        let out =
+            Compressor::new(&log, true, 100, 2, ditto_args(), u64::MAX / 2).run(files.clone());
         assert_eq!((out.ditto_calls, out.compressed, out.errors), (0, 0, 0));
         assert_eq!(out.skipped_low_space, 3);
         for (c, ino) in files.iter().zip(before) {
@@ -1493,7 +1657,7 @@ mod tests {
         files.extend(files_in(&dir, "rw", 1));
         let ro = dir.join("root/ro");
         fs::set_permissions(&ro, fs::Permissions::from_mode(0o555)).unwrap();
-        let out = Compressor::new(&log, true, 100, 1, 0).run(files.clone());
+        let out = Compressor::new(&log, true, 100, 1, ditto_args(), 0).run(files.clone());
         fs::set_permissions(&ro, fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(
             (out.ditto_calls, out.compressed, out.errors),
@@ -1534,7 +1698,7 @@ mod tests {
     }
 
     fn quiet(log: &Logger) -> Compressor<'_> {
-        Compressor::new(log, false, 100, 2, 0)
+        Compressor::new(log, false, 100, 2, ditto_args(), 0)
     }
 
     #[test]

@@ -15,7 +15,7 @@ mod sys;
 mod walk;
 
 use classify::{Class, DITTO_MAX_SIZE, Rules};
-use compress::{Compressor, Outcome};
+use compress::{Compressor, DittoArgs, Outcome, ProbeError};
 use config::Config;
 use logger::{Level, Logger};
 use progress::{FileEvent, Progress, abbreviate_home, human};
@@ -786,6 +786,13 @@ fn run(
     } else {
         None
     };
+    // Before the walk: a ditto that does not compress would only cache every file as
+    // incompressible. A preview never runs ditto.
+    let ditto_args = if apply {
+        probe_ditto(config_path, home, log)?
+    } else {
+        &[]
+    };
 
     let cache_path = home
         .join("Library/Caches")
@@ -994,8 +1001,15 @@ fn run(
     let out = if apply {
         compress::remove_stale(&walked.stale_staging, log);
         log.start_compress(todo.len() as u64, todo.iter().map(|c| c.size()).sum());
-        let out =
-            Compressor::new(log, cfg.verify, cfg.batch_size, threads, cfg.min_free_bytes).run(todo);
+        let out = Compressor::new(
+            log,
+            cfg.verify,
+            cfg.batch_size,
+            threads,
+            ditto_args,
+            cfg.min_free_bytes,
+        )
+        .run(todo);
         let keys = keep_cached.iter().chain(&out.new_incompressible);
         if let Err(e) = cache::store(&cache_path, keys) {
             log.warn(format_args!("cannot write {}: {e}", cache_path.display()));
@@ -1084,6 +1098,33 @@ fn run(
         sum.requarantined_new,
     )));
     Ok(())
+}
+
+/// The ditto options that compress here, probed next to the config, or in the state dir when
+/// the probe files cannot be written there (or it is not on APFS). `Err` when ditto compresses
+/// with none of them.
+fn probe_ditto(config_path: &Path, home: &Path, log: &Logger) -> Result<DittoArgs, String> {
+    let config_dir = config_path.parent().unwrap_or(Path::new("."));
+    let mut r = compress::probe(config_dir);
+    let mut dir = config_dir.to_path_buf();
+    if let Err(ProbeError::Setup(e)) = &r {
+        log.warn(format_args!("ditto probe: {e}; probing in the state dir"));
+        dir = state_dir(home);
+        r = fs::create_dir_all(&dir)
+            .map_err(|e| ProbeError::Setup(format!("cannot create {}: {e}", dir.display())))
+            .and_then(|()| compress::probe(&dir));
+    }
+    match r {
+        Ok(args) => {
+            log.info(format_args!("ditto compresses with: {}", args.join(" ")));
+            Ok(args)
+        }
+        Err(ProbeError::Setup(e)) => Err(format!("cannot probe ditto, nothing was changed: {e}")),
+        Err(ProbeError::NoCompression(e)) => Err(format!(
+            "ditto does not compress on this system, nothing was changed (probe in {}: {e})",
+            dir.display()
+        )),
+    }
 }
 
 /// Quotes an argument for a POSIX shell when it needs it.
