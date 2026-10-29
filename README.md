@@ -184,12 +184,17 @@ auto-compress-apfs -h|--help | -V|--version
 ```
 
 - **Preview** (no arguments, or `compress` without `--apply`): walks per config and prints to
-  stdout every not yet compressed file that would be compressed (`~/path   size`), then the
+  stdout every not yet compressed file that would be compressed: on a terminal `~/path   size`
+  with the size column right-aligned to `COLUMNS` (120 when unset) and long paths cut on the left
+  with `...`; piped or redirected `~/path size` (full path, one space), so nothing is lost. Then the
   skipped files (`SKIP(<kind>): reason`), totals with the 20 biggest roots, and the exact command
   that would do it: `Nothing changed. Run 'auto-compress-apfs compress --apply ...' to compress
-  these N files (X GiB).` It never spawns ditto and never writes staging dirs, the cache,
-  `state.tsv` or `quarantine.txt`; it may create the config, the log dir and the log, and like
-  every run it empties `<log_dir>/launchd.log` once that file exceeds 1 MiB.
+  these N files (X GiB).` Roots that could not be read get a `not accessible (see ERROR above)`
+  line, and with nothing else to compress the hint becomes `Fix access first`; roots refused by
+  the guard get their own `refused by the volume/protection guard (see WARN above)` line. It never
+  spawns ditto and never writes staging dirs, the cache, `state.tsv` or `quarantine.txt`; it may
+  create the config, the log dir and the log, and like every run it empties
+  `<log_dir>/launchd.log` once that file exceeds 1 MiB.
   `--dry-run` is kept as a hidden alias.
 - `compress --apply` does the work.
 - Without any pattern (empty `patterns` in the config and no `--search`) `compress` prints one
@@ -344,7 +349,9 @@ resolution), so `exclude = ["/private/var/**"]` does not exclude a walk started 
 
 **Full Disk Access.** `~/Downloads` is a TCC-protected folder. A run that walks it needs Full Disk
 Access (or Downloads access) for the binary (System Settings > Privacy & Security); without it the
-run logs one ERROR naming the binary's real path and goes on with the other roots. Hypothesis: the
+run logs one ERROR and goes on with the other roots. From a terminal the ERROR names the terminal
+app (`TERM_PROGRAM`) and the folder (Desktop/Documents/Downloads) to grant, since macOS checks
+the app the run started from; under launchd it names the binary's real path. Hypothesis: the
 ad-hoc signature changes with every rebuild, so macOS may ask again after a rebuild.
 
 ## Logs and state

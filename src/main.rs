@@ -1304,6 +1304,8 @@ fn run(
     let mut new_quarantine: Vec<Entry> = Vec::new();
     let mut keep_cached = Vec::new();
     let mut todo = Vec::new();
+    // Before `candidates` moves out below.
+    let preview_roots = (walked.inaccessible_roots(), walked.refused_walk_roots);
     for c in walked.candidates {
         let listed = quarantined.contains(&c.path);
         if let Some(r) = st.rows.get_mut(&c.path) {
@@ -1460,8 +1462,7 @@ fn run(
         }
         out
     } else {
-        let inaccessible = walked.refused_roots + walked.unreadable_roots;
-        print_preview(&todo, &preview_skips, home, args, inaccessible);
+        print_preview(&todo, &preview_skips, home, args, preview_roots);
         Outcome::default()
     };
 
@@ -1550,14 +1551,15 @@ pub(crate) fn shell_quote(s: &str) -> String {
 }
 
 /// Preview on stdout: every file that would be compressed with its size, the skipped files,
-/// totals with the biggest roots, and the command that would do it. `inaccessible` walk roots
-/// (refused or unreadable) get a warning before the totals and change the closing hint.
+/// totals with the biggest roots, and the command that would do it. `(inaccessible, refused)`
+/// walk roots get a note each before the totals ([`preview_notes`]); inaccessible ones also
+/// change the closing hint ([`preview_hint`]).
 fn print_preview(
     todo: &[walk::Candidate],
     skips: &[PreviewSkip],
     home: &Path,
     args: &CompressArgs,
-    inaccessible: u64,
+    (inaccessible, refused): (u64, u64),
 ) {
     use std::io::Write;
     let mut out = std::io::stdout().lock();
@@ -1585,13 +1587,7 @@ fn print_preview(
     }
     let mut roots: Vec<_> = roots.into_iter().collect();
     roots.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
-    if inaccessible > 0 {
-        let _ = writeln!(
-            out,
-            "\n{inaccessible} root(s) not accessible (see ERROR above); files there are not \
-             listed"
-        );
-    }
+    let _ = write!(out, "{}", preview_notes(inaccessible, refused));
     let _ = writeln!(
         out,
         "\nwould compress: {} files, {} ({} skipped)",
@@ -1617,6 +1613,24 @@ fn print_preview(
     );
 }
 
+/// Notes before the preview totals: roots that could not be read (an access problem, ERROR
+/// logged) and roots refused by the guard (by design, WARN logged), each on its own line.
+fn preview_notes(inaccessible: u64, refused: u64) -> String {
+    let mut s = String::new();
+    if inaccessible > 0 {
+        s += &format!(
+            "\n{inaccessible} root(s) not accessible (see ERROR above); files there are not \
+             listed\n"
+        );
+    }
+    if refused > 0 {
+        s += &format!(
+            "\n{refused} root(s) refused by the volume/protection guard (see WARN above)\n"
+        );
+    }
+    s
+}
+
 /// The closing lines of the preview: the `--apply` command, preceded by a warning when
 /// `inaccessible` roots exist, or a "fix access first" line when nothing would be compressed.
 fn preview_hint(files: usize, total: u64, inaccessible: u64, extra: &str) -> String {
@@ -1635,7 +1649,8 @@ fn preview_hint(files: usize, total: u64, inaccessible: u64, extra: &str) -> Str
     )
 }
 
-/// Preview file lines from `(path, size)` rows. With a terminal `width` the size column is
+/// Preview file lines from `(path, size)` rows. Widths count chars, so wide (CJK, emoji)
+/// chars may misalign the size column. With a terminal `width` the size column is
 /// right-aligned and paths too long for it are cut on the left with `...`; without one (stdout
 /// piped or redirected) each line is the full path, one space and the size, so nothing is lost.
 fn preview_lines(rows: &[(String, String)], width: Option<usize>) -> Vec<String> {
@@ -1680,6 +1695,8 @@ fn acquire_lock(state_dir: &Path) -> Result<Option<File>, String> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn preview_lines_align_on_tty_and_stay_whole_when_piped() {
         let long = format!("~/{}/file.py", "d".repeat(200));
@@ -1687,26 +1704,26 @@ mod tests {
             ("~/a.py".to_owned(), "20.0 KiB".to_owned()),
             (long.clone(), "1.5 MiB".to_owned()),
         ];
-        let tty = super::preview_lines(&rows, Some(80));
+        let tty = preview_lines(&rows, Some(80));
         assert!(tty.iter().all(|l| l.chars().count() == 80), "{tty:?}");
         assert!(tty[0].ends_with("  20.0 KiB") && tty[1].ends_with("   1.5 MiB"));
         assert!(tty[1].starts_with("...") && tty[1].contains("/file.py "));
-        let piped = super::preview_lines(&rows, None);
+        let piped = preview_lines(&rows, None);
         assert_eq!(piped[0], "~/a.py 20.0 KiB");
         assert_eq!(piped[1], format!("{long} 1.5 MiB"));
     }
 
     #[test]
     fn preview_hint_after_inaccessible_roots() {
-        let ok = super::preview_hint(2, 2048, 0, " -c x");
+        let ok = preview_hint(2, 2048, 0, " -c x");
         assert!(ok.starts_with("Nothing changed. Run 'auto-compress-apfs compress --apply -c x'"));
         assert!(ok.contains("these 2 files (2.0 KiB)"), "{ok}");
-        let none = super::preview_hint(0, 0, 1, "");
+        let none = preview_hint(0, 0, 1, "");
         assert_eq!(
             none,
             "Nothing changed. Fix access first; nothing would be compressed there.\n"
         );
-        let some = super::preview_hint(2, 2048, 1, "");
+        let some = preview_hint(2, 2048, 1, "");
         assert!(
             some.starts_with("Warning: 1 root(s) not accessible"),
             "{some}"
@@ -1714,7 +1731,19 @@ mod tests {
         assert!(some.contains("\nNothing changed. Run "), "{some}");
     }
 
-    use super::*;
+    #[test]
+    fn preview_notes_keep_guard_refusals_apart() {
+        let refused = preview_notes(0, 1);
+        assert!(refused.contains("1 root(s) refused by the volume/protection guard (see WARN"));
+        assert!(!refused.contains("see ERROR"), "{refused}");
+        assert!(!preview_hint(0, 0, 0, "").contains("Fix access"));
+        let both = preview_notes(2, 1);
+        assert!(
+            both.contains("2 root(s) not accessible (see ERROR above)"),
+            "{both}"
+        );
+        assert!(preview_notes(0, 0).is_empty());
+    }
 
     fn parse(args: &[&str]) -> Result<Cli, String> {
         parse_args(args.iter().map(|s| s.to_string()))

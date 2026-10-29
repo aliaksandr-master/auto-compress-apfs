@@ -109,9 +109,11 @@ pub struct Matcher {
     pattern_strs: Vec<String>,
 }
 
-/// The ERROR text for a walk root `dir` the process may not read. From a terminal (`is_tty`)
-/// the grant goes to the terminal app (`term_program`, from `TERM_PROGRAM`), since TCC checks
-/// the responsible app; elsewhere (launchd, a file) it names the binary `exe`.
+/// The ERROR text for a walk root `dir` the process may not read. The folder to grant is the
+/// last component of `dir` when it is Desktop, Documents or Downloads, else "this folder". From
+/// a terminal (`is_tty`) the grant goes to the terminal app (`term_program`, from
+/// `TERM_PROGRAM`), since TCC checks the responsible app; elsewhere (launchd, a file) it names
+/// the binary `exe`.
 fn access_hint(
     is_tty: bool,
     term_program: Option<&str>,
@@ -119,19 +121,24 @@ fn access_hint(
     dir: &str,
     err: &io::Error,
 ) -> String {
+    let folder = Path::new(dir)
+        .file_name()
+        .and_then(OsStr::to_str)
+        .filter(|n| matches!(*n, "Desktop" | "Documents" | "Downloads"))
+        .unwrap_or("this folder");
     if is_tty {
         let app = term_program.map_or_else(
             || "your terminal app".to_owned(),
             |t| format!("your terminal app ({t})"),
         );
         format!(
-            "no access to {dir}: grant Downloads (or Full Disk Access) to {app} in System \
+            "no access to {dir}: grant access to {folder} (or Full Disk Access) to {app} in System \
              Settings > Privacy & Security; the scheduled launchd run needs Full Disk Access for \
              {exe} ({err})"
         )
     } else {
         format!(
-            "no access to {dir}: grant Full Disk Access (or Downloads access) to {exe} in \
+            "no access to {dir}: grant Full Disk Access (or access to {folder}) to {exe} in \
              System Settings ({err})"
         )
     }
@@ -572,6 +579,8 @@ pub struct WalkResult {
     pub dataless: u64,
     /// Walk roots (and filesystem crossings) refused by the guard.
     pub refused_roots: u64,
+    /// Walk roots (only, no crossings) refused by the guard; part of `refused_roots`.
+    pub refused_walk_roots: u64,
     /// Walk roots that could not be read (permission denied).
     pub unreadable_roots: u64,
     /// Directories not entered because of uchg/uappnd/schg/sappnd/restricted, with their flags.
@@ -579,6 +588,14 @@ pub struct WalkResult {
     /// [`walk_entries`] only: files and directories matched by a pattern (a matched directory
     /// is not entered). Sorted by path, each once; nested matches (from overlapping roots) kept.
     pub matched: Vec<Matched>,
+}
+
+impl WalkResult {
+    /// Walk roots that exist but could not be read (an access problem the user can fix).
+    /// Roots refused by the guard and refused filesystem crossings are not counted.
+    pub fn inaccessible_roots(&self) -> u64 {
+        self.unreadable_roots
+    }
 }
 
 /// A file or directory matched by a pattern, as the walk saw it (`lstat`).
@@ -856,6 +873,7 @@ impl Walker<'_> {
             root.display()
         ));
         out.refused_roots += 1;
+        out.refused_walk_roots += 1;
     }
 
     /// An ancestor of `root` matched by a name exclude or a path exclude (lexical).
@@ -1089,6 +1107,7 @@ fn walk_with_fault(
         result.excluded += part.excluded;
         result.dataless += part.dataless;
         result.refused_roots += part.refused_roots;
+        result.refused_walk_roots += part.refused_walk_roots;
         result.unreadable_roots += part.unreadable_roots;
         result.flagged_dirs.extend(part.flagged_dirs);
         result.matched.extend(part.matched);
@@ -1709,20 +1728,65 @@ mod tests {
     }
 
     #[test]
+    fn refused_crossings_and_roots_are_not_inaccessible() {
+        let t = Tree::new("crossing");
+        t.file("a/x/m.py");
+        let guard = t.guard(&t.dir.join("home"));
+        let m = Matcher::new(&[t.pat("a/x")], &[], None).unwrap();
+        let walker = Walker {
+            matcher: &m,
+            guard: &guard,
+            one_file_system: true,
+            log: &t.log,
+            track_dirs: None,
+            fault: None,
+            entries: true,
+        };
+        // A device id no entry has: the matched `a/x` reads as a mount point below the root.
+        let job = Job {
+            dir: t.dir.join("a"),
+            mode: Mode::Search,
+            root_dev: u64::MAX,
+            is_root: true,
+        };
+        let mut out = WalkResult::default();
+        walker.visit(&job, &mut out, &mut Vec::new());
+        assert_eq!(out.refused_roots, 1, "{}", t.log_text());
+        assert_eq!(out.refused_walk_roots, 0);
+        assert_eq!(out.inaccessible_roots(), 0);
+        // A root refused by the guard is not an access problem either.
+        let r = t.walk(&["/Volumes/X/**".into()], &[], None, &guard);
+        assert_eq!((r.refused_roots, r.refused_walk_roots), (1, 1));
+        assert_eq!(r.inaccessible_roots(), 0);
+    }
+
+    #[test]
     fn access_hint_names_terminal_app_on_tty() {
         let e = io::Error::from_raw_os_error(1);
         let h = access_hint(true, Some("Apple_Terminal"), "/x/acz", "/u/Downloads", &e);
-        assert!(h.starts_with("no access to /u/Downloads: grant Downloads (or Full Disk Access)"));
+        assert!(h.starts_with(
+            "no access to /u/Downloads: grant access to Downloads (or Full Disk Access)"
+        ));
         assert!(h.contains("to your terminal app (Apple_Terminal) in System Settings > Privacy"));
         assert!(h.contains("needs Full Disk Access for /x/acz"), "{h}");
         let h = access_hint(true, None, "/x/acz", "/d", &e);
         assert!(h.contains("to your terminal app in System Settings"), "{h}");
         let h = access_hint(false, Some("Apple_Terminal"), "/x/acz", "/d", &e);
         assert!(
-            h.contains("grant Full Disk Access (or Downloads access) to /x/acz"),
+            h.contains("grant Full Disk Access (or access to this folder) to /x/acz"),
             "{h}"
         );
         assert!(!h.contains("terminal"), "{h}");
+        // The protected folder is named from the root, any other root says "this folder".
+        let h = access_hint(true, None, "/x/acz", "/u/Documents", &e);
+        assert!(
+            h.contains("grant access to Documents (or Full Disk Access)"),
+            "{h}"
+        );
+        let h = access_hint(false, None, "/x/acz", "/u/Documents", &e);
+        assert!(h.contains("(or access to Documents) to /x/acz"), "{h}");
+        let h = access_hint(false, None, "/x/acz", "/u/p", &e);
+        assert!(h.contains("(or access to this folder) to /x/acz"), "{h}");
     }
 
     #[test]
