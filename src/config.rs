@@ -76,7 +76,7 @@ impl Default for Config {
             threads: 0,
             batch_size: 1000,
             verify: true,
-            min_size: 1,
+            min_size: 16385,
             min_age_secs: 300,
             log_dir: "~/Library/Logs/auto-compress-apfs".into(),
             log_max_bytes: 4 * MIB,
@@ -253,6 +253,9 @@ mod tests {
         assert_eq!(parsed.log_dir, "/Users/u/Library/Logs/auto-compress-apfs");
         assert_eq!(parsed.batch_size, 1000);
         assert_eq!(parsed.min_age_secs, 300);
+        assert_eq!(parsed.min_size, 16385);
+        // A user value is honoured as written, not clamped to the default.
+        assert_eq!(Config::parse("min_size = 1", &home()).unwrap().min_size, 1);
         assert!(parsed.verify && parsed.one_file_system);
     }
 

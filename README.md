@@ -339,6 +339,8 @@ resolution), so `exclude = ["/private/var/**"]` does not exclude a walk started 
   this list, so repeat the entries you want to keep.
 - `allow_volumes`: mount points of further local apfs volumes that may be walked.
 - `quarantine_after` (3, 0 disables), `min_free_bytes` (10 GiB): see below.
+- `min_size` (16385 bytes): `ditto --hfsCompression` leaves files of 16384 bytes or less plain
+  (measured on macOS), so smaller files are not even tried. A value you set is used as written.
 
 **Full Disk Access.** `~/Downloads` is a TCC-protected folder. A run that walks it needs Full Disk
 Access (or Downloads access) for the binary (System Settings > Privacy & Security); without it the

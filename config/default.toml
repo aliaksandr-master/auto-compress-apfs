@@ -57,8 +57,9 @@ batch_size = 1000
 # Byte-compare the compressed copy with the original before replacing it.
 verify = true
 
-# Files smaller than this (bytes) are ignored; empty files cannot be compressed.
-min_size = 1
+# Files smaller than this (bytes) are ignored. ditto --hfsCompression leaves files of 16384 bytes
+# or less uncompressed (measured on macOS), so smaller files would only cost a copy.
+min_size = 16385
 
 # Files modified less than this many seconds ago are skipped (they may still be written to).
 min_age_secs = 300
