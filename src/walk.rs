@@ -13,7 +13,7 @@ use std::borrow::Cow;
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs::{self, Metadata};
-use std::io;
+use std::io::{self, IsTerminal as _};
 use std::os::macos::fs::MetadataExt as _;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
@@ -107,6 +107,34 @@ pub struct Matcher {
     roots: Vec<PathBuf>,
     /// The patterns as given, in `patterns` order.
     pattern_strs: Vec<String>,
+}
+
+/// The ERROR text for a walk root `dir` the process may not read. From a terminal (`is_tty`)
+/// the grant goes to the terminal app (`term_program`, from `TERM_PROGRAM`), since TCC checks
+/// the responsible app; elsewhere (launchd, a file) it names the binary `exe`.
+fn access_hint(
+    is_tty: bool,
+    term_program: Option<&str>,
+    exe: &str,
+    dir: &str,
+    err: &io::Error,
+) -> String {
+    if is_tty {
+        let app = term_program.map_or_else(
+            || "your terminal app".to_owned(),
+            |t| format!("your terminal app ({t})"),
+        );
+        format!(
+            "no access to {dir}: grant Downloads (or Full Disk Access) to {app} in System \
+             Settings > Privacy & Security; the scheduled launchd run needs Full Disk Access for \
+             {exe} ({err})"
+        )
+    } else {
+        format!(
+            "no access to {dir}: grant Full Disk Access (or Downloads access) to {exe} in \
+             System Settings ({err})"
+        )
+    }
 }
 
 fn glob(s: &str) -> Result<Glob, String> {
@@ -544,6 +572,8 @@ pub struct WalkResult {
     pub dataless: u64,
     /// Walk roots (and filesystem crossings) refused by the guard.
     pub refused_roots: u64,
+    /// Walk roots that could not be read (permission denied).
+    pub unreadable_roots: u64,
     /// Directories not entered because of uchg/uappnd/schg/sappnd/restricted, with their flags.
     pub flagged_dirs: Vec<(PathBuf, u32)>,
     /// [`walk_entries`] only: files and directories matched by a pattern (a matched directory
@@ -793,8 +823,8 @@ impl Walker<'_> {
         true
     }
 
-    /// `EDEADLK` means dataless (counted, DEBUG); a refused walk root gets one ERROR with the
-    /// permission hint; anything else is a WARN.
+    /// `EDEADLK` means dataless (counted, DEBUG); a walk root denied by permissions gets one
+    /// ERROR with the [`access_hint`] and counts in `unreadable_roots`; anything else is a WARN.
     fn read_error(&self, job: &Job, e: &io::Error, out: &mut WalkResult) {
         let dir = job.dir.display();
         if e.raw_os_error() == Some(EDEADLK) {
@@ -808,10 +838,13 @@ impl Walker<'_> {
                     |_| "auto-compress-apfs".to_owned(),
                     |p| p.display().to_string(),
                 );
+            let term = std::env::var("TERM_PROGRAM").ok();
+            let tty = io::stderr().is_terminal();
             self.log.error(format_args!(
-                "no access to {dir}: grant Full Disk Access (or Downloads access) to {exe} in \
-                 System Settings ({e})"
+                "{}",
+                access_hint(tty, term.as_deref(), &exe, &dir.to_string(), e)
             ));
+            out.unreadable_roots += 1;
         } else {
             self.log.warn(format_args!("cannot read dir {dir}: {e}"));
         }
@@ -1056,6 +1089,7 @@ fn walk_with_fault(
         result.excluded += part.excluded;
         result.dataless += part.dataless;
         result.refused_roots += part.refused_roots;
+        result.unreadable_roots += part.unreadable_roots;
         result.flagged_dirs.extend(part.flagged_dirs);
         result.matched.extend(part.matched);
     }
@@ -1668,8 +1702,27 @@ mod tests {
         assert!(r.candidates.is_empty());
         let log = t.log_text();
         assert_eq!(log.matches(" ERROR no access to ").count(), 1, "{log}");
-        assert!(log.contains("grant Full Disk Access"), "{log}");
+        // The terminal variant (stderr a TTY) words it differently; both name Full Disk Access.
+        assert!(log.contains("Full Disk Access"), "{log}");
         assert!(!log.contains(" WARN "), "{log}");
+        assert_eq!(r.unreadable_roots, 1);
+    }
+
+    #[test]
+    fn access_hint_names_terminal_app_on_tty() {
+        let e = io::Error::from_raw_os_error(1);
+        let h = access_hint(true, Some("Apple_Terminal"), "/x/acz", "/u/Downloads", &e);
+        assert!(h.starts_with("no access to /u/Downloads: grant Downloads (or Full Disk Access)"));
+        assert!(h.contains("to your terminal app (Apple_Terminal) in System Settings > Privacy"));
+        assert!(h.contains("needs Full Disk Access for /x/acz"), "{h}");
+        let h = access_hint(true, None, "/x/acz", "/d", &e);
+        assert!(h.contains("to your terminal app in System Settings"), "{h}");
+        let h = access_hint(false, Some("Apple_Terminal"), "/x/acz", "/d", &e);
+        assert!(
+            h.contains("grant Full Disk Access (or Downloads access) to /x/acz"),
+            "{h}"
+        );
+        assert!(!h.contains("terminal"), "{h}");
     }
 
     #[test]

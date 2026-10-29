@@ -36,6 +36,8 @@ const NAME: &str = "auto-compress-apfs";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Terminal width when `COLUMNS` is not set.
 const PROGRESS_WIDTH: usize = 100;
+/// Preview width on a terminal when `COLUMNS` is not set.
+const PREVIEW_WIDTH: usize = 120;
 /// Roots listed in the preview totals.
 const PREVIEW_TOP_ROOTS: usize = 20;
 
@@ -1458,7 +1460,8 @@ fn run(
         }
         out
     } else {
-        print_preview(&todo, &preview_skips, home, args);
+        let inaccessible = walked.refused_roots + walked.unreadable_roots;
+        print_preview(&todo, &preview_skips, home, args, inaccessible);
         Outcome::default()
     };
 
@@ -1467,7 +1470,7 @@ fn run(
         "summary found={} already_compressed={} to_compress={} compressed={} incompressible={} \
          too_small={} too_large={} too_new={} skipped={} errors={} bytes_before={} bytes_after={} \
          ditto_calls={} stale_staging={} quarantined={} requarantined_new={} refused_roots={} \
-         dataless={} excluded={} flagged={} skipped_low_space={} dry_run={} elapsed={elapsed:.3}s",
+         unreadable_roots={} dataless={} excluded={} flagged={} skipped_low_space={} dry_run={} elapsed={elapsed:.3}s",
         sum.found,
         sum.already_compressed,
         sum.to_compress,
@@ -1485,6 +1488,7 @@ fn run(
         sum.quarantined,
         sum.requarantined_new,
         walked.refused_roots,
+        walked.unreadable_roots,
         sum.dataless,
         walked.excluded,
         sum.flagged,
@@ -1546,25 +1550,31 @@ pub(crate) fn shell_quote(s: &str) -> String {
 }
 
 /// Preview on stdout: every file that would be compressed with its size, the skipped files,
-/// totals with the biggest roots, and the command that would do it.
+/// totals with the biggest roots, and the command that would do it. `inaccessible` walk roots
+/// (refused or unreadable) get a warning before the totals and change the closing hint.
 fn print_preview(
     todo: &[walk::Candidate],
     skips: &[PreviewSkip],
     home: &Path,
     args: &CompressArgs,
+    inaccessible: u64,
 ) {
     use std::io::Write;
     let mut out = std::io::stdout().lock();
     let show = |p: &Path| abbreviate_home(p, Some(home));
-    let col = todo
+    let width = std::io::stdout().is_terminal().then(|| {
+        std::env::var("COLUMNS")
+            .ok()
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(PREVIEW_WIDTH)
+    });
+    let rows: Vec<(String, String)> = todo
         .iter()
-        .map(|c| show(&c.path).chars().count())
-        .max()
-        .unwrap_or(0)
-        .min(100);
+        .map(|c| (show(&c.path), human(c.size())))
+        .collect();
     let total: u64 = todo.iter().map(|c| c.size()).sum();
-    for c in todo {
-        let _ = writeln!(out, "{:<col$}   {:>10}", show(&c.path), human(c.size()));
+    for line in preview_lines(&rows, width) {
+        let _ = writeln!(out, "{line}");
     }
     for s in skips {
         let _ = writeln!(out, "{}   SKIP({}): {}", show(&s.path), s.kind, s.reason);
@@ -1575,6 +1585,13 @@ fn print_preview(
     }
     let mut roots: Vec<_> = roots.into_iter().collect();
     roots.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    if inaccessible > 0 {
+        let _ = writeln!(
+            out,
+            "\n{inaccessible} root(s) not accessible (see ERROR above); files there are not \
+             listed"
+        );
+    }
     let _ = writeln!(
         out,
         "\nwould compress: {} files, {} ({} skipped)",
@@ -1593,12 +1610,55 @@ fn print_preview(
         .iter()
         .map(|a| format!(" {}", shell_quote(a)))
         .collect();
-    let _ = writeln!(
+    let _ = write!(
         out,
-        "Nothing changed. Run '{NAME} compress --apply{extra}' to compress these {} files ({}).",
-        todo.len(),
-        human(total)
+        "{}",
+        preview_hint(todo.len(), total, inaccessible, &extra)
     );
+}
+
+/// The closing lines of the preview: the `--apply` command, preceded by a warning when
+/// `inaccessible` roots exist, or a "fix access first" line when nothing would be compressed.
+fn preview_hint(files: usize, total: u64, inaccessible: u64, extra: &str) -> String {
+    if inaccessible > 0 && files == 0 {
+        return "Nothing changed. Fix access first; nothing would be compressed there.\n".into();
+    }
+    let warn = if inaccessible > 0 {
+        format!("Warning: {inaccessible} root(s) not accessible; --apply would skip them too.\n")
+    } else {
+        String::new()
+    };
+    format!(
+        "{warn}Nothing changed. Run '{NAME} compress --apply{extra}' to compress these {files} \
+         files ({}).\n",
+        human(total)
+    )
+}
+
+/// Preview file lines from `(path, size)` rows. With a terminal `width` the size column is
+/// right-aligned and paths too long for it are cut on the left with `...`; without one (stdout
+/// piped or redirected) each line is the full path, one space and the size, so nothing is lost.
+fn preview_lines(rows: &[(String, String)], width: Option<usize>) -> Vec<String> {
+    const SIZE: usize = 10;
+    const GAP: usize = 3;
+    let Some(width) = width else {
+        return rows.iter().map(|(p, s)| format!("{p} {s}")).collect();
+    };
+    let col = rows
+        .iter()
+        .map(|(p, _)| p.chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(width.saturating_sub(SIZE + GAP).max(8));
+    rows.iter()
+        .map(|(p, s)| {
+            format!(
+                "{:<col$}{:GAP$}{s:>SIZE$}",
+                progress::truncate_left(p, col),
+                ""
+            )
+        })
+        .collect()
 }
 
 fn acquire_lock(state_dir: &Path) -> Result<Option<File>, String> {
@@ -1620,6 +1680,40 @@ fn acquire_lock(state_dir: &Path) -> Result<Option<File>, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn preview_lines_align_on_tty_and_stay_whole_when_piped() {
+        let long = format!("~/{}/file.py", "d".repeat(200));
+        let rows = vec![
+            ("~/a.py".to_owned(), "20.0 KiB".to_owned()),
+            (long.clone(), "1.5 MiB".to_owned()),
+        ];
+        let tty = super::preview_lines(&rows, Some(80));
+        assert!(tty.iter().all(|l| l.chars().count() == 80), "{tty:?}");
+        assert!(tty[0].ends_with("  20.0 KiB") && tty[1].ends_with("   1.5 MiB"));
+        assert!(tty[1].starts_with("...") && tty[1].contains("/file.py "));
+        let piped = super::preview_lines(&rows, None);
+        assert_eq!(piped[0], "~/a.py 20.0 KiB");
+        assert_eq!(piped[1], format!("{long} 1.5 MiB"));
+    }
+
+    #[test]
+    fn preview_hint_after_inaccessible_roots() {
+        let ok = super::preview_hint(2, 2048, 0, " -c x");
+        assert!(ok.starts_with("Nothing changed. Run 'auto-compress-apfs compress --apply -c x'"));
+        assert!(ok.contains("these 2 files (2.0 KiB)"), "{ok}");
+        let none = super::preview_hint(0, 0, 1, "");
+        assert_eq!(
+            none,
+            "Nothing changed. Fix access first; nothing would be compressed there.\n"
+        );
+        let some = super::preview_hint(2, 2048, 1, "");
+        assert!(
+            some.starts_with("Warning: 1 root(s) not accessible"),
+            "{some}"
+        );
+        assert!(some.contains("\nNothing changed. Run "), "{some}");
+    }
+
     use super::*;
 
     fn parse(args: &[&str]) -> Result<Cli, String> {
