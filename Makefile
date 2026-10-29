@@ -37,6 +37,3 @@ test:
 lint:
 	cargo fmt --check
 	cargo clippy --all-targets -- -D warnings
-
-# Optional local, untracked additions.
--include local.mk
