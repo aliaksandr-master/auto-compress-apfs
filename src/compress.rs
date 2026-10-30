@@ -1,11 +1,13 @@
-//! Batched `ditto --hfsCompression` into staging dirs, then a checked, atomic swap per file.
+//! Batched `ditto --hfsCompression` (or the in-process [`crate::applesauce`] writer) into
+//! staging dirs, then a checked, atomic swap per file.
 //!
 //! The original stays the source of truth until a verified compressed copy is swapped in with
 //! `renamex_np(RENAME_SWAP)`; every failure path leaves the original untouched. Per-file outcomes
-//! are reported as typed [`FileEvent`]s (log line plus terminal line). No ditto call starts
+//! are reported as typed [`FileEvent`]s (log line plus terminal line). No batch starts
 //! without `min_free_bytes` left after its data, and a parent directory found not writable is
 //! remembered for the rest of the run.
 
+use crate::applesauce::{self, PART_DIR, Staged};
 use crate::logger::{Level, Logger};
 use crate::progress::{FileEvent, human};
 use crate::sys::{self, O_NOFOLLOW, UF_COMPRESSED};
@@ -48,6 +50,15 @@ pub(crate) const KEEP_MARKER: &str = ".acz-keep";
 
 /// The options passed to ditto before `--`.
 pub type DittoArgs = &'static [&'static str];
+
+/// How the staged copies are made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    /// `/usr/bin/ditto` with the options chosen by [`probe`].
+    Ditto(DittoArgs),
+    /// [`applesauce::stage`] per file; every copy is byte-compared and its xattrs checked.
+    Applesauce,
+}
 
 /// A file replaced by its compressed copy: the identity and sizes for `state.tsv`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,11 +142,12 @@ enum Commit {
     Rescued(PathBuf),
 }
 
-/// Per-worker verify buffers, allocated on first use and reused for every file.
+/// Per-worker verify (and applesauce) buffers, allocated on first use and reused for every file.
 #[derive(Default)]
 pub(crate) struct Buffers {
     a: Vec<u8>,
     b: Vec<u8>,
+    applesauce: Option<applesauce::Buffers>,
 }
 
 impl Buffers {
@@ -145,6 +157,11 @@ impl Buffers {
             self.b = vec![0; VERIFY_BUF];
         }
         (&mut self.a, &mut self.b)
+    }
+
+    fn applesauce(&mut self) -> &mut applesauce::Buffers {
+        self.applesauce
+            .get_or_insert_with(applesauce::Buffers::default)
     }
 }
 
@@ -300,6 +317,68 @@ pub fn probe(dir: &Path) -> Result<DittoArgs, ProbeError> {
 
 /// [`probe`] with the candidate argument sets given.
 fn probe_with(dir: &Path, sets: &[DittoArgs]) -> Result<DittoArgs, ProbeError> {
+    let (src, want) = probe_source(dir)?;
+    let out = dir.join(PROBE_OUT);
+    let copy = out.join(PROBE_NAME);
+    let mut failed = Vec::new();
+    for &args in sets {
+        reset_probe_out(&out)?;
+        let run = run_ditto(args, &[&src], &out, PROBE_TIMEOUT);
+        let why = if !run.success() {
+            format!("ditto failed: {}", run.describe())
+        } else {
+            match fs::symlink_metadata(&copy) {
+                Ok(m) if !m.is_file() => "copy is not a regular file".to_owned(),
+                Ok(m) if m.st_flags() & UF_COMPRESSED == 0 => "copy is not compressed".to_owned(),
+                Ok(_) if fs::read(&copy).is_ok_and(|b| b == want) => return Ok(args),
+                Ok(_) => "copy differs from the source".to_owned(),
+                Err(e) => format!("no copy: {e}"),
+            }
+        };
+        failed.push(format!("{}: {why}", args.join(" ")));
+    }
+    Err(ProbeError::NoCompression(failed.join("; ")))
+}
+
+/// The applesauce counterpart of [`probe`]: `<dir>/ditto-probe.txt` (kept as for [`probe`])
+/// is staged by [`applesauce::stage`] into `<dir>/ditto-probe.out/`; the copy must be
+/// compressed and read back byte-identical through the kernel.
+pub fn probe_applesauce(dir: &Path) -> Result<(), ProbeError> {
+    let (src, want) = probe_source(dir)?;
+    let out = dir.join(PROBE_OUT);
+    reset_probe_out(&out)?;
+    let m = fs::symlink_metadata(&src)
+        .map_err(|e| ProbeError::Setup(format!("cannot stat {}: {e}", src.display())))?;
+    let c = Candidate::new(src.clone(), Arc::from(out.as_path()), &m);
+    let why = match applesauce::stage(&c, &out, &mut applesauce::Buffers::default()) {
+        Ok(Staged::Copy(copy)) => match fs::symlink_metadata(&copy) {
+            Ok(m) if m.st_flags() & UF_COMPRESSED == 0 => "copy is not compressed".to_owned(),
+            Ok(_) if fs::read(&copy).is_ok_and(|b| b == want) => return Ok(()),
+            Ok(_) => "copy differs from the source".to_owned(),
+            Err(e) => format!("no copy: {e}"),
+        },
+        Ok(other) => format!("not staged: {other:?}"),
+        Err(e) => format!("cannot write the copy: {e}"),
+    };
+    Err(ProbeError::NoCompression(format!("applesauce: {why}")))
+}
+
+/// Recreates the empty probe output dir `out`.
+fn reset_probe_out(out: &Path) -> Result<(), ProbeError> {
+    match fs::remove_dir_all(out) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => {
+            let e = format!("cannot remove {}: {e}", out.display());
+            return Err(ProbeError::Setup(e));
+        }
+        _ => {}
+    }
+    fs::create_dir(out)
+        .map_err(|e| ProbeError::Setup(format!("cannot create {}: {e}", out.display())))
+}
+
+/// Checks that `dir` is on APFS and (re)writes `<dir>/ditto-probe.txt` when it is missing,
+/// changed or compressed; returns its path and content.
+fn probe_source(dir: &Path) -> Result<(PathBuf, Vec<u8>), ProbeError> {
     match sys::statfs(dir) {
         Ok(fs) if fs.fstype == "apfs" => {}
         Ok(fs) => {
@@ -323,34 +402,7 @@ fn probe_with(dir: &Path, sets: &[DittoArgs]) -> Result<DittoArgs, ProbeError> {
         fs::write(&src, &want)
             .map_err(|e| ProbeError::Setup(format!("cannot write {}: {e}", src.display())))?;
     }
-    let out = dir.join(PROBE_OUT);
-    let copy = out.join(PROBE_NAME);
-    let mut failed = Vec::new();
-    for &args in sets {
-        match fs::remove_dir_all(&out) {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => {
-                let e = format!("cannot remove {}: {e}", out.display());
-                return Err(ProbeError::Setup(e));
-            }
-            _ => {}
-        }
-        fs::create_dir(&out)
-            .map_err(|e| ProbeError::Setup(format!("cannot create {}: {e}", out.display())))?;
-        let run = run_ditto(args, &[&src], &out, PROBE_TIMEOUT);
-        let why = if !run.success() {
-            format!("ditto failed: {}", run.describe())
-        } else {
-            match fs::symlink_metadata(&copy) {
-                Ok(m) if !m.is_file() => "copy is not a regular file".to_owned(),
-                Ok(m) if m.st_flags() & UF_COMPRESSED == 0 => "copy is not compressed".to_owned(),
-                Ok(_) if fs::read(&copy).is_ok_and(|b| b == want) => return Ok(args),
-                Ok(_) => "copy differs from the source".to_owned(),
-                Err(e) => format!("no copy: {e}"),
-            }
-        };
-        failed.push(format!("{}: {why}", args.join(" ")));
-    }
-    Err(ProbeError::NoCompression(failed.join("; ")))
+    Ok((src, want))
 }
 
 /// Splits one match root's files into batches: <= `max_files` files, <= `max_bytes` of source
@@ -405,7 +457,7 @@ fn system_time(sec: i64, nsec: i64) -> SystemTime {
 }
 
 /// Reads until `buf` is full or EOF; returns the byte count.
-fn read_full(f: &mut File, buf: &mut [u8]) -> io::Result<usize> {
+pub(crate) fn read_full(mut f: impl Read, buf: &mut [u8]) -> io::Result<usize> {
     let mut n = 0;
     while n < buf.len() {
         match f.read(&mut buf[n..]) {
@@ -430,10 +482,16 @@ fn has_keep_marker(dir: &Path) -> bool {
 }
 
 /// True when every top-level entry of a staging dir is a compressed regular file (a copy made
-/// by ditto). Anything else may be a user's original swapped out right before a crash.
+/// by ditto or applesauce) or the [`PART_DIR`] directory of copies being written (a directory
+/// is never a swapped-out original). Anything else may be a user's original swapped out right
+/// before a crash.
 fn only_staged_copies(dir: &Path) -> io::Result<bool> {
     for entry in fs::read_dir(dir)? {
-        let m = entry?.metadata()?;
+        let entry = entry?;
+        let m = entry.metadata()?;
+        if m.is_dir() && entry.file_name() == PART_DIR {
+            continue;
+        }
         if !m.is_file() || m.st_flags() & UF_COMPRESSED == 0 {
             return Ok(false);
         }
@@ -443,7 +501,7 @@ fn only_staged_copies(dir: &Path) -> io::Result<bool> {
 
 /// Cleans leftover staging dirs of crashed runs (only names matching the exact staging regex).
 /// A dir with the [`KEEP_MARKER`] directory is kept; a dir holding anything but compressed
-/// copies is renamed to `.acz-rescue-<pid>-<n>` instead of being deleted.
+/// copies (and the [`PART_DIR`] of partial applesauce copies) is renamed to `.acz-rescue-<pid>-<n>` instead of being deleted.
 pub fn remove_stale(dirs: &[PathBuf], log: &Logger) {
     for dir in dirs {
         let name = dir.file_name().map(|n| n.as_bytes()).unwrap_or_default();
@@ -523,14 +581,17 @@ pub struct Compressor<'a> {
     pub verify: bool,
     pub batch_size: usize,
     pub threads: usize,
-    /// ditto options chosen by [`probe`].
-    pub ditto_args: DittoArgs,
-    /// Free bytes that must remain on the volume after a ditto call's data.
+    /// ditto (with the options chosen by [`probe`]) or applesauce.
+    pub backend: Backend,
+    /// Free bytes that must remain on the volume after a batch's data.
     pub min_free_bytes: u64,
     /// The low-space WARN was written (later ones are DEBUG).
     low_space_warned: AtomicBool,
     /// Directories where creating staging or swapping failed with EACCES/EPERM in this run.
     unwritable: Mutex<HashSet<PathBuf>>,
+    /// Test seam: runs between an applesauce stage and its commit.
+    #[cfg(test)]
+    after_stage: Option<fn(&Candidate)>,
 }
 
 impl<'a> Compressor<'a> {
@@ -539,7 +600,7 @@ impl<'a> Compressor<'a> {
         verify: bool,
         batch_size: usize,
         threads: usize,
-        ditto_args: DittoArgs,
+        backend: Backend,
         min_free_bytes: u64,
     ) -> Self {
         Self {
@@ -547,10 +608,12 @@ impl<'a> Compressor<'a> {
             verify,
             batch_size,
             threads,
-            ditto_args,
+            backend,
             min_free_bytes,
             low_space_warned: AtomicBool::new(false),
             unwritable: Mutex::new(HashSet::new()),
+            #[cfg(test)]
+            after_stage: None,
         }
     }
 
@@ -743,7 +806,8 @@ impl<'a> Compressor<'a> {
         }
     }
 
-    /// Runs ditto for `files` into `staging`, commits every staged copy, removes `staging`.
+    /// Makes the staged copies of `files` in `staging` (ditto, or applesauce per file), commits
+    /// every staged copy, removes `staging`.
     fn process(&self, staging: &Path, files: &[&Candidate], bufs: &mut Buffers, out: &mut Outcome) {
         // Files in a directory already found not writable would fail the swap again.
         let (blocked, files): (Vec<&Candidate>, Vec<&Candidate>) =
@@ -766,9 +830,13 @@ impl<'a> Compressor<'a> {
             self.remove_staging(staging);
             return;
         }
+        let ditto_args = match self.backend {
+            Backend::Ditto(args) => args,
+            Backend::Applesauce => return self.process_applesauce(staging, files, bufs, out),
+        };
         let sources: Vec<&Path> = files.iter().map(|c| c.path.as_path()).collect();
         out.ditto_calls += 1;
-        let run = run_ditto(self.ditto_args, &sources, staging, DITTO_TIMEOUT);
+        let run = run_ditto(ditto_args, &sources, staging, DITTO_TIMEOUT);
         let batch_ok = match &run.status {
             DittoStatus::Exited(_) => run.success(),
             DittoStatus::TimedOut | DittoStatus::SpawnFailed(_) | DittoStatus::WaitFailed(_) => {
@@ -852,7 +920,7 @@ impl<'a> Compressor<'a> {
                         break Commit::LowSpace;
                     }
                     out.ditto_calls += 1;
-                    let retry = run_ditto(self.ditto_args, &[&c.path], staging, DITTO_TIMEOUT);
+                    let retry = run_ditto(ditto_args, &[&c.path], staging, DITTO_TIMEOUT);
                     if !retry.success() {
                         retry_failures += 1;
                         let kind = if matches!(retry.status, DittoStatus::TimedOut) {
@@ -886,6 +954,100 @@ impl<'a> Compressor<'a> {
                     continue;
                 }
                 break r;
+            };
+            self.finish(out, c, &r);
+            if let Commit::Rescued(p) = r {
+                rescued = Some(p);
+            }
+        }
+        if rescued.is_none() {
+            self.remove_staging(staging);
+        }
+    }
+
+    /// [`Self::process`] for the applesauce backend: one [`applesauce::stage`] per file, each
+    /// copy committed with the byte compare forced on; free space was checked for the batch.
+    fn process_applesauce(
+        &self,
+        staging: &Path,
+        files: &[&Candidate],
+        bufs: &mut Buffers,
+        out: &mut Outcome,
+    ) {
+        let mut rescued: Option<PathBuf> = None;
+        // The volume ran full: the rest of the batch is not attempted, as on the ditto path.
+        let mut full = false;
+        for c in files {
+            if let Some(rescue) = &rescued {
+                let r = self.fail(
+                    c,
+                    "swap",
+                    format_args!("not committed: batch staging moved to {}", rescue.display()),
+                );
+                self.finish(out, c, &r);
+                continue;
+            }
+            if full {
+                self.finish(out, c, &Commit::LowSpace);
+                continue;
+            }
+            let r = if self.parent_unwritable(c) {
+                self.fail_unwritable(c)
+            } else {
+                match applesauce::stage(c, staging, bufs.applesauce()) {
+                    Ok(Staged::Copy(staged)) => {
+                        #[cfg(test)]
+                        if let Some(hook) = self.after_stage {
+                            hook(c);
+                        }
+                        // Always byte-compared, whatever `verify` says.
+                        self.commit(c, &staged, true, bufs, &sys::rename_swap)
+                    }
+                    Ok(Staged::Incompressible) => {
+                        self.log
+                            .debug(format_args!("{}: incompressible, cached", c.path.display()));
+                        Commit::Incompressible(c.key)
+                    }
+                    Ok(Staged::Changed) => {
+                        self.log.file_event(
+                            Level::Info,
+                            &c.path,
+                            FileEvent::Skip("changed"),
+                            "changed during run, skipped",
+                        );
+                        Commit::Skipped
+                    }
+                    Ok(Staged::HasXattr(name)) => {
+                        self.log.file_event(
+                            Level::Info,
+                            &c.path,
+                            FileEvent::Skip("xattr"),
+                            format_args!("has {name} already, skipped"),
+                        );
+                        Commit::Skipped
+                    }
+                    Ok(Staged::ReservedName) => {
+                        self.log.file_event(
+                            Level::Info,
+                            &c.path,
+                            FileEvent::Skip("name"),
+                            format_args!("named like the staging part dir {PART_DIR}, skipped"),
+                        );
+                        Commit::Skipped
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::StorageFull => {
+                        full = true;
+                        let why = format!("low disk space: {e}");
+                        let rest: Vec<&Candidate> = files
+                            .iter()
+                            .skip_while(|f| !std::ptr::eq(**f, *c))
+                            .copied()
+                            .collect();
+                        self.low_space(staging, &rest, &why);
+                        Commit::LowSpace
+                    }
+                    Err(e) => self.fail(c, "io", format_args!("cannot write compressed copy: {e}")),
+                }
             };
             self.finish(out, c, &r);
             if let Commit::Rescued(p) = r {
@@ -952,7 +1114,23 @@ impl<'a> Compressor<'a> {
             .read(true)
             .custom_flags(O_NOFOLLOW)
             .open(staged);
-        if let Err(e) = opened.and_then(|f| f.set_times(times)) {
+        // Setting an mtime older than the birthtime lowers the birthtime on APFS: the
+        // applesauce copy got the original's birthtime in staging, put it back after.
+        let keep_birth = self.backend == Backend::Applesauce;
+        let set = |f: File| -> io::Result<()> {
+            let birth = if keep_birth {
+                Some(f.metadata()?.created()?)
+            } else {
+                None
+            };
+            f.set_times(times)?;
+            if let Some(b) = birth {
+                use std::os::macos::fs::FileTimesExt as _;
+                f.set_times(FileTimes::new().set_created(b))?;
+            }
+            Ok(())
+        };
+        if let Err(e) = opened.and_then(set) {
             let r = self.fail(
                 c,
                 "io",
@@ -985,6 +1163,25 @@ impl<'a> Compressor<'a> {
             self.log
                 .debug(format_args!("{}: incompressible, cached", c.path.display()));
             return Self::discard(staged, Commit::Incompressible(c.key));
+        }
+        // The xattrs ditto would carry over, checked for applesauce copies only.
+        if self.backend == Backend::Applesauce {
+            match xattr_diff(&c.path, &c.key, staged) {
+                Ok(XattrCheck::Same) => {}
+                Ok(XattrCheck::Changed) => return self.changed(c, staged),
+                Ok(XattrCheck::Differs(diff)) => {
+                    let r = self.fail(
+                        c,
+                        "io",
+                        format_args!("staged copy differs ({diff}), discarded"),
+                    );
+                    return Self::discard(staged, r);
+                }
+                Err(e) => {
+                    let r = self.fail(c, "io", format_args!("cannot compare xattrs: {e}"));
+                    return Self::discard(staged, r);
+                }
+            }
         }
         if sm.gid() != c.gid
             && let Err(e) = std::os::unix::fs::chown(staged, None, Some(c.gid))
@@ -1135,6 +1332,66 @@ fn metadata_diff(c: &Candidate, sm: &Metadata) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// Result of [`xattr_diff`].
+#[derive(Debug, PartialEq, Eq)]
+enum XattrCheck {
+    Same,
+    /// The path no longer holds the walked inode.
+    Changed,
+    /// The first difference.
+    Differs(String),
+}
+
+/// Compares the xattrs of the original (opened without following a symlink, must still be
+/// `key`) and the staged copy, as a plain listing shows them: the name sets must be equal and
+/// every value too, except [`applesauce::XATTR_NOT_COPIED`] (ignored, kernel-assigned per
+/// creating process) and [`applesauce::XATTR_VALUE_REWRITTEN`], of which only the flags field
+/// (before the first `;`) is compared (copyfile rewrites time and agent, as ditto does).
+fn xattr_diff(orig: &Path, key: &FileKey, staged: &Path) -> io::Result<XattrCheck> {
+    let open = |p: &Path| File::options().read(true).custom_flags(O_NOFOLLOW).open(p);
+    let o = match open(orig) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(XattrCheck::Changed),
+        Err(e) => return Err(e),
+    };
+    if FileKey::of(&o.metadata()?) != *key {
+        return Ok(XattrCheck::Changed);
+    }
+    let s = open(staged)?;
+    let names = |f: &File| -> io::Result<Vec<std::ffi::CString>> {
+        let mut v = sys::flist_xattr(f)?;
+        v.retain(|n| n.as_c_str() != applesauce::XATTR_NOT_COPIED);
+        v.sort();
+        Ok(v)
+    };
+    let (on, sn) = (names(&o)?, names(&s)?);
+    if on != sn {
+        return Ok(XattrCheck::Differs("xattr names".to_owned()));
+    }
+    for n in &on {
+        let (mut a, mut b) = (
+            sys::fget_xattr(&o, n, false)?,
+            sys::fget_xattr(&s, n, false)?,
+        );
+        if n.as_c_str() == applesauce::XATTR_VALUE_REWRITTEN {
+            let flags = |v: &mut Option<Vec<u8>>| {
+                if let Some(v) = v {
+                    v.truncate(v.iter().position(|&b| b == b';').unwrap_or(v.len()));
+                }
+            };
+            flags(&mut a);
+            flags(&mut b);
+        }
+        if a != b {
+            return Ok(XattrCheck::Differs(format!(
+                "xattr {}",
+                n.to_string_lossy()
+            )));
+        }
+    }
+    Ok(XattrCheck::Same)
 }
 
 /// Opens the original once (no symlink follow), checks it is still the walked inode and
@@ -1312,7 +1569,7 @@ mod tests {
 
     impl Fixture {
         fn compressor(&self) -> Compressor<'_> {
-            Compressor::new(&self.log, true, 10, 1, ditto_args(), 0)
+            Compressor::new(&self.log, true, 10, 1, Backend::Ditto(ditto_args()), 0)
         }
 
         /// Replaces the original by a new inode with different content.
@@ -1542,9 +1799,26 @@ mod tests {
         fs::create_dir(&fake).unwrap();
         fs::write(fake.join(KEEP_MARKER), "user file").unwrap();
 
-        let all = [&stale, &empty, &other, &kept, &crashed, &fake].map(|p| p.to_path_buf());
+        // A crash while applesauce wrote a copy: the part dir is ours.
+        let part = dir.join(".acz-staging-1-7");
+        fs::create_dir_all(part.join(PART_DIR)).unwrap();
+        fs::write(part.join(PART_DIR).join("half.txt"), "").unwrap();
+        compressed_copy(&dir, &part, "done.txt");
+        // A user FILE named like the part dir is a swapped-out original: moved, not deleted.
+        let named = dir.join(".acz-staging-1-8");
+        fs::create_dir(&named).unwrap();
+        fs::write(named.join(PART_DIR), "user file").unwrap();
+
+        let all = [
+            &stale, &empty, &other, &kept, &crashed, &fake, &part, &named,
+        ]
+        .map(|p| p.to_path_buf());
         remove_stale(&all, &log);
-        assert!(!stale.exists() && !empty.exists());
+        assert!(!stale.exists() && !empty.exists() && !part.exists());
+        assert_eq!(
+            fs::read_to_string(dir.join(".acz-rescue-1-8").join(PART_DIR)).unwrap(),
+            "user file"
+        );
         assert!(other.exists());
         assert_eq!(
             fs::read_to_string(kept.join("data.txt")).unwrap(),
@@ -1628,8 +1902,15 @@ mod tests {
         let log = Logger::open(&dir.join("log"), 1 << 20, 1, false).unwrap();
         let files = files_in(&dir, "a", 3);
         let before: Vec<u64> = files.iter().map(|c| c.key.ino).collect();
-        let out =
-            Compressor::new(&log, true, 100, 2, ditto_args(), u64::MAX / 2).run(files.clone());
+        let out = Compressor::new(
+            &log,
+            true,
+            100,
+            2,
+            Backend::Ditto(ditto_args()),
+            u64::MAX / 2,
+        )
+        .run(files.clone());
         assert_eq!((out.ditto_calls, out.compressed, out.errors), (0, 0, 0));
         assert_eq!(out.skipped_low_space, 3);
         for (c, ino) in files.iter().zip(before) {
@@ -1650,6 +1931,109 @@ mod tests {
     }
 
     #[test]
+    fn applesauce_backend_compresses_and_verifies() {
+        let dir = temp_dir("applesauce");
+        let log = Logger::open(&dir.join("log"), 1 << 20, 1, false).unwrap();
+        let files = files_in(&dir, "a", 3);
+        let content: Vec<Vec<u8>> = files.iter().map(|c| fs::read(&c.path).unwrap()).collect();
+        // Verify off in the config: applesauce copies are byte-compared anyway.
+        let out = Compressor::new(&log, false, 100, 2, Backend::Applesauce, 0).run(files.clone());
+        assert_eq!((out.compressed, out.errors, out.ditto_calls), (3, 0, 0));
+        for (c, want) in files.iter().zip(&content) {
+            let m = fs::symlink_metadata(&c.path).unwrap();
+            assert_ne!(m.st_flags() & UF_COMPRESSED, 0);
+            assert_eq!(
+                (m.size(), m.mtime(), m.mtime_nsec()),
+                (c.size(), c.key.mtime_sec, c.key.mtime_nsec)
+            );
+            assert_eq!(&fs::read(&c.path).unwrap(), want);
+        }
+        assert!(fs::read_dir(dir.join("root")).unwrap().all(|e| {
+            !e.unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(STAGING_PREFIX)
+        }));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn xattr_diff_flags_lost_or_changed_xattrs() {
+        let dir = temp_dir("xattr-diff");
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        fs::write(&a, "a").unwrap();
+        fs::write(&b, "b").unwrap();
+        let key = FileKey::of(&fs::symlink_metadata(&a).unwrap());
+        let set = |p: &Path, n: &std::ffi::CStr, v: &[u8]| {
+            sys::fset_xattr(&File::open(p).unwrap(), n, v, 0).unwrap()
+        };
+        let diff = || xattr_diff(&a, &key, &b).unwrap();
+        let differs = |s: &str| XattrCheck::Differs(s.to_owned());
+        assert_eq!(diff(), XattrCheck::Same);
+        set(&a, c"user.x", b"1");
+        assert_eq!(diff(), differs("xattr names"));
+        set(&b, c"user.x", b"2");
+        assert_eq!(diff(), differs("xattr user.x"));
+        set(&b, c"user.x", b"1");
+        // Quarantine: presence and flags count, time and agent are rewritten by copyfile.
+        set(
+            &a,
+            applesauce::XATTR_VALUE_REWRITTEN,
+            b"0081;5f000000;Safari;",
+        );
+        assert_eq!(diff(), differs("xattr names"));
+        set(&b, applesauce::XATTR_VALUE_REWRITTEN, b"0082;6a000000;;");
+        assert_eq!(diff(), differs("xattr com.apple.quarantine"));
+        set(&b, applesauce::XATTR_VALUE_REWRITTEN, b"0081;6a000000;;");
+        assert_eq!(diff(), XattrCheck::Same);
+        // Another inode at the original's path: changed, never compared.
+        assert_eq!(xattr_diff(&b, &key, &a).unwrap(), XattrCheck::Changed);
+        fs::remove_file(&a).unwrap();
+        assert_eq!(diff(), XattrCheck::Changed);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn applesauce_copy_is_verified_even_with_verify_off() {
+        let dir = temp_dir("applesauce-verify");
+        let log = Logger::open(&dir.join("log"), 1 << 20, 1, false).unwrap();
+        let files = files_in(&dir, "v", 1);
+        let want = fs::read(&files[0].path).unwrap();
+        let mut comp = Compressor::new(&log, false, 100, 1, Backend::Applesauce, 0);
+        // Same size and mtime, other bytes: only a byte compare can tell.
+        comp.after_stage = Some(|c| {
+            let mut data = fs::read(&c.path).unwrap();
+            data[0] ^= 1;
+            fs::write(&c.path, data).unwrap();
+            let t = system_time(c.key.mtime_sec, c.key.mtime_nsec);
+            File::options()
+                .write(true)
+                .open(&c.path)
+                .unwrap()
+                .set_modified(t)
+                .unwrap();
+        });
+        let out = comp.run(files.clone());
+        assert_eq!((out.compressed, out.errors), (0, 1));
+        let p = &files[0].path;
+        assert_eq!(
+            fs::symlink_metadata(p).unwrap().st_flags() & UF_COMPRESSED,
+            0
+        );
+        assert_ne!(
+            fs::read(p).unwrap(),
+            want,
+            "the original stays, as modified"
+        );
+        assert!(
+            log_text(&dir).contains("verify failed"),
+            "{}",
+            log_text(&dir)
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn unwritable_parent_is_remembered_for_the_run() {
         let dir = temp_dir("eacces");
         let log = Logger::open(&dir.join("log"), 1 << 20, 1, false).unwrap();
@@ -1657,7 +2041,8 @@ mod tests {
         files.extend(files_in(&dir, "rw", 1));
         let ro = dir.join("root/ro");
         fs::set_permissions(&ro, fs::Permissions::from_mode(0o555)).unwrap();
-        let out = Compressor::new(&log, true, 100, 1, ditto_args(), 0).run(files.clone());
+        let out =
+            Compressor::new(&log, true, 100, 1, Backend::Ditto(ditto_args()), 0).run(files.clone());
         fs::set_permissions(&ro, fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(
             (out.ditto_calls, out.compressed, out.errors),
@@ -1698,7 +2083,7 @@ mod tests {
     }
 
     fn quiet(log: &Logger) -> Compressor<'_> {
-        Compressor::new(log, false, 100, 2, ditto_args(), 0)
+        Compressor::new(log, false, 100, 2, Backend::Ditto(ditto_args()), 0)
     }
 
     #[test]

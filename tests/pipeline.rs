@@ -1243,8 +1243,8 @@ fn clean_lists_and_removes_leftovers() {
 
 #[test]
 fn too_large_for_ditto_is_skipped_and_uncached() {
-    // `DITTO_MAX_SIZE` in src/classify.rs (a bin crate, not importable here).
-    const DITTO_MAX_SIZE: u64 = 512 << 20;
+    // `MAX_SIZE` in src/classify.rs (a bin crate, not importable here).
+    const MAX_SIZE: u64 = 512 << 20;
     let env = Env::new("large", "");
     let venv = env.base.join("tree/Work_l/.venv");
     fs::write(
@@ -1258,7 +1258,7 @@ fn too_large_for_ditto_is_skipped_and_uncached() {
     let big = venv.join("big.bin");
     fs::File::create(&big)
         .unwrap()
-        .set_len(DITTO_MAX_SIZE + 1)
+        .set_len(MAX_SIZE + 1)
         .unwrap();
     // A cache entry from earlier runs, when ditto was still tried on it.
     let m = lstat(&big);
@@ -1282,7 +1282,7 @@ fn too_large_for_ditto_is_skipped_and_uncached() {
     assert_eq!(s["ditto_calls"], "0", "{s:?}");
     let now = lstat(&big);
     assert!(!compressed(&big));
-    assert_eq!((now.ino(), now.size()), (m.ino(), DITTO_MAX_SIZE + 1));
+    assert_eq!((now.ino(), now.size()), (m.ino(), MAX_SIZE + 1));
     let ino = m.ino().to_string();
     let cache = fs::read_to_string(env.cache()).unwrap();
     assert!(
@@ -1291,7 +1291,7 @@ fn too_large_for_ditto_is_skipped_and_uncached() {
     );
     assert!(
         env.log_text().contains(&format!(
-            "{}: larger than 512 MiB (ditto does not compress it), skipped",
+            "{}: larger than 512 MiB (above the compression size limit), skipped",
             big.display()
         )),
         "{}",
@@ -1328,4 +1328,188 @@ fn too_small_file_keeps_its_state_row() {
         "{}",
         fs::read_to_string(env.state()).unwrap()
     );
+}
+
+/// Edge-size files under one match root, run with `backend`. Returns the env, the root and
+/// the (name, content) pairs written; `big.bin` (sparse, over 512 MiB) is extra.
+fn edge_files(tag: &str, backend: &str) -> (Env, PathBuf, Vec<(String, Vec<u8>)>) {
+    let env = Env::new(tag, "");
+    let root = env.base.join(format!("tree/Work_{tag}/.venv"));
+    fs::write(
+        &env.config,
+        fs::read_to_string(&env.config).unwrap()
+            + &format!(
+                "patterns = [\"{}\"]\nexclude = []\nmin_size = 0\nbackend = \"{backend}\"\n",
+                root.display()
+            ),
+    )
+    .unwrap();
+    fs::create_dir_all(&root).unwrap();
+    let text = |n: usize| compressible("edge").into_bytes().repeat(n / 250_000 + 1)[..n].to_vec();
+    let files: Vec<(String, Vec<u8>)> = [0, 1, 65_535, 65_536, 65_537, 5 << 20]
+        .into_iter()
+        .map(|n| (format!("e{n}.txt"), text(n)))
+        .chain([("random.bin".to_owned(), random_bytes(256 * 1024))])
+        .collect();
+    for (name, data) in &files {
+        fs::write(root.join(name), data).unwrap();
+    }
+    let tagged = root.join("e65537.txt");
+    assert!(
+        Command::new("/usr/bin/xattr")
+            .args(["-w", "user.acz", "kept"])
+            .arg(&tagged)
+            .status()
+            .unwrap()
+            .success()
+    );
+    fs::File::create(root.join("big.bin"))
+        .unwrap()
+        .set_len((512 << 20) + 1)
+        .unwrap();
+    (env, root, files)
+}
+
+/// The edge-size run of `backend`: `compressed_from` is the smallest size it compresses.
+fn edge_sizes(backend: &str, compressed_from: usize) {
+    let (env, root, files) = edge_files(&format!("edge-{backend}"), backend);
+    let before: HashMap<String, Metadata> = files
+        .iter()
+        .map(|(n, _)| (n.clone(), lstat(&root.join(n))))
+        .collect();
+    let s = env.run(&["compress", "--apply", "-v"]);
+    let want_compressed = files
+        .iter()
+        .filter(|(n, d)| n.starts_with('e') && d.len() >= compressed_from)
+        .count();
+    assert_eq!(s["compressed"], want_compressed.to_string(), "{s:?}");
+    assert_eq!(s["errors"], "0", "{s:?}");
+    assert_eq!(s["too_large"], "1", "{s:?}");
+    assert_eq!(
+        s["incompressible"],
+        (files.len() - want_compressed).to_string(),
+        "{s:?}"
+    );
+    let plain = env.base.join("plain");
+    for (name, data) in &files {
+        let p = root.join(name);
+        let (m, b) = (lstat(&p), &before[name]);
+        let should = name.starts_with('e') && data.len() >= compressed_from;
+        assert_eq!(compressed(&p), should, "{name}");
+        // Kernel read, size and metadata as before.
+        assert_eq!(&fs::read(&p).unwrap(), data, "{name}");
+        assert_eq!(m.size(), data.len() as u64, "{name}");
+        assert_eq!(
+            (m.mode(), m.uid(), m.gid(), m.mtime(), m.mtime_nsec()),
+            (b.mode(), b.uid(), b.gid(), b.mtime(), b.mtime_nsec()),
+            "{name}"
+        );
+        if backend == "applesauce" {
+            assert_eq!(m.created().unwrap(), b.created().unwrap(), "{name}");
+        }
+        // An uncompressed copy made by ditto is byte-identical (without
+        // --nopreserveHFSCompression ditto keeps the copy compressed).
+        fs::create_dir_all(&plain).unwrap();
+        let mut dest = plain.clone().into_os_string();
+        dest.push("/");
+        let ok = Command::new("/usr/bin/ditto")
+            .args([
+                "--nohfsCompression",
+                "--nopreserveHFSCompression",
+                "--noclone",
+            ])
+            .arg(&p)
+            .arg(&dest)
+            .status()
+            .unwrap();
+        assert!(ok.success(), "{name}");
+        let copy = plain.join(name);
+        assert!(!compressed(&copy), "{name}");
+        assert_eq!(&fs::read(&copy).unwrap(), data, "{name}");
+    }
+    let tagged = root.join("e65537.txt");
+    let out = Command::new("/usr/bin/xattr")
+        .args(["-p", "user.acz"])
+        .arg(&tagged)
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "kept");
+    assert!(!compressed(&root.join("big.bin")));
+}
+
+#[test]
+fn ditto_edge_sizes() {
+    // ditto leaves 16 KiB and less uncompressed: expected, not a failure.
+    edge_sizes("ditto", 16 * 1024 + 1);
+}
+
+#[test]
+fn applesauce_edge_sizes() {
+    // Below one 4 KiB allocation unit nothing can be saved.
+    edge_sizes("applesauce", 2);
+}
+
+#[test]
+fn switching_backend_drops_the_incompressible_cache() {
+    let (env, _, _) = edge_files("switch", "applesauce");
+    let s = env.apply();
+    assert_eq!(s["incompressible"], "3", "{s:?}");
+    let record = env.cache().with_file_name("ditto-args.txt");
+    assert_eq!(
+        fs::read_to_string(&record).unwrap(),
+        "applesauce lzfse 0.4.14 2.0.0\n"
+    );
+    // Same backend again: the cache holds.
+    let s = env.apply();
+    assert_eq!(s["incompressible"], "3", "{s:?}");
+    assert!(!env.log_text().contains("dropped"), "{}", env.log_text());
+    // ditto for one run: entries of another compressor are re-checked.
+    env.run(&["compress", "--apply", "--backend", "ditto"]);
+    assert!(
+        env.log_text().contains(
+            "incompressible cache was filled by another backend or other ditto options, dropped 3 entries"
+        ),
+        "{}",
+        env.log_text()
+    );
+    assert!(
+        fs::read_to_string(&record)
+            .unwrap()
+            .starts_with("--hfsCompression")
+    );
+}
+
+#[test]
+fn applesauce_keeps_birthtime_older_mtime() {
+    use std::os::macos::fs::FileTimesExt as _;
+    use std::time::{Duration, UNIX_EPOCH};
+    let env = Env::new("birth", "");
+    let venv = env.base.join("tree/Work_b/.venv");
+    fs::write(
+        &env.config,
+        fs::read_to_string(&env.config).unwrap()
+            + &format!(
+                "patterns = [\"{}\"]\nexclude = []\nbackend = \"applesauce\"\n",
+                venv.display()
+            ),
+    )
+    .unwrap();
+    fs::create_dir_all(&venv).unwrap();
+    let file = venv.join("old.txt");
+    fs::write(&file, compressible("old")).unwrap();
+    // mtime in 2001, birthtime in 2005: the commit's mtime would pull the birthtime down.
+    let f = fs::File::options().write(true).open(&file).unwrap();
+    f.set_modified(UNIX_EPOCH + Duration::from_secs(978_307_200))
+        .unwrap();
+    f.set_times(fs::FileTimes::new().set_created(UNIX_EPOCH + Duration::from_secs(1_104_537_600)))
+        .unwrap();
+    drop(f);
+    let before = lstat(&file);
+    assert!(before.created().unwrap() > before.modified().unwrap());
+    let s = env.apply();
+    assert_eq!(s["compressed"], "1", "{s:?}");
+    let after = lstat(&file);
+    assert!(compressed(&file));
+    assert_eq!(after.created().unwrap(), before.created().unwrap());
+    assert_eq!(after.modified().unwrap(), before.modified().unwrap());
 }

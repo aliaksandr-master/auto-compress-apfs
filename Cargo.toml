@@ -3,7 +3,7 @@ name = "auto-compress-apfs"
 version = "0.3.0"
 edition = "2024"
 rust-version = "1.89"
-description = "Turns on APFS transparent compression for files matched by glob patterns, using /usr/bin/ditto"
+description = "Turns on APFS transparent compression for files matched by glob patterns, using /usr/bin/ditto or an in-process LZFSE backend"
 license = "GPL-3.0-or-later"
 authors = ["Aliaksandr Master <alxe.master@gmail.com>"]
 readme = "README.md"
@@ -14,7 +14,12 @@ homepage = "https://github.com/aliaksandr-master/auto-compress-apfs"
 include = ["/src", "/config/default.toml", "/README.md", "/CHANGELOG.md", "/LICENSE", "/examples"]
 
 [dependencies]
+# In-process decmpfs writer (opt-in `backend = "applesauce"`); its lzfse-sys is pinned below.
+applesauce-core = { version = "=0.4.14", default-features = false, features = ["lzfse"] }
 globset = "0.4"
+libc = "0.2"
+# Pinned: its version is part of the incompressible-cache record of the applesauce backend.
+lzfse-sys = "=2.0.0"
 serde = { version = "1", features = ["derive"] }
 toml = "1"
 

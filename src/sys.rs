@@ -1,7 +1,9 @@
 //! Thin FFI wrappers over libSystem and the BSD flag constants this tool relies on.
 
-use std::ffi::{CString, c_char, c_int, c_long, c_uint};
-use std::io;
+use std::ffi::{CStr, CString, c_char, c_int, c_long, c_uint};
+use std::fs::File;
+use std::io::{self, Seek, SeekFrom, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
@@ -175,6 +177,22 @@ pub fn rename_excl(from: &Path, to: &Path) -> io::Result<()> {
     }
 }
 
+/// Renames `from` to `to` unless `to` exists (`EEXIST` then); never replaces an entry
+/// (`renamex_np(from, to, RENAME_EXCL)`). Unlike [`rename_excl`] it follows symlinks in the
+/// leading components, as [`rename_swap`] does: for two names inside one staging dir of ours.
+pub fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+    let a = c_path(from)?;
+    let b = c_path(to)?;
+    // SAFETY: `a` and `b` are valid NUL-terminated strings that outlive the call; renamex_np
+    // does not retain the pointers.
+    let rc = unsafe { renamex_np(a.as_ptr(), b.as_ptr(), RENAME_EXCL) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 /// Names (as `chflags(1)` spells them) of the [`PROTECTED_FLAGS`] set in `flags`, comma separated.
 pub fn flag_names(flags: u32) -> String {
     [
@@ -255,9 +273,228 @@ pub fn disable_dataless_materialization() -> io::Result<()> {
     }
 }
 
+/// Name of the resource fork xattr; a decmpfs file keeps its compressed blocks there.
+pub const RESOURCE_FORK: &CStr = c"com.apple.ResourceFork";
+/// Name of the decmpfs header xattr of a transparently compressed file.
+pub const DECMPFS: &CStr = c"com.apple.decmpfs";
+/// `fcopyfile(3)`: copy the extended attributes.
+pub const COPYFILE_XATTR: u32 = libc::COPYFILE_XATTR;
+/// `fcopyfile(3)`: copy the access control list.
+pub const COPYFILE_ACL: u32 = libc::COPYFILE_ACL;
+
+fn check(rc: c_int) -> io::Result<()> {
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn xattr_opts(show_compression: bool) -> c_int {
+    if show_compression {
+        libc::XATTR_SHOWCOMPRESSION
+    } else {
+        0
+    }
+}
+
+/// Length of the xattr `name` of `f`, `None` when it is not set. `show_compression` passes
+/// `XATTR_SHOWCOMPRESSION`, which makes the decmpfs and resource fork xattrs of a compressed
+/// file visible.
+pub fn fxattr_len(f: &File, name: &CStr, show_compression: bool) -> io::Result<Option<usize>> {
+    // SAFETY: the fd is open for the lifetime of `f`, `name` is NUL-terminated; a null
+    // buffer of size 0 asks only for the value length.
+    let len = unsafe {
+        libc::fgetxattr(
+            f.as_raw_fd(),
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+            0,
+            xattr_opts(show_compression),
+        )
+    };
+    if len >= 0 {
+        return Ok(Some(len as usize));
+    }
+    let e = io::Error::last_os_error();
+    match e.raw_os_error() {
+        Some(libc::ENOATTR) => Ok(None),
+        _ => Err(e),
+    }
+}
+
+/// Value of the xattr `name` of `f`, `None` when it is not set (`show_compression` as for
+/// [`fxattr_len`]).
+pub fn fget_xattr(f: &File, name: &CStr, show_compression: bool) -> io::Result<Option<Vec<u8>>> {
+    loop {
+        let Some(len) = fxattr_len(f, name, show_compression)? else {
+            return Ok(None);
+        };
+        let mut buf = vec![0u8; len];
+        // SAFETY: `buf` is a live allocation of `buf.len()` writable bytes; fgetxattr writes
+        // at most that many and does not retain any pointer.
+        let got = unsafe {
+            libc::fgetxattr(
+                f.as_raw_fd(),
+                name.as_ptr(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                0,
+                xattr_opts(show_compression),
+            )
+        };
+        if got >= 0 {
+            buf.truncate(got as usize);
+            return Ok(Some(buf));
+        }
+        let e = io::Error::last_os_error();
+        match e.raw_os_error() {
+            // Grew between the two calls: ask for the length again.
+            Some(libc::ERANGE) => continue,
+            Some(libc::ENOATTR) => return Ok(None),
+            _ => return Err(e),
+        }
+    }
+}
+
+/// Writes `value` into the xattr `name` of `f` at byte `position` (only the resource fork
+/// takes a non-zero position), with `XATTR_SHOWCOMPRESSION`.
+pub fn fset_xattr(f: &File, name: &CStr, value: &[u8], position: u32) -> io::Result<()> {
+    // SAFETY: the fd is open for the lifetime of `f`, `name` is NUL-terminated and `value` is
+    // valid for `value.len()` bytes; fsetxattr only reads them and retains no pointer.
+    check(unsafe {
+        libc::fsetxattr(
+            f.as_raw_fd(),
+            name.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            position,
+            libc::XATTR_SHOWCOMPRESSION,
+        )
+    })
+}
+
+/// Names of the xattrs of `f` as a plain listing shows them (no `XATTR_SHOWCOMPRESSION`: the
+/// decmpfs and resource fork xattrs of a compressed file are hidden).
+pub fn flist_xattr(f: &File) -> io::Result<Vec<CString>> {
+    loop {
+        // SAFETY: the fd is open for the lifetime of `f`; a null buffer of size 0 asks only
+        // for the list length.
+        let len = unsafe { libc::flistxattr(f.as_raw_fd(), std::ptr::null_mut(), 0, 0) };
+        if len < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut buf = vec![0u8; len as usize];
+        // SAFETY: `buf` is a live allocation of `buf.len()` writable bytes; flistxattr writes
+        // at most that many and does not retain the pointer.
+        let got = unsafe { libc::flistxattr(f.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
+        if got < 0 {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::ERANGE) {
+                continue;
+            }
+            return Err(e);
+        }
+        buf.truncate(got as usize);
+        return Ok(buf
+            .split(|&b| b == 0)
+            .filter(|n| !n.is_empty())
+            .map(|n| CString::new(n).expect("split at NUL"))
+            .collect());
+    }
+}
+
+/// Sets the `st_flags` of `f` to `flags` (`fchflags(2)`).
+pub fn fchflags(f: &File, flags: u32) -> io::Result<()> {
+    // SAFETY: the fd is open for the lifetime of `f`; fchflags takes no pointers.
+    check(unsafe { libc::fchflags(f.as_raw_fd(), flags) })
+}
+
+/// Copies what `flags` ([`COPYFILE_XATTR`], [`COPYFILE_ACL`]) select from `src` to `dst`
+/// (`fcopyfile(3)` without state).
+pub fn fcopyfile(src: &File, dst: &File, flags: u32) -> io::Result<()> {
+    // SAFETY: both fds are open for the lifetime of the borrows; a null state is allowed and
+    // fcopyfile retains nothing.
+    check(unsafe {
+        libc::fcopyfile(
+            src.as_raw_fd(),
+            dst.as_raw_fd(),
+            std::ptr::null_mut(),
+            flags,
+        )
+    })
+}
+
+/// The resource fork of a file as a seekable byte stream: every write is an
+/// [`fset_xattr`] of [`RESOURCE_FORK`] at the current position. Positions beyond `u32::MAX`
+/// are errors (the xattr position is 32-bit). The fork is assumed absent when created.
+pub struct RforkWriter<'a> {
+    file: &'a File,
+    pos: u64,
+    /// Bytes written so far up to the furthest end (the fork length).
+    len: u64,
+}
+
+impl<'a> RforkWriter<'a> {
+    pub fn new(file: &'a File) -> Self {
+        Self {
+            file,
+            pos: 0,
+            len: 0,
+        }
+    }
+}
+
+fn too_far() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "resource fork position beyond 4 GiB",
+    )
+}
+
+impl Write for RforkWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let end = self.pos + buf.len() as u64;
+        if end > u64::from(u32::MAX) {
+            return Err(too_far());
+        }
+        fset_xattr(self.file, RESOURCE_FORK, buf, self.pos as u32)?;
+        self.pos = end;
+        self.len = self.len.max(end);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Seek for RforkWriter<'_> {
+    fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
+        let pos = match to {
+            SeekFrom::Start(p) => Some(p),
+            SeekFrom::Current(d) => self.pos.checked_add_signed(d),
+            SeekFrom::End(d) => self.len.checked_add_signed(d),
+        };
+        match pos {
+            Some(p) if p <= u64::from(u32::MAX) => {
+                self.pos = p;
+                Ok(p)
+            }
+            Some(_) => Err(too_far()),
+            None => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seek before the start of the resource fork",
+            )),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::macos::fs::MetadataExt as _;
 
     #[test]
     fn local_time_is_plausible() {
@@ -311,5 +548,60 @@ mod tests {
     #[test]
     fn dataless_policy_can_be_set() {
         disable_dataless_materialization().unwrap();
+    }
+
+    #[test]
+    fn xattr_wrappers_round_trip() {
+        let dir = std::env::temp_dir().join(format!("acz-sys-xattr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        std::fs::write(&a, "A").unwrap();
+        std::fs::write(&b, "B").unwrap();
+        let fa = File::options().read(true).write(true).open(&a).unwrap();
+        let fb = File::options().read(true).write(true).open(&b).unwrap();
+        assert_eq!(fget_xattr(&fa, c"user.acz", false).unwrap(), None);
+        fset_xattr(&fa, c"user.acz", b"value", 0).unwrap();
+        assert_eq!(
+            fget_xattr(&fa, c"user.acz", false).unwrap().as_deref(),
+            Some(&b"value"[..])
+        );
+        // The system may add com.apple.provenance to files this process creates.
+        let has = |f: &File| flist_xattr(f).unwrap().contains(&c"user.acz".to_owned());
+        assert!(has(&fa));
+        assert!(!has(&fb));
+        fcopyfile(&fa, &fb, COPYFILE_XATTR).unwrap();
+        assert!(has(&fb));
+        let flags = std::fs::metadata(&b).unwrap().st_flags();
+        fchflags(&fb, flags | 0x0000_8000).unwrap(); // UF_HIDDEN
+        assert_ne!(std::fs::metadata(&b).unwrap().st_flags() & 0x0000_8000, 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rfork_writer_gap_seek_and_overwrite() {
+        let dir = std::env::temp_dir().join(format!("acz-sys-rfork-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("f");
+        std::fs::write(&p, "").unwrap();
+        let f = File::options().read(true).write(true).open(&p).unwrap();
+        let mut w = RforkWriter::new(&f);
+        // Like the decmpfs writer: skip the header, write the blocks, then the header.
+        assert_eq!(w.seek(SeekFrom::Start(8)).unwrap(), 8);
+        w.write_all(b"blocks").unwrap();
+        assert_eq!(w.seek(SeekFrom::End(0)).unwrap(), 14);
+        assert_eq!(w.seek(SeekFrom::Current(-14)).unwrap(), 0);
+        w.write_all(b"HEADER__").unwrap();
+        assert_eq!(w.stream_position().unwrap(), 8);
+        assert_eq!(
+            fget_xattr(&f, RESOURCE_FORK, true).unwrap().as_deref(),
+            Some(&b"HEADER__blocks"[..])
+        );
+        assert!(w.seek(SeekFrom::Current(-9)).is_err());
+        assert!(w.seek(SeekFrom::Start(u64::from(u32::MAX) + 1)).is_err());
+        w.seek(SeekFrom::Start(u64::from(u32::MAX) - 1)).unwrap();
+        assert!(w.write(b"xy").is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

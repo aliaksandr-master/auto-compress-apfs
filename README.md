@@ -1,7 +1,8 @@
 # auto-compress-apfs
 
-Turns on APFS transparent compression for files matched by glob patterns, using only Apple's
-standard tool `/usr/bin/ditto --hfsCompression`. Compressed files stay readable by every program
+Turns on APFS transparent compression for files matched by glob patterns, using Apple's
+standard tool `/usr/bin/ditto --hfsCompression` (the default), or optionally an in-process LZFSE
+writer (`backend = "applesauce"`, built on the `applesauce-core` crate). Compressed files stay readable by every program
 as usual; the filesystem decompresses them on read. Good targets are large trees of small, rarely
 rewritten, well compressible files: Python virtualenvs, package caches, `node_modules`.
 
@@ -127,6 +128,10 @@ holds the lock exits 0 at once.
    incompressible cache are recorded next to it (`ditto-args.txt`); a cache filled with other
    options, or one without a record while the probe needs `--noclone`, is dropped once and its
    files are checked again. A preview runs no ditto and keeps showing the cache until then.
+   With `backend = "applesauce"` the probe instead stages `ditto-probe.txt` with the in-process
+   writer into `ditto-probe.out/` and requires a compressed copy that reads back
+   byte-identical; the cache record is then `applesauce lzfse <applesauce-core> <lzfse-sys>`
+   (the pinned versions), so switching backends (or versions) drops the cache once too.
 5. **Compress in batches.** Files of one match root (and device) are copied by one
    `ditto <probed options> -- <files...> <root>/.acz-staging-<pid>-<n>/` call (up to `batch_size`
    files and 2 GiB of data; basenames unique per batch ignoring case, because APFS volumes are
@@ -161,6 +166,28 @@ holds the lock exits 0 at once.
    `skipped_low_space`) and no copy is made. A directory found not writable (staging or swap
    fails with EACCES/EPERM) is remembered for the rest of the run: its other files get one
    ERROR each ("parent dir not writable") without another copy. Nothing is ever `chmod`ed.
+
+   **`backend = "applesauce"`** (or `--backend applesauce` for one run) uses the same batches,
+   staging dirs and commit checks, but makes each copy in-process instead of with ditto: the
+   original is opened `O_NOFOLLOW` and must still be the walked inode; a file that already has a
+   `com.apple.ResourceFork` or `com.apple.decmpfs` xattr is skipped. The copy is written in
+   `<staging>/.acz-part/` (xattrs via `fcopyfile`, then the whole file read in 64 KiB blocks and
+   compressed with LZFSE into the resource fork, or inline into the decmpfs xattr for one small
+   block; then the decmpfs header, ACL, the current mode, birthtime, the user flags plus
+   `UF_COMPRESSED`, and `fsync` last) and
+   renamed next to the other staged copies only when complete. A file is incompressible when
+   the stored bytes rounded up to 4 KiB are not below its size rounded up, decided only after
+   the whole file was read unchanged. Every applesauce copy is byte-compared before the swap,
+   whatever `verify` says, and its xattrs must match the original's: same names, same values,
+   except `com.apple.provenance` (assigned by the kernel to every file the process creates and
+   not writable, ditto's copies get the same) and the value of `com.apple.quarantine`
+   (rewritten by copyfile with a new timestamp and without the agent, as ditto does; only its
+   flags field must match). The same 512 MiB limit applies. A file named `.acz-part` is never
+   compressed by this backend (its copy would clash with the part dir). A full volume
+   (`ENOSPC`) while writing a copy skips the rest of the batch as low space. The birthtime is
+   kept, also when the mtime is older than it (it is set again after the mtime).
+   A crash mid-copy leaves a `.acz-part/` directory, which stale cleanup removes with the
+   staging dir.
 
 The original stays the source of truth until the verified atomic swap; every failure leaves it
 untouched. Only `/usr/bin/ditto` is executed, by absolute path.
@@ -418,12 +445,18 @@ quarantine after three run days.
   files. Fact (`uv help sync`, uv 0.12.17): uv's default link mode on macOS is `clone`. Fact
   (checked with `cp -c` on APFS): a clone of a compressed file is compressed too, and writing to
   the clone leaves the original intact.
-- **New inode.** The compressed file is a new inode: birthtime changes, a process that holds the
+- **New inode.** The compressed file is a new inode: with ditto the birthtime changes (measured:
+  the copy gets about the original's mtime; the applesauce backend keeps it), a process that holds the
   old file open keeps reading the old data until it reopens it; hardlinked files are skipped.
   Extended attributes, ACLs, mode, owner, group, atime and mtime are preserved.
 - Files modified within `min_age_secs` (default 5 min) are skipped to avoid racing writers.
 - Recompiling a package or `pip install` rewrites files uncompressed; the next run picks them
   up again (until the quarantine stops it, see above).
+- **applesauce backend.** Opt-in. The compressed data is written by third-party code
+  (`applesauce-core` 0.4.14 with the bundled C `lzfse` 2.0.0), not by Apple's compressor; the
+  byte compare through the kernel before every swap is the safety net. Its output differs from
+  ditto's (LZFSE instead of LZVN), and files ditto leaves plain (16 KiB and less) may be
+  compressed when `min_size` allows them.
 - **Verify cost.** With `verify = true` every file is read twice (original and copy), so a 1.5 GiB
   dump costs 3 GiB of reads.
 - **Side effects of the swap** (new inode): Time Machine backs the swapped files up once more and

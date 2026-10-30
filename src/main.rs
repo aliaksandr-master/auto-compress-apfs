@@ -1,6 +1,7 @@
 //! auto-compress-apfs: turns on APFS transparent compression for files matched by glob
-//! patterns, using Apple's `/usr/bin/ditto --hfsCompression`.
+//! patterns, using Apple's `/usr/bin/ditto --hfsCompression` or an in-process LZFSE writer.
 
+mod applesauce;
 mod cache;
 mod classify;
 mod clean;
@@ -16,8 +17,8 @@ mod state;
 mod sys;
 mod walk;
 
-use classify::{Class, DITTO_MAX_SIZE, Rules};
-use compress::{Compressor, DittoArgs, Outcome, ProbeError};
+use classify::{Class, MAX_SIZE, Rules};
+use compress::{Backend, Compressor, Outcome, ProbeError};
 use config::Config;
 use logger::{Level, Logger};
 use progress::{FileEvent, Progress, abbreviate_home, human};
@@ -58,9 +59,9 @@ Usage:
   auto-compress-apfs check-launchd [--config PATH]
   auto-compress-apfs -h|--help | -V|--version
 
-Turns on APFS transparent compression (ditto --hfsCompression) for files matched by the
-glob patterns in the config. Without --apply nothing is changed: the files that would be
-compressed are listed.
+Turns on APFS transparent compression (ditto --hfsCompression, or the opt-in in-process
+applesauce backend) for files matched by the glob patterns in the config. Without --apply
+nothing is changed: the files that would be compressed are listed.
 
 compress options:
   --apply                    compress (default: preview only, nothing is changed)
@@ -72,6 +73,7 @@ compress options:
   --exclude GLOB...          excludes added for this run (without /: a name at any depth)
   --ignore-global-search     ignore the config's patterns and exclude; only --search and
                              --exclude apply (hard protections always apply)
+  --backend NAME             ditto or applesauce, for this run (default: the config's backend)
   --progress, --no-progress  force or suppress terminal progress (default: stderr is a terminal)
   -v, --verbose              DEBUG level, log lines mirrored to stderr
 
@@ -106,6 +108,8 @@ struct CompressArgs {
     search: Vec<String>,
     exclude: Vec<String>,
     ignore_global: bool,
+    /// `None`: the config's `backend`.
+    backend: Option<config::Backend>,
     /// `None`: on when stderr is a terminal.
     progress: Option<bool>,
     /// The options as given (without `--apply`/`--dry-run`), for the preview hint.
@@ -239,6 +243,14 @@ fn parse_compress(it: impl Iterator<Item = String>) -> Result<Cli, String> {
             "--progress" => a.progress = Some(true),
             "--no-progress" => a.progress = Some(false),
             "--ignore-global-search" => a.ignore_global = true,
+            "--backend" => {
+                let b = it.next().ok_or("--backend needs ditto or applesauce")?;
+                a.raw.push(b.clone());
+                a.backend = Some(
+                    config::Backend::parse(&b)
+                        .ok_or_else(|| format!("--backend: `{b}` is not ditto or applesauce"))?,
+                );
+            }
             "--dir" => {
                 let d = it.next().ok_or("--dir needs a DIR")?;
                 a.raw.push(d.clone());
@@ -1179,12 +1191,18 @@ fn run(
     } else {
         None
     };
-    // Before the walk: a ditto that does not compress would only cache every file as
-    // incompressible. A preview never runs ditto.
-    let ditto_args = if apply {
-        probe_ditto(config_path, home, log)?
+    // Before the walk: a compressor that does not compress would only cache every file as
+    // incompressible. A preview never runs ditto or writes a copy.
+    let configured = args.backend.unwrap_or(cfg.backend);
+    let backend = if apply {
+        probe_backend(config_path, home, log, configured)?
     } else {
-        &[]
+        Backend::Ditto(&[])
+    };
+    // What filled the incompressible cache: ditto's options or the applesauce versions.
+    let cache_args: &[&str] = match backend {
+        Backend::Ditto(args) => args,
+        Backend::Applesauce => &applesauce::CACHE_ARGS,
     };
 
     let cache_path = home
@@ -1195,11 +1213,12 @@ fn run(
         log.warn(format_args!("cannot read {}: {e}", cache_path.display()));
         HashSet::new()
     });
-    // Entries cached by ditto with other options may be compressible files: re-check them.
+    // Entries cached by another compressor (or ditto with other options) may be compressible
+    // files: re-check them.
     let args_path = cache_path.with_file_name(cache::ARGS_NAME);
-    if apply && !known.is_empty() && cache::filled_with_other_args(&args_path, ditto_args) {
+    if apply && !known.is_empty() && cache::filled_with_other_args(&args_path, cache_args) {
         log.info(format_args!(
-            "incompressible cache was filled with other ditto options, dropped {} entries",
+            "incompressible cache was filled by another backend or other ditto options, dropped {} entries",
             known.len()
         ));
         known.clear();
@@ -1357,9 +1376,9 @@ fn run(
             Class::TooLarge => {
                 sum.too_large += 1;
                 log.debug(format_args!(
-                    "{}: larger than {} MiB (ditto does not compress it), skipped",
+                    "{}: larger than {} MiB (above the compression size limit), skipped",
                     c.path.display(),
-                    DITTO_MAX_SIZE >> 20
+                    MAX_SIZE >> 20
                 ));
             }
             Class::TooNew => {
@@ -1423,7 +1442,7 @@ fn run(
             cfg.verify,
             cfg.batch_size,
             threads,
-            ditto_args,
+            backend,
             cfg.min_free_bytes,
         )
         .run(todo);
@@ -1431,7 +1450,7 @@ fn run(
         // The record follows the cache: a stale record only costs a re-check.
         match cache::store(&cache_path, keys) {
             Ok(()) => {
-                if let Err(e) = cache::store_args(&args_path, ditto_args) {
+                if let Err(e) = cache::store_args(&args_path, cache_args) {
                     log.warn(format_args!("cannot write {}: {e}", args_path.display()));
                 }
             }
@@ -1524,28 +1543,47 @@ fn run(
     Ok(())
 }
 
-/// The ditto options that compress here, probed next to the config, or in the state dir when
-/// the probe files cannot be written there (or it is not on APFS). `Err` when ditto compresses
-/// with none of them.
-fn probe_ditto(config_path: &Path, home: &Path, log: &Logger) -> Result<DittoArgs, String> {
+/// The backend ready to compress here: for ditto the options that compress, for applesauce a
+/// passed self-probe. Probed next to the config, or in the state dir when the probe files
+/// cannot be written there (or it is not on APFS). `Err` when the backend does not compress.
+fn probe_backend(
+    config_path: &Path,
+    home: &Path,
+    log: &Logger,
+    backend: config::Backend,
+) -> Result<Backend, String> {
+    type Probe = fn(&Path) -> Result<Backend, ProbeError>;
+    let (name, probe): (&str, Probe) = match backend {
+        config::Backend::Ditto => ("ditto", |d| compress::probe(d).map(Backend::Ditto)),
+        config::Backend::Applesauce => ("applesauce", |d| {
+            compress::probe_applesauce(d).map(|()| Backend::Applesauce)
+        }),
+    };
     let config_dir = config_path.parent().unwrap_or(Path::new("."));
-    let mut r = compress::probe(config_dir);
+    let mut r = probe(config_dir);
     let mut dir = config_dir.to_path_buf();
     if let Err(ProbeError::Setup(e)) = &r {
-        log.warn(format_args!("ditto probe: {e}; probing in the state dir"));
+        log.warn(format_args!("{name} probe: {e}; probing in the state dir"));
         dir = state_dir(home);
         r = fs::create_dir_all(&dir)
             .map_err(|e| ProbeError::Setup(format!("cannot create {}: {e}", dir.display())))
-            .and_then(|()| compress::probe(&dir));
+            .and_then(|()| probe(&dir));
     }
     match r {
-        Ok(args) => {
+        Ok(Backend::Ditto(args)) => {
             log.info(format_args!("ditto compresses with: {}", args.join(" ")));
-            Ok(args)
+            Ok(Backend::Ditto(args))
         }
-        Err(ProbeError::Setup(e)) => Err(format!("cannot probe ditto, nothing was changed: {e}")),
+        Ok(Backend::Applesauce) => {
+            log.info(format_args!(
+                "applesauce compresses (LZFSE, {})",
+                applesauce::CACHE_ARGS[2..].join(" ")
+            ));
+            Ok(Backend::Applesauce)
+        }
+        Err(ProbeError::Setup(e)) => Err(format!("cannot probe {name}, nothing was changed: {e}")),
         Err(ProbeError::NoCompression(e)) => Err(format!(
-            "ditto does not compress on this system, nothing was changed (probe in {}: {e})",
+            "{name} does not compress on this system, nothing was changed (probe in {}: {e})",
             dir.display()
         )),
     }
@@ -1831,6 +1869,16 @@ mod tests {
         assert!(parse(&["--exclude"]).is_err());
         let a = compress(&["--apply", "--search", "a b", "--config", "/c.toml"]);
         assert_eq!(a.raw, ["--search", "a b", "--config", "/c.toml"]);
+        assert_eq!(a.backend, None);
+        let a = compress(&["--backend", "applesauce"]);
+        assert_eq!(a.backend, Some(config::Backend::Applesauce));
+        assert_eq!(a.raw, ["--backend", "applesauce"]);
+        assert_eq!(
+            compress(&["--backend", "ditto"]).backend,
+            Some(config::Backend::Ditto)
+        );
+        assert!(parse(&["--backend", "lzfse"]).is_err());
+        assert!(parse(&["--backend"]).is_err());
     }
 
     #[test]

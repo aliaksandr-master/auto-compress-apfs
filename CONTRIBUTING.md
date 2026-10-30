@@ -20,10 +20,10 @@ make lint test        # cargo fmt --check, cargo clippy --all-targets -- -D warn
 ## Rules
 
 - Rust edition 2024, stable toolchain, macOS only.
-- Dependencies are limited to `serde`, `toml` and `globset`. Propose anything new in an issue
-  first.
+- Dependencies are limited to `serde`, `toml`, `globset`, `applesauce-core` and `lzfse-sys`
+  (both pinned to exact versions) and `libc`. Propose anything new in an issue first.
 - `unsafe` only for libSystem calls std lacks, each wrapper in `src/sys.rs` with a `SAFETY`
-  comment.
+  comment (declarations from `libc`).
 - The original file may only be replaced by the verified `RENAME_SWAP` of a compressed copy, and
   only `/usr/bin/ditto` is executed, by absolute path.
 - A bug fix comes with a test that fails without it; a feature comes with its tests.

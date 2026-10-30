@@ -41,7 +41,7 @@ allow_volumes = []
 # hand. 0 disables the quarantine.
 quarantine_after = 3
 
-# Free space (bytes) that must remain after a ditto call; batches that would go below are
+# Free space (bytes) that must remain after a batch's copies; batches that would go below are
 # skipped. Default 10 GiB.
 min_free_bytes = 10737418240
 
@@ -56,6 +56,12 @@ batch_size = 1000
 
 # Byte-compare the compressed copy with the original before replacing it.
 verify = true
+
+# How the compressed copy is made: "ditto" runs /usr/bin/ditto --hfsCompression (the system's
+# compressor); "applesauce" compresses in-process with LZFSE (the applesauce-core decmpfs
+# writer) and always byte-compares the copy, whatever `verify` says. Files over 512 MiB are
+# skipped by both. `--backend` overrides this for one run.
+backend = "ditto"
 
 # Files smaller than this (bytes) are ignored. ditto --hfsCompression leaves files of 16384 bytes
 # or less uncompressed (measured on macOS), so smaller files would only cost a copy.

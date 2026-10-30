@@ -27,12 +27,14 @@ pub struct Config {
     /// Consecutive run days a compressed file may be found decompressed again before it is
     /// quarantined; 0 disables the quarantine.
     pub quarantine_after: u32,
-    /// Free space that must remain on the volume after a ditto call's copies.
+    /// Free space that must remain on the volume after a batch's copies.
     pub min_free_bytes: u64,
     pub one_file_system: bool,
     pub threads: usize,
     pub batch_size: usize,
     pub verify: bool,
+    /// How compressed copies are made.
+    pub backend: Backend,
     pub min_size: u64,
     pub min_age_secs: u64,
     pub log_dir: String,
@@ -42,6 +44,29 @@ pub struct Config {
     pub trash: Rule,
     /// `purge`: matched files and directories are deleted for good.
     pub purge: Rule,
+}
+
+/// The compressor that writes the staged copies.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Backend {
+    /// `/usr/bin/ditto --hfsCompression` (the system's own compressor).
+    #[default]
+    Ditto,
+    /// In-process LZFSE through the `applesauce-core` decmpfs writer; every copy is
+    /// byte-compared before the swap.
+    Applesauce,
+}
+
+impl Backend {
+    /// Parses the config/CLI spelling (`ditto`, `applesauce`).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "ditto" => Some(Self::Ditto),
+            "applesauce" => Some(Self::Applesauce),
+            _ => None,
+        }
+    }
 }
 
 /// Patterns and excludes of `trash` or `purge` (same syntax as the compress ones). A matched
@@ -76,6 +101,7 @@ impl Default for Config {
             threads: 0,
             batch_size: 1000,
             verify: true,
+            backend: Backend::Ditto,
             min_size: 16385,
             min_age_secs: 300,
             log_dir: "~/Library/Logs/auto-compress-apfs".into(),
@@ -257,6 +283,20 @@ mod tests {
         // A user value is honoured as written, not clamped to the default.
         assert_eq!(Config::parse("min_size = 1", &home()).unwrap().min_size, 1);
         assert!(parsed.verify && parsed.one_file_system);
+        assert_eq!(parsed.backend, Backend::Ditto);
+    }
+
+    #[test]
+    fn backend_values() {
+        let cfg = Config::parse("backend = \"applesauce\"", &home()).unwrap();
+        assert_eq!(cfg.backend, Backend::Applesauce);
+        let cfg = Config::parse("backend = \"ditto\"", &home()).unwrap();
+        assert_eq!(cfg.backend, Backend::Ditto);
+        assert!(Config::parse("backend = \"Applesauce\"", &home()).is_err());
+        assert!(Config::parse("backend = \"zlib\"", &home()).is_err());
+        assert_eq!(Backend::parse("applesauce"), Some(Backend::Applesauce));
+        assert_eq!(Backend::parse("ditto"), Some(Backend::Ditto));
+        assert_eq!(Backend::parse("lzfse"), None);
     }
 
     #[test]

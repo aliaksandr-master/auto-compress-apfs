@@ -7,9 +7,10 @@ use std::collections::HashSet;
 const S_ISUID: u32 = 0o4000;
 const S_ISGID: u32 = 0o2000;
 
-/// Measured on current macOS: `ditto --hfsCompression` leaves files larger than this
-/// uncompressed, and ditto has no option to change it.
-pub const DITTO_MAX_SIZE: u64 = 512 << 20;
+/// Largest file either backend compresses. Measured on current macOS: `ditto --hfsCompression`
+/// leaves files larger than this uncompressed, and ditto has no option to change it; the
+/// applesauce backend keeps the same bound (raising it is a separate decision).
+pub const MAX_SIZE: u64 = 512 << 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Class {
@@ -19,7 +20,7 @@ pub enum Class {
     /// Cloud placeholder (`SF_DATALESS`); reading it would download it.
     Dataless,
     TooSmall,
-    /// Larger than `DITTO_MAX_SIZE`: ditto would only stage a full uncompressed copy.
+    /// Larger than `MAX_SIZE`: ditto would only stage a full uncompressed copy.
     TooLarge,
     /// Logged at INFO with the reason; `kind` names the reason in progress lines.
     Skip {
@@ -58,7 +59,7 @@ impl Rules<'_> {
             Class::Dataless
         } else if too_small(c.flags, c.size(), self.min_size) {
             Class::TooSmall
-        } else if c.size() > DITTO_MAX_SIZE {
+        } else if c.size() > MAX_SIZE {
             Class::TooLarge
         } else if c.nlink > 1 {
             skip("hardlink", "hardlinked, skipped")
@@ -150,10 +151,10 @@ mod tests {
             // The ditto size limit: inclusive bound, checked before the cache; flags and
             // dataless still win over it.
             let mut c = cand();
-            c.key.size = DITTO_MAX_SIZE;
+            c.key.size = MAX_SIZE;
             out.push(r.classify(&c));
             let mut c = cand();
-            c.key.size = DITTO_MAX_SIZE + 1;
+            c.key.size = MAX_SIZE + 1;
             out.push(r.classify(&c));
             c.flags = UF_IMMUTABLE;
             out.push(r.classify(&c));
@@ -184,7 +185,7 @@ mod tests {
         assert_eq!(got[13], Class::Dataless);
         cache.insert(cand().key);
         let mut big = cand().key;
-        big.size = DITTO_MAX_SIZE + 1;
+        big.size = MAX_SIZE + 1;
         cache.insert(big);
         let got = rules(&cache);
         assert_eq!(got[0], Class::Incompressible);
@@ -209,7 +210,7 @@ mod tests {
             SF_DATALESS,
             UF_COMPRESSED | SF_DATALESS,
         ];
-        let sizes = [0, min - 1, min, min + 1, DITTO_MAX_SIZE + 1];
+        let sizes = [0, min - 1, min, min + 1, MAX_SIZE + 1];
         for f in flags {
             for size in sizes {
                 for nlink in [1, 2] {
