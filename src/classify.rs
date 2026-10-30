@@ -41,6 +41,12 @@ pub struct Rules<'a> {
     pub incompressible: &'a HashSet<FileKey>,
 }
 
+/// The `TooSmall` test of `Rules::classify`, with the flag checks that come before it: the
+/// walk uses it to count such files without keeping them.
+pub fn too_small(flags: u32, size: u64, min_size: u64) -> bool {
+    flags & (UF_COMPRESSED | PROTECTED_FLAGS | SF_DATALESS) == 0 && size < min_size
+}
+
 impl Rules<'_> {
     pub fn classify(&self, c: &Candidate) -> Class {
         let skip = |kind, reason| Class::Skip { kind, reason };
@@ -50,7 +56,7 @@ impl Rules<'_> {
             Class::Flagged(c.flags & PROTECTED_FLAGS)
         } else if c.flags & SF_DATALESS != 0 {
             Class::Dataless
-        } else if c.size() < self.min_size {
+        } else if too_small(c.flags, c.size(), self.min_size) {
             Class::TooSmall
         } else if c.size() > DITTO_MAX_SIZE {
             Class::TooLarge
@@ -183,5 +189,47 @@ mod tests {
         let got = rules(&cache);
         assert_eq!(got[0], Class::Incompressible);
         assert_eq!(got[11], Class::TooLarge);
+    }
+
+    #[test]
+    fn too_small_matches_classify() {
+        let cache = HashSet::new();
+        let min = 100;
+        let r = Rules {
+            euid: 501,
+            min_size: min,
+            mtime_cutoff: 2000,
+            incompressible: &cache,
+        };
+        let flags = [
+            0,
+            UF_COMPRESSED,
+            UF_IMMUTABLE,
+            SF_RESTRICTED,
+            SF_DATALESS,
+            UF_COMPRESSED | SF_DATALESS,
+        ];
+        let sizes = [0, min - 1, min, min + 1, DITTO_MAX_SIZE + 1];
+        for f in flags {
+            for size in sizes {
+                for nlink in [1, 2] {
+                    for uid in [501, 0] {
+                        for mtime in [1000, 3000] {
+                            let mut c = cand();
+                            c.flags = f;
+                            c.key.size = size;
+                            c.nlink = nlink;
+                            c.uid = uid;
+                            c.key.mtime_sec = mtime;
+                            assert_eq!(
+                                too_small(c.flags, c.size(), min),
+                                r.classify(&c) == Class::TooSmall,
+                                "{c:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }
