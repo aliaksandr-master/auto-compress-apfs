@@ -56,3 +56,23 @@ Compressing only the venv un-shares its blocks from the cache.
 hypothesis: some unpacked wheels); the swap needs write access to the parent dir and the tool never
 chmods.
 **Action**: expected; drop such patterns from the config if the lines are unwanted.
+
+## ditto on macOS 27 clones instead of compressing
+
+**Symptom**: `ditto --hfsCompression` copies a file but the copy is not compressed.
+**Cause**: since macOS 27 ditto clones files by default (`cloneFiles`), and a clone keeps the
+source's (uncompressed) storage.
+**Action**: `compress --apply` first runs a probe (`ditto-probe.txt` next to the config, compressed
+into `ditto-probe.out/`, recreated every run) with the args it will use; when the probe copy is not
+compressed, the run stops with a warning instead of swapping uncompressed copies. The args that
+passed are cached in `ditto-args.txt`.
+
+## Endpoint security may flag `install-launchd`
+
+**Symptom**: right after `install-launchd`, an endpoint security agent (seen with SentinelOne)
+kills the process tree that ran it or quarantines the binary.
+**Cause**: behavioural rule "unsigned process adds a property list to `~/Library/LaunchAgents`"
+(persistence). The release binary is ad-hoc signed.
+**Action**: run `install-launchd` from a terminal, not from a build tool or agent; or add an
+exclusion for the folder holding the binary. Tests never write a plist below a
+`Library/LaunchAgents` path (`ACZ_LAUNCH_AGENTS_DIR`).
