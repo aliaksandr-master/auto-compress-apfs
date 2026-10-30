@@ -8,6 +8,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- License: GPL-3.0-or-later (was Apache-2.0), since the new applesauce backend links the
+  GPL-3.0 `applesauce-core` crate.
+
 - `auto-compress-apfs` without arguments prints the help instead of a compress preview; use
   `compress` for the preview. Options without a command still mean `compress`.
 - The launchd agent's `run.sh` runs `run --apply` instead of `compress --apply`;
