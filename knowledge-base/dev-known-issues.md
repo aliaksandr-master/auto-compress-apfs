@@ -76,3 +76,11 @@ kills the process tree that ran it or quarantines the binary.
 **Action**: run `install-launchd` from a terminal, not from a build tool or agent; or add an
 exclusion for the folder holding the binary. Tests never write a plist below a
 `Library/LaunchAgents` path (`ACZ_LAUNCH_AGENTS_DIR`).
+
+## Pipeline tests can run a stale debug binary
+
+**Symptom**: after `cargo package` / `cargo publish --dry-run`, `tests/pipeline.rs` keeps failing
+on behaviour the source no longer has; the binary under `target/debug` predates the last edit.
+**Cause**: hypothesis: the packaging build leaves a fingerprint that makes cargo treat the old
+binary as fresh. The stale binary itself was observed (2026-10-20).
+**Action**: `cargo clean -p auto-compress-apfs`, then `make test` again.
