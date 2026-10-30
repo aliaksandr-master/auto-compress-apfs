@@ -1251,13 +1251,18 @@ fn run(
         let color = std::env::var_os("NO_COLOR").is_none();
         log.enable_progress(Progress::new(width, color, Some(home)));
     }
-    let walked = walk::walk(
+    // Too-small files are only counted; `seen` is read only when this run prunes.
+    let walked = walk::walk_reduced(
         &matcher,
         &guard,
         cfg.one_file_system,
         threads,
         log,
         track_dirs.as_ref(),
+        &walk::Reduce {
+            min_size: cfg.min_size,
+            tracked: &|p: &Path| prune && st.rows.contains_key(p),
+        },
     );
     drop(track_dirs);
     if !apply {
@@ -1276,7 +1281,8 @@ fn run(
         incompressible: &known,
     };
     let mut sum = Summary {
-        found: walked.candidates.len() as u64,
+        found: walked.candidates.len() as u64 + walked.too_small,
+        too_small: walked.too_small,
         dataless: walked.dataless,
         flagged: walked.flagged_dirs.len() as u64,
         ..Summary::default()
@@ -1308,6 +1314,11 @@ fn run(
     let mut todo = Vec::new();
     // Before `candidates` moves out below.
     let preview_roots = (walked.inaccessible_roots(), walked.refused_walk_roots);
+    for p in &walked.too_small_tracked {
+        if let Some(r) = st.rows.get_mut(p) {
+            r.seen = true;
+        }
+    }
     for c in walked.candidates {
         let listed = quarantined.contains(&c.path);
         if let Some(r) = st.rows.get_mut(&c.path) {

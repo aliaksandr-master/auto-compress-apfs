@@ -5,6 +5,7 @@
 //! (TCC) folders are never entered unless a root lies inside them. Excludes win over patterns
 //! for files and directories in both walk modes.
 
+use crate::classify;
 use crate::logger::{Level, Logger};
 use crate::progress::FileEvent;
 use crate::sys::{self, FsInfo, MNT_LOCAL, PROTECTED_FLAGS, SF_DATALESS};
@@ -564,8 +565,17 @@ impl Queue {
 
 #[derive(Default)]
 pub struct WalkResult {
-    /// Deduplicated by (dev, ino), sorted by path.
+    /// Deduplicated by (dev, ino), sorted by path. From [`walk_reduced`]: without the too-small
+    /// files below a walk root (a too-small literal file root is still in it).
     pub candidates: Vec<Candidate>,
+    /// [`walk_reduced`] only: distinct too-small inodes not found as a kept candidate.
+    pub too_small: u64,
+    /// [`walk_reduced`] only: paths of counted too-small files that `Reduce::tracked` accepted.
+    pub too_small_tracked: Vec<PathBuf>,
+    /// Per worker: (dev, ino) of too-small files, before the merge.
+    small: Vec<(u64, u64)>,
+    /// Per worker: too-small files that `Reduce::tracked` accepted, before the merge.
+    small_tracked: Vec<(u64, u64, PathBuf)>,
     /// Leftover staging dirs of crashed runs.
     pub stale_staging: Vec<PathBuf>,
     /// Rescue dirs (exact name regex); never entered, only listed for `clean`.
@@ -618,6 +628,13 @@ impl Matched {
     }
 }
 
+/// Makes [`walk_reduced`] count too-small files instead of keeping them as candidates.
+pub struct Reduce<'a> {
+    pub min_size: u64,
+    /// The caller needs this path back (to mark its state row `seen`).
+    pub tracked: &'a (dyn Fn(&Path) -> bool + Sync),
+}
+
 struct Walker<'a> {
     matcher: &'a Matcher,
     guard: &'a Guard,
@@ -629,6 +646,8 @@ struct Walker<'a> {
     fault: Option<&'a Path>,
     /// Collect matched entries (files and dirs, never entered) instead of compress candidates.
     entries: bool,
+    /// Count too-small files (see [`Reduce`]) instead of collecting them.
+    reduce: Option<&'a Reduce<'a>>,
 }
 
 impl Walker<'_> {
@@ -651,7 +670,7 @@ impl Walker<'_> {
                 return;
             }
         };
-        let found_before = out.candidates.len();
+        let mut found = 0u64;
         let mut complete = true;
         for entry in entries {
             let entry = match entry {
@@ -734,15 +753,30 @@ impl Walker<'_> {
                 }
             }
             if ft.is_file() {
+                if inside.is_none() && !matched {
+                    continue;
+                }
+                let Some(m) = self.lstat(&path, &entry) else {
+                    complete = false;
+                    continue;
+                };
+                found += 1;
+                if let Some(r) = self
+                    .reduce
+                    .filter(|r| classify::too_small(m.st_flags(), m.size(), r.min_size))
+                {
+                    if (r.tracked)(&path) {
+                        out.small_tracked.push((m.dev(), m.ino(), path));
+                    } else {
+                        out.small.push((m.dev(), m.ino()));
+                    }
+                    continue;
+                }
                 let root = match inside {
                     Some(root) => root.clone(),
-                    None if matched => Arc::from(job.dir.as_path()),
-                    None => continue,
+                    None => Arc::from(job.dir.as_path()),
                 };
-                match self.lstat(&path, &entry) {
-                    Some(m) => out.candidates.push(Candidate::new(path, root, &m)),
-                    None => complete = false,
-                }
+                out.candidates.push(Candidate::new(path, root, &m));
                 continue;
             }
             let mode = match inside {
@@ -757,9 +791,8 @@ impl Walker<'_> {
         if complete && self.track_dirs.is_some_and(|t| t.contains(&job.dir)) {
             out.read_dirs.insert(job.dir.clone());
         }
-        let found = out.candidates.len() - found_before;
         if found > 0 {
-            self.log.scan_found(found as u64);
+            self.log.scan_found(found);
         }
     }
 
@@ -1024,6 +1057,32 @@ pub fn walk(
         track_dirs,
         None,
         false,
+        None,
+    )
+}
+
+/// Like [`walk`], but a file below a walk root that `classify::too_small` accepts is only
+/// counted in `too_small` (its path kept in `too_small_tracked` when `reduce.tracked` accepts
+/// it) and is not a candidate.
+pub fn walk_reduced(
+    matcher: &Matcher,
+    guard: &Guard,
+    one_file_system: bool,
+    threads: usize,
+    log: &Logger,
+    track_dirs: Option<&HashSet<PathBuf>>,
+    reduce: &Reduce,
+) -> WalkResult {
+    walk_with_fault(
+        matcher,
+        guard,
+        one_file_system,
+        threads,
+        log,
+        track_dirs,
+        None,
+        false,
+        Some(reduce),
     )
 }
 
@@ -1045,6 +1104,7 @@ pub fn walk_entries(
         None,
         None,
         true,
+        None,
     )
 }
 
@@ -1058,6 +1118,7 @@ fn walk_with_fault(
     track_dirs: Option<&HashSet<PathBuf>>,
     fault: Option<&Path>,
     entries: bool,
+    reduce: Option<&Reduce>,
 ) -> WalkResult {
     let walker = Walker {
         matcher,
@@ -1067,6 +1128,7 @@ fn walk_with_fault(
         track_dirs,
         fault,
         entries,
+        reduce,
     };
     let mut result = WalkResult::default();
     let jobs: Vec<Job> = matcher
@@ -1099,8 +1161,14 @@ fn walk_with_fault(
     });
 
     let mut seen = HashSet::new();
+    result
+        .candidates
+        .reserve_exact(parts.iter().map(|p| p.candidates.len()).sum());
+    let mut small = Vec::with_capacity(parts.iter().map(|p| p.small.len()).sum());
     for part in parts {
         result.candidates.extend(part.candidates);
+        small.extend(part.small);
+        result.small_tracked.extend(part.small_tracked);
         result.stale_staging.extend(part.stale_staging);
         result.rescue_dirs.extend(part.rescue_dirs);
         result.read_dirs.extend(part.read_dirs);
@@ -1120,6 +1188,17 @@ fn walk_with_fault(
     result
         .candidates
         .retain(|c| seen.insert((c.key.dev, c.key.ino)));
+    // Too-small duplicates: a kept candidate wins, then one with a state row, then the rest.
+    for (dev, ino, path) in std::mem::take(&mut result.small_tracked) {
+        if seen.insert((dev, ino)) {
+            result.too_small += 1;
+            result.too_small_tracked.push(path);
+        }
+    }
+    small.sort_unstable();
+    small.dedup();
+    result.too_small += small.iter().filter(|id| !seen.contains(*id)).count() as u64;
+    drop(small);
     result
         .candidates
         .sort_unstable_by(|a, b| a.path.cmp(&b.path));
@@ -1422,6 +1501,78 @@ mod tests {
     }
 
     #[test]
+    fn reduced_walk_matches_full_walk() {
+        let t = Tree::new("reduced");
+        let big = |rel: &str| {
+            let p = t.file(rel);
+            fs::write(&p, [b'x'; 64]).unwrap();
+            p
+        };
+        t.file("a/s1.txt");
+        t.file("a/b/s2.txt");
+        let tracked = t.file("a/b/tracked.txt");
+        big("a/g1.bin");
+        big("a/b/g2.bin");
+        fs::hard_link(t.file("a/c/small.txt"), t.dir.join("a/b/small_link.txt")).unwrap();
+        fs::hard_link(big("a/c/big.bin"), t.dir.join("a/b/big_link.bin")).unwrap();
+        let m = Matcher::new(&[t.pat("a/**"), t.pat("a/b/**")], &[], None).unwrap();
+        let guard = accept_all(&t.dir.join("home"));
+        let track = all_dirs(&t.dir);
+        let min_size = 16;
+        let link = t.dir.join("a/b/small_link.txt");
+        let is_tracked = |p: &Path| p == tracked || p == link;
+        let reduce = Reduce {
+            min_size,
+            tracked: &is_tracked,
+        };
+        let small = |c: &Candidate| classify::too_small(c.flags, c.size(), min_size);
+        let ids = |cs: &mut dyn Iterator<Item = &Candidate>| -> HashSet<(u64, u64)> {
+            cs.map(|c| (c.key.dev, c.key.ino)).collect()
+        };
+        let full = walk(&m, &guard, true, 3, &t.log, Some(&track));
+        // The tracked path of the small hardlink pair always wins over the untracked one.
+        for _ in 0..5 {
+            let mut got =
+                walk_reduced(&m, &guard, true, 3, &t.log, Some(&track), &reduce).too_small_tracked;
+            got.sort();
+            assert_eq!(got, vec![link.clone(), tracked.clone()]);
+        }
+        let red = walk_reduced(&m, &guard, true, 3, &t.log, Some(&track), &reduce);
+        let kept: Vec<&Candidate> = full.candidates.iter().filter(|c| !small(c)).collect();
+        assert_eq!(red.candidates.len(), kept.len());
+        assert_eq!(ids(&mut red.candidates.iter()), ids(&mut kept.into_iter()));
+        let full_small = full.candidates.iter().filter(|c| small(c)).count() as u64;
+        assert_eq!(red.too_small, full_small);
+        assert_eq!(full_small, 4);
+        assert_eq!(
+            red.candidates.len() as u64 + red.too_small,
+            full.candidates.len() as u64
+        );
+        assert_eq!(red.too_small_tracked.len(), 2);
+        assert_eq!(full.too_small, 0);
+        assert!(full.too_small_tracked.is_empty());
+        assert_eq!(red.excluded, full.excluded);
+        assert_eq!(red.read_dirs, full.read_dirs);
+        assert_eq!(red.stale_staging, full.stale_staging);
+        assert_eq!(red.rescue_dirs, full.rescue_dirs);
+        assert_eq!(red.flagged_dirs, full.flagged_dirs);
+        // One worker visits in a fixed order: the surviving paths are equal too.
+        let full = walk(&m, &guard, true, 1, &t.log, Some(&track));
+        let red = walk_reduced(&m, &guard, true, 1, &t.log, Some(&track), &reduce);
+        assert_eq!(
+            t.found(&red),
+            full.candidates
+                .iter()
+                .filter(|c| !small(c))
+                .map(|c| c.path.strip_prefix(&t.dir).unwrap().display().to_string())
+                .collect::<Vec<_>>()
+        );
+        let mut got = red.too_small_tracked;
+        got.sort();
+        assert_eq!(got, vec![link, tracked]);
+    }
+
+    #[test]
     fn only_tracked_and_completely_read_dirs_are_reported() {
         let t = Tree::new("partial");
         t.file("v/.venv/a/f.py");
@@ -1441,6 +1592,7 @@ mod tests {
             Some(&track),
             Some(&fault),
             false,
+            None,
         );
         // `a` failed midway, `c` is untracked, `.venv` itself untracked.
         assert_eq!(r.read_dirs, HashSet::from([venv.join("b")]));
@@ -1741,6 +1893,7 @@ mod tests {
             track_dirs: None,
             fault: None,
             entries: true,
+            reduce: None,
         };
         // A device id no entry has: the matched `a/x` reads as a mount point below the root.
         let job = Job {

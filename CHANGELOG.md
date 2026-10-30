@@ -12,6 +12,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `compress` for the preview. Options without a command still mean `compress`.
 - The launchd agent's `run.sh` runs `run --apply` instead of `compress --apply`;
   `check-launchd` reports `REINSTALL` for an agent installed by an earlier version.
+- Lower peak memory of compress runs: files below `min_size` are counted, not kept. The state
+  row of a too-small file whose inode is found under two paths (hardlinks) is now always kept
+  instead of being dropped at random.
 
 ### Added
 
