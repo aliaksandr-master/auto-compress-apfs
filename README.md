@@ -28,7 +28,8 @@ The binary lands in `~/.cargo/bin/auto-compress-apfs`. From a source checkout:
 
 ```sh
 cargo install --locked --path .
-# or: make install  (release build into release/, symlink ~/.local/bin/auto-compress-apfs,
+# or: make release  (release build into release/)
+#     make install  (copy it to release/installed/, symlink ~/.local/bin/auto-compress-apfs,
 #                    copy config/default.toml to ~/.config/auto-compress-apfs/ if missing)
 ```
 
