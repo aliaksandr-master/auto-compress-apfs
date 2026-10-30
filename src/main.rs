@@ -17,7 +17,7 @@ mod state;
 mod sys;
 mod walk;
 
-use classify::{Class, MAX_SIZE, Rules};
+use classify::{Class, Rules};
 use compress::{Backend, Compressor, Outcome, ProbeError};
 use config::Config;
 use logger::{Level, Logger};
@@ -73,7 +73,8 @@ compress options:
   --exclude GLOB...          excludes added for this run (without /: a name at any depth)
   --ignore-global-search     ignore the config's patterns and exclude; only --search and
                              --exclude apply (hard protections always apply)
-  --backend NAME             ditto or applesauce, for this run (default: the config's backend)
+  --backend NAME             ditto or applesauce for every size, this run (default: the
+                             config's backend_by_size)
   --progress, --no-progress  force or suppress terminal progress (default: stderr is a terminal)
   -v, --verbose              DEBUG level, log lines mirrored to stderr
 
@@ -108,7 +109,7 @@ struct CompressArgs {
     search: Vec<String>,
     exclude: Vec<String>,
     ignore_global: bool,
-    /// `None`: the config's `backend`.
+    /// `None`: the config's routing (`backend_by_size`).
     backend: Option<config::Backend>,
     /// `None`: on when stderr is a terminal.
     progress: Option<bool>,
@@ -1193,17 +1194,47 @@ fn run(
     };
     // Before the walk: a compressor that does not compress would only cache every file as
     // incompressible. A preview never runs ditto or writes a copy.
-    let configured = args.backend.unwrap_or(cfg.backend);
-    let backend = if apply {
-        probe_backend(config_path, home, log, configured)?
-    } else {
-        Backend::Ditto(&[])
+    let routing = match args.backend {
+        Some(b) => config::forced_routing(&cfg.routing, b),
+        None => cfg.routing.clone(),
     };
-    // What filled the incompressible cache: ditto's options or the applesauce versions.
-    let cache_args: &[&str] = match backend {
-        Backend::Ditto(args) => args,
-        Backend::Applesauce => &applesauce::CACHE_ARGS,
-    };
+    // Every backend the routing uses, in a stable order (ditto first), probed with --apply.
+    let mut backends: Vec<(config::Backend, Backend)> = Vec::new();
+    for b in [config::Backend::Ditto, config::Backend::Applesauce] {
+        if routing.iter().any(|r| r.backend == b) {
+            let ready = if apply {
+                probe_backend(config_path, home, log, b)?
+            } else {
+                Backend::Ditto(&[])
+            };
+            backends.push((b, ready));
+        }
+    }
+    if cfg.single_backend() && args.backend.is_none() {
+        log.info(format_args!(
+            "config sets the top-level `backend`: only {} is compressed, other sizes are \
+             skipped ([[backend_by_size]] routes sizes to backends)",
+            routing[0]
+        ));
+    }
+    // What filled the incompressible cache: per backend in use (ditto first) its options or
+    // versions, then `@min..max` of each of its ranges, so any routing change drops it once.
+    let mut record: Vec<String> = Vec::new();
+    for (b, ready) in &backends {
+        let args: &[&str] = match ready {
+            Backend::Ditto(args) => args,
+            Backend::Applesauce => &applesauce::CACHE_ARGS,
+        };
+        record.extend(args.iter().map(|a| (*a).to_owned()));
+        for r in routing.iter().filter(|r| r.backend == *b) {
+            record.push(match r.max_size {
+                Some(max) => format!("@{}..{max}", r.min_size),
+                None => format!("@{}..", r.min_size),
+            });
+        }
+    }
+    let cache_args: Vec<&str> = record.iter().map(String::as_str).collect();
+    let cache_args = cache_args.as_slice();
 
     let cache_path = home
         .join("Library/Caches")
@@ -1218,7 +1249,7 @@ fn run(
     let args_path = cache_path.with_file_name(cache::ARGS_NAME);
     if apply && !known.is_empty() && cache::filled_with_other_args(&args_path, cache_args) {
         log.info(format_args!(
-            "incompressible cache was filled by another backend or other ditto options, dropped {} entries",
+            "incompressible cache was filled under another routing or other backend options, dropped {} entries",
             known.len()
         ));
         known.clear();
@@ -1279,7 +1310,7 @@ fn run(
         log,
         track_dirs.as_ref(),
         &walk::Reduce {
-            min_size: cfg.min_size,
+            min_size: config::lowest_min_size(&routing),
             tracked: &|p: &Path| prune && st.rows.contains_key(p),
         },
     );
@@ -1295,7 +1326,7 @@ fn run(
     let prev_day = st.previous_run_day(today);
     let rules = Rules {
         euid: sys::effective_uid(),
-        min_size: cfg.min_size,
+        routing: &routing,
         mtime_cutoff: now.saturating_sub_unsigned(cfg.min_age_secs),
         incompressible: &known,
     };
@@ -1331,6 +1362,8 @@ fn run(
     let mut new_quarantine: Vec<Entry> = Vec::new();
     let mut keep_cached = Vec::new();
     let mut todo = Vec::new();
+    // The backend of each `todo` file, by index.
+    let mut todo_backends = Vec::new();
     // Before `candidates` moves out below.
     let preview_roots = (walked.inaccessible_roots(), walked.refused_walk_roots);
     for p in &walked.too_small_tracked {
@@ -1376,9 +1409,8 @@ fn run(
             Class::TooLarge => {
                 sum.too_large += 1;
                 log.debug(format_args!(
-                    "{}: larger than {} MiB (above the compression size limit), skipped",
-                    c.path.display(),
-                    MAX_SIZE >> 20
+                    "{}: outside every backend size range, skipped",
+                    c.path.display()
                 ));
             }
             Class::TooNew => {
@@ -1398,8 +1430,8 @@ fn run(
                 sum.incompressible += 1;
                 keep_cached.push(c.key);
             }
-            Class::Compress if listed => sum.quarantined += 1,
-            Class::Compress => {
+            Class::Compress(_) if listed => sum.quarantined += 1,
+            Class::Compress(backend) => {
                 // The streak is reset only once the file is listed in quarantine.txt. Narrowed
                 // runs leave streaks alone and only honour one already at the threshold (an
                 // append that failed earlier).
@@ -1430,6 +1462,7 @@ fn run(
                     log.debug(format_args!("would compress {}", c.path.display()));
                 }
                 todo.push(c);
+                todo_backends.push(backend);
             }
         }
     }
@@ -1437,15 +1470,16 @@ fn run(
     let out = if apply {
         compress::remove_stale(&walked.stale_staging, log);
         log.start_compress(todo.len() as u64, todo.iter().map(|c| c.size()).sum());
-        let out = Compressor::new(
-            log,
-            cfg.verify,
-            cfg.batch_size,
-            threads,
-            backend,
-            cfg.min_free_bytes,
-        )
-        .run(todo);
+        let out = Compressor::new(log, cfg.verify, cfg.batch_size, threads, cfg.min_free_bytes)
+            .run_routed(
+                todo.into_iter()
+                    .zip(todo_backends)
+                    .map(|(c, b)| {
+                        let ready = backends.iter().find(|(k, _)| *k == b).map(|(_, r)| *r);
+                        (c, ready.expect("every routed backend was probed"))
+                    })
+                    .collect(),
+            );
         let keys = keep_cached.iter().chain(&out.new_incompressible);
         // The record follows the cache: a stale record only costs a re-check.
         match cache::store(&cache_path, keys) {

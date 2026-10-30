@@ -29,6 +29,8 @@ pub const CACHE_ARGS: [&str; 4] = ["applesauce", "lzfse", "0.4.14", "2.0.0"];
 pub const PART_DIR: &str = ".acz-part";
 /// Allocation unit the saving rule rounds to.
 const ALLOC: u64 = 4096;
+/// Largest resource fork (block table plus blocks): the writer's block offsets are 32-bit.
+const FORK_MAX: u64 = u32::MAX as u64;
 /// Write buffer in front of the resource fork xattr (one `fsetxattr` per flush).
 const RFORK_BUF: usize = 1 << 20;
 /// The xattrs a copy cannot carry over byte for byte, ditto included (checked by the probe
@@ -113,15 +115,16 @@ enum Written {
 /// fsync. atime/mtime are not set here: the commit sets them on every staged copy, after
 /// this, as for a ditto copy, and then restores the birthtime they may have lowered.
 pub fn stage(c: &Candidate, staging: &Path, bufs: &mut Buffers) -> io::Result<Staged> {
-    stage_with(c, staging, bufs, &mut || {})
+    stage_with(c, staging, bufs, FORK_MAX, &mut || {})
 }
 
-/// [`stage`] with `after_block` called after every block read (tests change the original
-/// there).
+/// [`stage`] with the resource fork limit `fork_max` (tests lower it) and `after_block`
+/// called after every block read (tests change the original there).
 fn stage_with(
     c: &Candidate,
     staging: &Path,
     bufs: &mut Buffers,
+    fork_max: u64,
     after_block: &mut dyn FnMut(),
 ) -> io::Result<Staged> {
     let name = c.path.file_name().unwrap_or_default();
@@ -160,7 +163,7 @@ fn stage_with(
         .mode(0o600)
         .custom_flags(O_NOFOLLOW)
         .open(&part)?;
-    let r = write_copy(c, &orig, &m, &dst, bufs, after_block);
+    let r = write_copy(c, &orig, &m, &dst, bufs, fork_max, after_block);
     drop(dst);
     let r = match r {
         Ok(Written::Compressed) => {
@@ -191,13 +194,15 @@ fn compression_xattr(f: &File) -> io::Result<Option<&'static str>> {
     Ok(None)
 }
 
-/// Fills `dst` (empty, just created) from `orig`, whose metadata `m` matched the walk.
+/// Fills `dst` (empty, just created) from `orig`, whose metadata `m` matched the walk. A
+/// resource fork that would outgrow `fork_max` makes the file incompressible.
 fn write_copy(
     c: &Candidate,
     mut orig: &File,
     m: &fs::Metadata,
     dst: &File,
     bufs: &mut Buffers,
+    fork_max: u64,
     after_block: &mut dyn FnMut(),
 ) -> io::Result<Written> {
     let size = c.size();
@@ -209,7 +214,10 @@ fn write_copy(
     let mut writer = Writer::new(Kind::Lzfse, size, || {
         BufWriter::with_capacity(RFORK_BUF, sys::RforkWriter::new(dst))
     })?;
-    // Never stops early: the whole file is read before any verdict.
+    // Stops early only when the fork cannot be written; otherwise the whole file is read
+    // before any verdict.
+    let fork_header = Kind::Lzfse.header_size(num_blocks(size));
+    let mut stored = 0u64;
     let mut read = 0u64;
     let mut block_lens = Vec::with_capacity(num_blocks(size) as usize);
     loop {
@@ -225,6 +233,11 @@ fn write_copy(
         }
         let len = bufs.lzfse.compress(&mut bufs.dst, &bufs.src[..n], 0)?;
         block_lens.push(len as u64);
+        stored += len as u64;
+        // The writer's 32-bit block offsets cannot address this fork.
+        if fork_header + stored > fork_max {
+            return Ok(Written::Incompressible);
+        }
         writer.add_block(&bufs.dst[..len])?;
     }
     if read != size || FileKey::of(&orig.metadata()?) != c.key {
@@ -323,6 +336,30 @@ mod tests {
     }
 
     #[test]
+    fn fork_over_the_limit_is_incompressible() {
+        let dir = temp_dir("forkmax");
+        let src = dir.join("f");
+        let data = mixed(3 * BLOCK_SIZE);
+        fs::write(&src, &data).unwrap();
+        let c = candidate(&src);
+        let staging = dir.join("s");
+        fs::create_dir(&staging).unwrap();
+        let mut bufs = Buffers::default();
+        // A limit the first block already passes (the real one is 4 GiB).
+        let got = stage_with(&c, &staging, &mut bufs, 1024, &mut || {}).unwrap();
+        assert_eq!(got, Staged::Incompressible);
+        assert_eq!(fs::read_dir(staging.join(PART_DIR)).unwrap().count(), 0);
+        assert!(!staging.join("f").exists());
+        let m = fs::symlink_metadata(&src).unwrap();
+        assert_eq!((m.ino(), m.st_flags() & UF_COMPRESSED), (c.key.ino, 0));
+        assert_eq!(fs::read(&src).unwrap(), data);
+        // Under the real limit the same file compresses.
+        let got = stage_with(&c, &staging, &mut bufs, FORK_MAX, &mut || {}).unwrap();
+        assert!(matches!(got, Staged::Copy(_)), "{got:?}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn original_changed_mid_read_is_not_staged() {
         let dir = temp_dir("grow");
         let mut bufs = Buffers::default();
@@ -344,7 +381,7 @@ mod tests {
                         }
                     }
                 };
-                let got = stage_with(&c, &staging, &mut bufs, &mut hook).unwrap();
+                let got = stage_with(&c, &staging, &mut bufs, FORK_MAX, &mut hook).unwrap();
                 assert_eq!(got, Staged::Changed, "{size} grow={grow}");
                 assert_eq!(fs::read_dir(staging.join(PART_DIR)).unwrap().count(), 0);
             }

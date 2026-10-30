@@ -1,9 +1,10 @@
 # auto-compress-apfs
 
 Turns on APFS transparent compression for files matched by glob patterns, using Apple's
-standard tool `/usr/bin/ditto --hfsCompression` (the default), or optionally an in-process LZFSE
-writer (`backend = "applesauce"`, built on the `applesauce-core` crate). Compressed files stay readable by every program
-as usual; the filesystem decompresses them on read. Good targets are large trees of small, rarely
+standard tool `/usr/bin/ditto --hfsCompression` for files up to 512 MiB and an in-process LZFSE
+writer (`applesauce`, built on the `applesauce-core` crate) for larger ones
+(`[[backend_by_size]]`). Compressed files stay readable by every program as usual; the
+filesystem decompresses them on read. Good targets are large trees of small, rarely
 rewritten, well compressible files: Python virtualenvs, package caches, `node_modules`.
 
 - Preview first: without `--apply` it only lists what it would compress.
@@ -111,12 +112,14 @@ holds the lock exits 0 at once.
      process turns off their materialization (`setiopolicy_np`), so an accidental read fails
      instead of downloading.
 3. **Classify** from the `lstat` data of the walk, without extra syscalls: already compressed,
-   flagged, dataless, too small, larger than 512 MiB (measured on current macOS: ditto compresses
-   a file of exactly 512 MiB and leaves anything larger uncompressed; neither its options nor the
-   private Bom.framework copier options behind it, including AppleFSCompression's
-   `kAFSCAllowLargeResourceForks`, lift the limit), hardlinked, owned by another user,
+   flagged, dataless, too small (below the lowest `min_size` of `backend_by_size`), outside
+   every backend size range (a gap between ranges, or above a bounded top range), hardlinked, owned by another user,
    setuid/setgid, modified in the last `min_age_secs`, known incompressible (cache), quarantined,
-   or to compress.
+   or to compress with the backend whose size range holds the file. A ditto range may not go
+   above 512 MiB (measured on current macOS: ditto compresses a file of exactly 512 MiB and
+   leaves anything larger uncompressed; neither its options nor the private Bom.framework
+   copier options behind it, including AppleFSCompression's `kAFSCAllowLargeResourceForks`,
+   lift the limit), so the default routing gives larger files to applesauce.
 4. **Probe ditto.** Before the walk, `compress --apply` copies `ditto-probe.txt` next to the
    config (written there if missing, changed or compressed) into `ditto-probe.out/` with
    `--hfsCompression --noclone`, then with `--hfsCompression` alone, and uses the first set that
@@ -129,10 +132,12 @@ holds the lock exits 0 at once.
    incompressible cache are recorded next to it (`ditto-args.txt`); a cache filled with other
    options, or one without a record while the probe needs `--noclone`, is dropped once and its
    files are checked again. A preview runs no ditto and keeps showing the cache until then.
-   With `backend = "applesauce"` the probe instead stages `ditto-probe.txt` with the in-process
-   writer into `ditto-probe.out/` and requires a compressed copy that reads back
-   byte-identical; the cache record is then `applesauce lzfse <applesauce-core> <lzfse-sys>`
-   (the pinned versions), so switching backends (or versions) drops the cache once too.
+   Every backend the routing uses is probed. For applesauce the probe stages `ditto-probe.txt`
+   with the in-process writer into `ditto-probe.out/` and requires a compressed copy that reads
+   back byte-identical. The cache record lists, per backend in use (ditto first), its options or
+   `applesauce lzfse <applesauce-core> <lzfse-sys>` (the pinned versions), then `@min..max` of
+   each of its ranges, so any routing change (a bound too) or version change drops the cache
+   once.
 5. **Compress in batches.** Files of one match root (and device) are copied by one
    `ditto <probed options> -- <files...> <root>/.acz-staging-<pid>-<n>/` call (up to `batch_size`
    files and 2 GiB of data; basenames unique per batch ignoring case, because APFS volumes are
@@ -168,7 +173,8 @@ holds the lock exits 0 at once.
    fails with EACCES/EPERM) is remembered for the rest of the run: its other files get one
    ERROR each ("parent dir not writable") without another copy. Nothing is ever `chmod`ed.
 
-   **`backend = "applesauce"`** (or `--backend applesauce` for one run) uses the same batches,
+   **applesauce** (the files in its `backend_by_size` ranges, or every file with
+   `--backend applesauce`) uses the same batches (a batch never mixes backends),
    staging dirs and commit checks, but makes each copy in-process instead of with ditto: the
    original is opened `O_NOFOLLOW` and must still be the walked inode; a file that already has a
    `com.apple.ResourceFork` or `com.apple.decmpfs` xattr is skipped. The copy is written in
@@ -183,7 +189,9 @@ holds the lock exits 0 at once.
    except `com.apple.provenance` (assigned by the kernel to every file the process creates and
    not writable, ditto's copies get the same) and the value of `com.apple.quarantine`
    (rewritten by copyfile with a new timestamp and without the agent, as ditto does; only its
-   flags field must match). The same 512 MiB limit applies. A file named `.acz-part` is never
+   flags field must match). Its range may be unbounded, but a file whose compressed resource
+   fork would exceed 4 GiB (32-bit offsets) stops being read at that point and is cached as
+   incompressible; the original stays. A file named `.acz-part` is never
    compressed by this backend (its copy would clash with the part dir). A full volume
    (`ENOSPC`) while writing a copy skips the rest of the batch as low space. The birthtime is
    kept, also when the mtime is older than it (it is set again after the mtime).
@@ -374,8 +382,17 @@ resolution), so `exclude = ["/private/var/**"]` does not exclude a walk started 
   this list, so repeat the entries you want to keep.
 - `allow_volumes`: mount points of further local apfs volumes that may be walked.
 - `quarantine_after` (3, 0 disables), `min_free_bytes` (10 GiB): see below.
-- `min_size` (16385 bytes): `ditto --hfsCompression` leaves files of 16384 bytes or less plain
-  (measured on macOS), so smaller files are not even tried. A value you set is used as written.
+- `[[backend_by_size]]`: which backend compresses which sizes (`backend`, `min_size`, optional
+  `max_size`, both inclusive). Default: ditto for 16385..536870912 bytes, applesauce from
+  536870913 up. `ditto --hfsCompression` leaves files of 16384 bytes or less plain (measured on
+  macOS), so files below the lowest `min_size` are not even tried; a value you set is used as
+  written. Ranges must not overlap and a ditto range needs a `max_size` of at most 536870912:
+  otherwise every command that reads the config refuses to start, naming both ranges.
+  `--backend NAME` gives every file from the lowest `min_size` up (up to 512 MiB for ditto) to
+  one backend for a run. Old configs: a top-level `min_size` alone sets ditto's lower bound of
+  the default routing; a top-level `backend` means that backend alone for
+  `min_size`..536870912 (one INFO line per run says that other sizes are skipped). Neither may
+  be combined with `backend_by_size`; a `min_size` above 536870912 is refused.
 
 **Full Disk Access.** `~/Downloads` is a TCC-protected folder. A run that walks it needs Full Disk
 Access (or Downloads access) for the binary (System Settings > Privacy & Security); without it the
@@ -453,11 +470,12 @@ quarantine after three run days.
 - Files modified within `min_age_secs` (default 5 min) are skipped to avoid racing writers.
 - Recompiling a package or `pip install` rewrites files uncompressed; the next run picks them
   up again (until the quarantine stops it, see above).
-- **applesauce backend.** Opt-in. The compressed data is written by third-party code
+- **applesauce backend.** Used by default for files over 512 MiB only. The compressed data is written by third-party code
   (`applesauce-core` 0.4.14 with the bundled C `lzfse` 2.0.0), not by Apple's compressor; the
   byte compare through the kernel before every swap is the safety net. Its output differs from
   ditto's (LZFSE instead of LZVN), and files ditto leaves plain (16 KiB and less) may be
-  compressed when `min_size` allows them.
+  compressed when an applesauce range covers them. A file whose compressed resource fork would
+  exceed 4 GiB is cached as incompressible.
 - **Verify cost.** With `verify = true` every file is read twice (original and copy), so a 1.5 GiB
   dump costs 3 GiB of reads.
 - **Side effects of the swap** (new inode): Time Machine backs the swapped files up once more and

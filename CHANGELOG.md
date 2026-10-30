@@ -6,12 +6,28 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `[[backend_by_size]]` (config): routes files to a backend by size (`backend`, `min_size`,
+  optional `max_size`, inclusive). Default: ditto for 16385..536870912 bytes, applesauce for
+  larger files, which were skipped before. Overlapping ranges, `min_size > max_size` and a ditto
+  range without `max_size` or above 512 MiB are refused at config load by every command that
+  reads the config. A batch never mixes backends; every backend in use is probed, and the
+  incompressible cache record lists all of them with their ranges, so the new default (and any
+  later change of the ranges) drops the cache once. An applesauce file whose compressed
+  resource fork would exceed 4 GiB is cached as incompressible.
+  `--backend NAME` gives every file from the lowest `min_size` up to one backend for the run.
+
 ### Changed
 
 - License: GPL-3.0-or-later (was Apache-2.0), since the new applesauce backend links the
   GPL-3.0 `applesauce-core` crate.
-- The log line of a file over 512 MiB no longer names ditto: "larger than 512 MiB (above the
-  compression size limit), skipped".
+- The log line of a file no backend range covers: "outside every backend size range, skipped".
+- A top-level `min_size` alone now sets ditto's lower bound of the default routing (larger
+  files go to applesauce); a top-level `backend` keeps the old single range
+  `min_size`..536870912 and logs one INFO line per run. Both are refused together with
+  `backend_by_size`, and a `min_size` above 536870912 is refused; the default config
+  now spells the routing out instead.
 
 - `auto-compress-apfs` without arguments prints the help instead of a compress preview; use
   `compress` for the preview. Options without a command still mean `compress`.

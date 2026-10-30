@@ -5,6 +5,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::classify::MAX_SIZE;
+
 /// The embedded default configuration, written out when the config file does not exist.
 pub const DEFAULT_TOML: &str = include_str!("../config/default.toml");
 
@@ -33,9 +35,19 @@ pub struct Config {
     pub threads: usize,
     pub batch_size: usize,
     pub verify: bool,
-    /// How compressed copies are made.
-    pub backend: Backend,
-    pub min_size: u64,
+    /// Old single-backend form: how compressed copies are made. Not allowed together with
+    /// `backend_by_size`.
+    pub backend: Option<Backend>,
+    /// Old single-backend form: the smallest size compressed. Not allowed together with
+    /// `backend_by_size`.
+    pub min_size: Option<u64>,
+    /// Which backend compresses which file sizes (as written; `None` when absent).
+    pub backend_by_size: Option<Vec<SizeRange>>,
+    /// The routing in effect after [`Config::parse`]: `backend_by_size`; else the single range
+    /// `[min_size, MAX_SIZE]` of a top-level `backend`; else [`default_routing`] with ditto
+    /// from `min_size` when that is given. Sorted by `min_size`, non-overlapping.
+    #[serde(skip)]
+    pub routing: Vec<SizeRange>,
     pub min_age_secs: u64,
     pub log_dir: String,
     pub log_max_bytes: u64,
@@ -67,6 +79,109 @@ impl Backend {
             _ => None,
         }
     }
+}
+
+/// One `[[backend_by_size]]` entry: files of `min_size..=max_size` bytes go to `backend`;
+/// `max_size` absent is unbounded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SizeRange {
+    pub backend: Backend,
+    pub min_size: u64,
+    #[serde(default)]
+    pub max_size: Option<u64>,
+}
+
+impl SizeRange {
+    fn contains(&self, size: u64) -> bool {
+        size >= self.min_size && self.max_size.is_none_or(|m| size <= m)
+    }
+}
+
+impl std::fmt::Display for SizeRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self.backend {
+            Backend::Ditto => "ditto",
+            Backend::Applesauce => "applesauce",
+        };
+        match self.max_size {
+            Some(max) => write!(f, "{name} {}..{max}", self.min_size),
+            None => write!(f, "{name} {}..unbounded", self.min_size),
+        }
+    }
+}
+
+/// Default lower bound: files below it are never compressed.
+pub const DEFAULT_MIN_SIZE: u64 = 16385;
+
+/// The builtin routing: ditto up to [`MAX_SIZE`] (512 MiB), applesauce above it.
+pub fn default_routing() -> Vec<SizeRange> {
+    vec![
+        SizeRange {
+            backend: Backend::Ditto,
+            min_size: DEFAULT_MIN_SIZE,
+            max_size: Some(MAX_SIZE),
+        },
+        SizeRange {
+            backend: Backend::Applesauce,
+            min_size: MAX_SIZE + 1,
+            max_size: None,
+        },
+    ]
+}
+
+/// The backend whose range holds `size`, if any (`routing` as in [`Config::routing`]).
+pub fn backend_for(routing: &[SizeRange], size: u64) -> Option<Backend> {
+    routing.iter().find(|r| r.contains(size)).map(|r| r.backend)
+}
+
+/// The lowest `min_size` of `routing`: smaller files are too small for every backend.
+pub fn lowest_min_size(routing: &[SizeRange]) -> u64 {
+    routing.iter().map(|r| r.min_size).min().unwrap_or(0)
+}
+
+/// The routing of `--backend`: `backend` alone from the lowest `min_size` of `routing`, up
+/// to [`MAX_SIZE`] for ditto (it leaves bigger files uncompressed), unbounded for applesauce.
+pub fn forced_routing(routing: &[SizeRange], backend: Backend) -> Vec<SizeRange> {
+    vec![SizeRange {
+        backend,
+        min_size: lowest_min_size(routing),
+        max_size: match backend {
+            Backend::Ditto => Some(MAX_SIZE),
+            Backend::Applesauce => None,
+        },
+    }]
+}
+
+/// Checks `ranges` (min <= max, ditto bounded by [`MAX_SIZE`], no overlaps) and returns them
+/// sorted by `min_size`.
+fn check_routing(ranges: &[SizeRange]) -> Result<Vec<SizeRange>, String> {
+    if ranges.is_empty() {
+        return Err("`backend_by_size` needs at least one range".into());
+    }
+    for r in ranges {
+        if r.max_size.is_some_and(|m| r.min_size > m) {
+            return Err(format!("backend_by_size range {r}: min_size > max_size"));
+        }
+        if r.backend == Backend::Ditto && r.max_size.is_none_or(|m| m > MAX_SIZE) {
+            return Err(format!(
+                "backend_by_size range {r}: a ditto range needs max_size <= {MAX_SIZE} (ditto \
+                 leaves bigger files uncompressed)"
+            ));
+        }
+    }
+    let mut sorted = ranges.to_vec();
+    sorted.sort_by_key(|r| r.min_size);
+    // Sorted by min_size: any overlap shows between neighbours.
+    for w in sorted.windows(2) {
+        if w[0].max_size.is_none_or(|m| m >= w[1].min_size) {
+            return Err(format!(
+                "backend_by_size ranges overlap: {} and {}",
+                w[0], w[1]
+            ));
+        }
+    }
+    Ok(sorted)
 }
 
 /// Patterns and excludes of `trash` or `purge` (same syntax as the compress ones). A matched
@@ -101,8 +216,10 @@ impl Default for Config {
             threads: 0,
             batch_size: 1000,
             verify: true,
-            backend: Backend::Ditto,
-            min_size: 16385,
+            backend: None,
+            min_size: None,
+            backend_by_size: None,
+            routing: Vec::new(),
             min_age_secs: 300,
             log_dir: "~/Library/Logs/auto-compress-apfs".into(),
             log_max_bytes: 4 * MIB,
@@ -156,6 +273,43 @@ impl Config {
         }
         cfg.log_dir = expand_tilde(&cfg.log_dir, home);
         cfg.validate()?;
+        cfg.routing = match &cfg.backend_by_size {
+            Some(_) if cfg.backend.is_some() || cfg.min_size.is_some() => {
+                return Err(
+                    "`backend_by_size` replaces the top-level `backend` and `min_size`: remove both"
+                        .into(),
+                );
+            }
+            Some(ranges) => check_routing(ranges)?,
+            // `min_size` alone: ditto's lower bound of the default routing.
+            None if cfg.backend.is_none() => {
+                let mut routing = default_routing();
+                if let Some(min) = cfg.min_size {
+                    if min > MAX_SIZE {
+                        return Err(format!(
+                            "`min_size` {min} is above {MAX_SIZE}, the largest file ditto compresses"
+                        ));
+                    }
+                    routing[0].min_size = min;
+                }
+                routing
+            }
+            // An explicit `backend`: that backend alone for [min_size, MAX_SIZE], as before
+            // backend_by_size.
+            None => {
+                let min = cfg.min_size.unwrap_or(DEFAULT_MIN_SIZE);
+                if min > MAX_SIZE {
+                    return Err(format!(
+                        "`min_size` {min} is above {MAX_SIZE}, the top of the single `backend` range"
+                    ));
+                }
+                check_routing(&[SizeRange {
+                    backend: cfg.backend.unwrap_or_default(),
+                    min_size: min,
+                    max_size: Some(MAX_SIZE),
+                }])?
+            }
+        };
         Ok(cfg)
     }
 
@@ -219,6 +373,11 @@ impl Config {
         Ok((cfg, created))
     }
 
+    /// True when the old top-level `backend` alone decides the routing (one range).
+    pub fn single_backend(&self) -> bool {
+        self.backend.is_some() && self.backend_by_size.is_none()
+    }
+
     /// Worker thread count with `0` resolved to the available parallelism.
     pub fn worker_threads(&self) -> usize {
         match self.threads {
@@ -268,8 +427,10 @@ mod tests {
 
     #[test]
     fn embedded_default_equals_builtin_default() {
-        let parsed = Config::parse(DEFAULT_TOML, &home()).unwrap();
+        let mut parsed = Config::parse(DEFAULT_TOML, &home()).unwrap();
         let empty = Config::parse("", &home()).unwrap();
+        // The file spells the builtin routing out; everything else is equal as parsed.
+        assert_eq!(parsed.backend_by_size.take(), Some(default_routing()));
         assert_eq!(parsed, empty);
         assert!(parsed.patterns.is_empty());
         assert_eq!(&parsed.exclude[..3], ["node_modules", ".git", "target"]);
@@ -279,19 +440,128 @@ mod tests {
         assert_eq!(parsed.log_dir, "/Users/u/Library/Logs/auto-compress-apfs");
         assert_eq!(parsed.batch_size, 1000);
         assert_eq!(parsed.min_age_secs, 300);
-        assert_eq!(parsed.min_size, 16385);
+        assert_eq!(parsed.routing, default_routing());
+        assert_eq!(lowest_min_size(&parsed.routing), 16385);
+        assert_eq!(parsed.routing[0].max_size, Some(512 * MIB));
+        assert_eq!(parsed.routing[1].min_size, 512 * MIB + 1);
         // A user value is honoured as written, not clamped to the default.
-        assert_eq!(Config::parse("min_size = 1", &home()).unwrap().min_size, 1);
+        let one = Config::parse("min_size = 1", &home()).unwrap();
+        assert_eq!(one.routing[0], range(Backend::Ditto, 1, Some(MAX_SIZE)));
         assert!(parsed.verify && parsed.one_file_system);
-        assert_eq!(parsed.backend, Backend::Ditto);
+        assert_eq!((parsed.backend, parsed.min_size), (None, None));
+    }
+
+    fn range(backend: Backend, min_size: u64, max_size: Option<u64>) -> SizeRange {
+        SizeRange {
+            backend,
+            min_size,
+            max_size,
+        }
+    }
+
+    #[test]
+    fn backend_by_size_parses_sorted() {
+        let text = "[[backend_by_size]]\nbackend = \"applesauce\"\nmin_size = 101\n\
+                    [[backend_by_size]]\nbackend = \"ditto\"\nmin_size = 10\nmax_size = 100\n";
+        let cfg = Config::parse(text, &home()).unwrap();
+        assert_eq!(
+            cfg.routing,
+            [
+                range(Backend::Ditto, 10, Some(100)),
+                range(Backend::Applesauce, 101, None)
+            ]
+        );
+        // The same backend twice is fine when the ranges do not overlap.
+        let text = "[[backend_by_size]]\nbackend = \"applesauce\"\nmin_size = 1\nmax_size = 5\n\
+                    [[backend_by_size]]\nbackend = \"applesauce\"\nmin_size = 6\n";
+        assert_eq!(Config::parse(text, &home()).unwrap().routing.len(), 2);
+    }
+
+    #[test]
+    fn backend_by_size_errors() {
+        let table = |b: &str, min: u64, max: Option<u64>| {
+            let max = max.map_or(String::new(), |m| format!("max_size = {m}\n"));
+            format!("[[backend_by_size]]\nbackend = \"{b}\"\nmin_size = {min}\n{max}")
+        };
+        let err = |text: &str| Config::parse(text, &home()).unwrap_err();
+        let e = err(&(table("ditto", 10, Some(100)) + &table("applesauce", 100, None)));
+        assert_eq!(
+            e,
+            "backend_by_size ranges overlap: ditto 10..100 and applesauce 100..unbounded"
+        );
+        let e = err(&(table("applesauce", 1, None) + &table("applesauce", 50, Some(60))));
+        assert!(
+            e.contains("overlap: applesauce 1..unbounded and applesauce 50..60"),
+            "{e}"
+        );
+        let e = err(&table("ditto", 10, Some(9)));
+        assert!(e.contains("min_size > max_size"), "{e}");
+        let e = err(&table("ditto", 10, None));
+        assert!(e.contains("ditto range needs max_size"), "{e}");
+        let e = err(&table("ditto", 10, Some(MAX_SIZE + 1)));
+        assert!(e.contains("ditto range needs max_size"), "{e}");
+        assert!(err("backend_by_size = []").contains("at least one range"));
+        for old in ["backend = \"ditto\"\n", "min_size = 5\n"] {
+            let e = err(&(old.to_owned() + &table("ditto", 10, Some(100))));
+            assert!(e.contains("`backend` and `min_size`"), "{e}");
+        }
+        assert!(err(&(table("ditto", 10, Some(100)) + "bogus = 1\n")).contains("bogus"));
+    }
+
+    #[test]
+    fn old_keys_and_forced_routing() {
+        let cfg = Config::parse("backend = \"applesauce\"", &home()).unwrap();
+        assert_eq!(
+            cfg.routing,
+            [range(Backend::Applesauce, DEFAULT_MIN_SIZE, Some(MAX_SIZE))]
+        );
+        assert!(cfg.single_backend());
+        let cfg = Config::parse("backend = \"ditto\"\nmin_size = 7", &home()).unwrap();
+        assert_eq!(cfg.routing, [range(Backend::Ditto, 7, Some(MAX_SIZE))]);
+        // `min_size` alone: the default routing with ditto from it.
+        let cfg = Config::parse("min_size = 7", &home()).unwrap();
+        assert_eq!(
+            cfg.routing,
+            [
+                range(Backend::Ditto, 7, Some(MAX_SIZE)),
+                range(Backend::Applesauce, MAX_SIZE + 1, None)
+            ]
+        );
+        assert!(!cfg.single_backend());
+        assert!(!Config::parse("", &home()).unwrap().single_backend());
+        let big = MAX_SIZE + 1;
+        for text in [
+            format!("min_size = {big}"),
+            format!("backend = \"ditto\"\nmin_size = {big}"),
+        ] {
+            let e = Config::parse(&text, &home()).unwrap_err();
+            assert!(
+                e.starts_with(&format!("`min_size` {big} is above {MAX_SIZE}")),
+                "{e}"
+            );
+        }
+        let routing = default_routing();
+        assert_eq!(
+            forced_routing(&routing, Backend::Ditto),
+            [range(Backend::Ditto, DEFAULT_MIN_SIZE, Some(MAX_SIZE))]
+        );
+        assert_eq!(
+            forced_routing(&routing, Backend::Applesauce),
+            [range(Backend::Applesauce, DEFAULT_MIN_SIZE, None)]
+        );
+        assert_eq!(backend_for(&routing, DEFAULT_MIN_SIZE - 1), None);
+        assert_eq!(
+            backend_for(&routing, MAX_SIZE + 1),
+            Some(Backend::Applesauce)
+        );
     }
 
     #[test]
     fn backend_values() {
         let cfg = Config::parse("backend = \"applesauce\"", &home()).unwrap();
-        assert_eq!(cfg.backend, Backend::Applesauce);
+        assert_eq!(cfg.backend, Some(Backend::Applesauce));
         let cfg = Config::parse("backend = \"ditto\"", &home()).unwrap();
-        assert_eq!(cfg.backend, Backend::Ditto);
+        assert_eq!(cfg.backend, Some(Backend::Ditto));
         assert!(Config::parse("backend = \"Applesauce\"", &home()).is_err());
         assert!(Config::parse("backend = \"zlib\"", &home()).is_err());
         assert_eq!(Backend::parse("applesauce"), Some(Backend::Applesauce));

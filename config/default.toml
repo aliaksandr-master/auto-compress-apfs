@@ -57,16 +57,6 @@ batch_size = 1000
 # Byte-compare the compressed copy with the original before replacing it.
 verify = true
 
-# How the compressed copy is made: "ditto" runs /usr/bin/ditto --hfsCompression (the system's
-# compressor); "applesauce" compresses in-process with LZFSE (the applesauce-core decmpfs
-# writer) and always byte-compares the copy, whatever `verify` says. Files over 512 MiB are
-# skipped by both. `--backend` overrides this for one run.
-backend = "ditto"
-
-# Files smaller than this (bytes) are ignored. ditto --hfsCompression leaves files of 16384 bytes
-# or less uncompressed (measured on macOS), so smaller files would only cost a copy.
-min_size = 16385
-
 # Files modified less than this many seconds ago are skipped (they may still be written to).
 min_age_secs = 300
 
@@ -79,6 +69,27 @@ log_max_bytes = 4194304
 # Rotated logs kept (.log.1 .. .log.N, at most 9).
 # log_max_bytes * (log_keep + 1) + 1 MiB must not exceed 10 MiB.
 log_keep = 1
+
+# Which backend compresses which file sizes (bytes, both bounds inclusive; no max_size =
+# unbounded). A table list: keep it after every plain key. "ditto" runs /usr/bin/ditto
+# --hfsCompression (the system's compressor); it leaves files of 16384 bytes or less and files
+# over 512 MiB (536870912) uncompressed, so a ditto range must lie inside 16385..536870912 to
+# be useful and may not go above 536870912. "applesauce" compresses in-process with LZFSE (the
+# applesauce-core decmpfs writer) and always byte-compares the copy, whatever `verify` says;
+# a file whose compressed form would exceed 4 GiB is cached as incompressible. Files below the
+# lowest min_size are ignored; a file outside every range is skipped. Ranges must not overlap.
+# `--backend` forces one backend for a run. Changing the ranges re-checks the files cached as
+# incompressible once. Old configs: a top-level `min_size` alone sets ditto's lower bound of
+# this default routing; a top-level `backend` means that backend alone for
+# min_size..536870912. Neither may be combined with this table.
+[[backend_by_size]]
+backend = "ditto"
+min_size = 16385
+max_size = 536870912
+
+[[backend_by_size]]
+backend = "applesauce"
+min_size = 536870913
 
 # `trash` moves every file or directory matched by these patterns to ~/.Trash; `purge` deletes
 # them for good. Same pattern and exclude syntax as above; a matched directory goes as a whole,

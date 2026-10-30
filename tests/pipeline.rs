@@ -1276,7 +1276,8 @@ fn too_large_for_ditto_is_skipped_and_uncached() {
     )
     .unwrap();
 
-    let s = env.run(&["compress", "--apply", "-v"]);
+    // ditto alone (the default routing would give it to applesauce).
+    let s = env.run(&["compress", "--apply", "-v", "--backend", "ditto"]);
     assert_eq!(s["too_large"], "1", "{s:?}");
     assert_eq!(s["incompressible"], "0", "{s:?}");
     assert_eq!(s["ditto_calls"], "0", "{s:?}");
@@ -1291,7 +1292,7 @@ fn too_large_for_ditto_is_skipped_and_uncached() {
     );
     assert!(
         env.log_text().contains(&format!(
-            "{}: larger than 512 MiB (above the compression size limit), skipped",
+            "{}: outside every backend size range, skipped",
             big.display()
         )),
         "{}",
@@ -1457,7 +1458,15 @@ fn switching_backend_drops_the_incompressible_cache() {
     let record = env.cache().with_file_name("ditto-args.txt");
     assert_eq!(
         fs::read_to_string(&record).unwrap(),
-        "applesauce lzfse 0.4.14 2.0.0\n"
+        "applesauce lzfse 0.4.14 2.0.0 @0..536870912\n"
+    );
+    // The old top-level `backend`: one INFO line names the single range.
+    assert!(
+        env.log_text().contains(
+            "config sets the top-level `backend`: only applesauce 0..536870912 is compressed"
+        ),
+        "{}",
+        env.log_text()
     );
     // Same backend again: the cache holds.
     let s = env.apply();
@@ -1467,7 +1476,7 @@ fn switching_backend_drops_the_incompressible_cache() {
     env.run(&["compress", "--apply", "--backend", "ditto"]);
     assert!(
         env.log_text().contains(
-            "incompressible cache was filled by another backend or other ditto options, dropped 3 entries"
+            "incompressible cache was filled under another routing or other backend options, dropped 3 entries"
         ),
         "{}",
         env.log_text()
@@ -1512,4 +1521,159 @@ fn applesauce_keeps_birthtime_older_mtime() {
     assert!(compressed(&file));
     assert_eq!(after.created().unwrap(), before.created().unwrap());
     assert_eq!(after.modified().unwrap(), before.modified().unwrap());
+}
+
+/// `[[backend_by_size]]` tables (after every plain key of the config).
+fn routing_tables(ranges: &[(&str, u64, Option<u64>)]) -> String {
+    ranges
+        .iter()
+        .map(|(b, min, max)| {
+            let max = max.map_or(String::new(), |m| format!("max_size = {m}\n"));
+            format!("[[backend_by_size]]\nbackend = \"{b}\"\nmin_size = {min}\n{max}")
+        })
+        .collect()
+}
+
+#[test]
+fn size_routing_sends_each_file_to_its_backend() {
+    let env = Env::new("routing", "");
+    let root = env.base.join("tree/Work_r/.venv");
+    // A small test-only boundary: ditto up to 64 KiB, applesauce above it and below 16 KiB
+    // (ditto leaves those plain, so a compressed one proves applesauce made it).
+    fs::write(
+        &env.config,
+        fs::read_to_string(&env.config).unwrap()
+            + &format!("patterns = [\"{}\"]\nexclude = []\n", root.display())
+            + &routing_tables(&[
+                ("applesauce", 4096, Some(16384)),
+                ("ditto", 16385, Some(65536)),
+                ("applesauce", 65537, None),
+            ]),
+    )
+    .unwrap();
+    fs::create_dir_all(&root).unwrap();
+    let text = |n: usize| compressible("route").into_bytes()[..n].to_vec();
+    let files: Vec<(PathBuf, Vec<u8>)> = [10_000, 40_000, 200_000]
+        .into_iter()
+        .map(|n| (root.join(format!("f{n}.txt")), text(n)))
+        .collect();
+    for (p, data) in &files {
+        fs::write(p, data).unwrap();
+    }
+    let tiny = root.join("tiny.txt");
+    fs::write(&tiny, text(1000)).unwrap();
+
+    let s = env.apply();
+    assert_eq!(s["compressed"], "3", "{s:?}");
+    assert_eq!(s["too_small"], "1", "{s:?}");
+    assert_eq!(s["errors"], "0", "{s:?}");
+    // Only the 40 KB file went through ditto.
+    assert_eq!(s["ditto_calls"], "1", "{s:?}");
+    for (p, data) in &files {
+        assert!(compressed(p), "{}", p.display());
+        assert_eq!(&fs::read(p).unwrap(), data, "{}", p.display());
+    }
+    assert!(!compressed(&tiny));
+    // Both backends' records fill the cache record, ditto's options first.
+    let record = fs::read_to_string(env.cache().with_file_name("ditto-args.txt")).unwrap();
+    assert!(record.starts_with("--hfsCompression"), "{record}");
+    assert!(
+        record.ends_with(" @16385..65536 applesauce lzfse 0.4.14 2.0.0 @4096..16384 @65537..\n"),
+        "{record}"
+    );
+}
+
+#[test]
+fn overlapping_size_ranges_refuse_to_start() {
+    let env = Env::new("overlap", "");
+    let root = env.base.join("tree/Work_o/.venv");
+    fs::write(
+        &env.config,
+        fs::read_to_string(&env.config).unwrap()
+            + &format!("patterns = [\"{}\"]\nexclude = []\n", root.display())
+            + &routing_tables(&[
+                ("ditto", 16385, Some(100_000)),
+                ("applesauce", 90_000, None),
+            ]),
+    )
+    .unwrap();
+    fs::create_dir_all(&root).unwrap();
+    let file = root.join("f.txt");
+    fs::write(&file, compressible("overlap")).unwrap();
+    let before = lstat(&file);
+    // Every command that reads the config refuses it (stat and quarantine do not read it).
+    let commands: [&[&str]; 6] = [
+        &["compress"],
+        &["compress", "--apply"],
+        &["clean"],
+        &["trash"],
+        &["purge"],
+        &["run", "--apply"],
+    ];
+    for args in commands {
+        let out = env.exec(args, None);
+        assert!(!out.status.success(), "{args:?}: {out:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains(
+                "backend_by_size ranges overlap: ditto 16385..100000 and applesauce 90000..unbounded"
+            ),
+            "{args:?}: {err}"
+        );
+    }
+    let now = lstat(&file);
+    assert_eq!((now.ino(), now.mtime()), (before.ino(), before.mtime()));
+    assert!(!compressed(&file));
+    assert!(!env.cache().exists() && !env.state().exists());
+}
+
+#[test]
+fn changing_range_bounds_drops_the_incompressible_cache() {
+    let env = Env::new("bounds", "");
+    let root = env.base.join("tree/Work_bd/.venv");
+    let write_config = |ditto_max: u64| {
+        let base = fs::read_to_string(&env.config).unwrap();
+        let plain = base.split("[[backend_by_size]]").next().unwrap().to_owned();
+        fs::write(
+            &env.config,
+            plain
+                + &routing_tables(&[
+                    ("ditto", 16385, Some(ditto_max)),
+                    ("applesauce", ditto_max + 1, None),
+                ]),
+        )
+        .unwrap();
+    };
+    fs::write(
+        &env.config,
+        fs::read_to_string(&env.config).unwrap()
+            + &format!("patterns = [\"{}\"]\nexclude = []\n", root.display()),
+    )
+    .unwrap();
+    write_config(1 << 20);
+    fs::create_dir_all(&root).unwrap();
+    for i in 0..2 {
+        fs::write(root.join(format!("r{i}.bin")), random_bytes(256 * 1024)).unwrap();
+    }
+    let s = env.apply();
+    assert_eq!(s["incompressible"], "2", "{s:?}");
+    // Same routing: the cache holds.
+    env.apply();
+    assert!(!env.log_text().contains("dropped"), "{}", env.log_text());
+    // Only a bound moves (same backends): the cache is dropped once.
+    write_config(2 << 20);
+    env.apply();
+    assert!(
+        env.log_text()
+            .contains("incompressible cache was filled under another routing or other backend options, dropped 2 entries"),
+        "{}",
+        env.log_text()
+    );
+    env.apply();
+    assert_eq!(
+        env.log_text().matches("dropped").count(),
+        1,
+        "{}",
+        env.log_text()
+    );
 }

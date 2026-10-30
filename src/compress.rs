@@ -52,7 +52,7 @@ pub(crate) const KEEP_MARKER: &str = ".acz-keep";
 pub type DittoArgs = &'static [&'static str];
 
 /// How the staged copies are made.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Backend {
     /// `/usr/bin/ditto` with the options chosen by [`probe`].
     Ditto(DittoArgs),
@@ -405,6 +405,29 @@ fn probe_source(dir: &Path) -> Result<(PathBuf, Vec<u8>), ProbeError> {
     Ok((src, want))
 }
 
+/// Groups `files` by backend, match root and device and splits each group by
+/// [`split_batches`]: every batch has one backend.
+fn batches_of(
+    files: Vec<(Candidate, Backend)>,
+    batch_size: usize,
+) -> Vec<(Backend, Vec<Candidate>)> {
+    let mut groups: BTreeMap<(Backend, Arc<Path>, u64), Vec<Candidate>> = BTreeMap::new();
+    for (c, backend) in files {
+        groups
+            .entry((backend, c.match_root.clone(), c.key.dev))
+            .or_default()
+            .push(c);
+    }
+    groups
+        .into_iter()
+        .flat_map(|((backend, ..), g)| {
+            split_batches(g, batch_size, MAX_ARG_BYTES)
+                .into_iter()
+                .map(move |b| (backend, b))
+        })
+        .collect()
+}
+
 /// Splits one match root's files into batches: <= `max_files` files, <= `max_bytes` of source
 /// path bytes, <= [`MAX_BATCH_DATA`] of file data, and basenames unique per batch ignoring case
 /// (ditto flattens sources into one directory on a case-insensitive volume).
@@ -581,8 +604,6 @@ pub struct Compressor<'a> {
     pub verify: bool,
     pub batch_size: usize,
     pub threads: usize,
-    /// ditto (with the options chosen by [`probe`]) or applesauce.
-    pub backend: Backend,
     /// Free bytes that must remain on the volume after a batch's data.
     pub min_free_bytes: u64,
     /// The low-space WARN was written (later ones are DEBUG).
@@ -600,7 +621,6 @@ impl<'a> Compressor<'a> {
         verify: bool,
         batch_size: usize,
         threads: usize,
-        backend: Backend,
         min_free_bytes: u64,
     ) -> Self {
         Self {
@@ -608,7 +628,6 @@ impl<'a> Compressor<'a> {
             verify,
             batch_size,
             threads,
-            backend,
             min_free_bytes,
             low_space_warned: AtomicBool::new(false),
             unwritable: Mutex::new(HashSet::new()),
@@ -617,19 +636,16 @@ impl<'a> Compressor<'a> {
         }
     }
 
-    /// Compresses `files` (all classified as to-compress), batches running in parallel.
-    pub fn run(&self, files: Vec<Candidate>) -> Outcome {
-        let mut groups: BTreeMap<(Arc<Path>, u64), Vec<Candidate>> = BTreeMap::new();
-        for c in files {
-            groups
-                .entry((c.match_root.clone(), c.key.dev))
-                .or_default()
-                .push(c);
-        }
-        let batches: Vec<Vec<Candidate>> = groups
-            .into_values()
-            .flat_map(|g| split_batches(g, self.batch_size, MAX_ARG_BYTES))
-            .collect();
+    /// [`Self::run_routed`] with one backend for all `files`.
+    #[cfg(test)]
+    fn run(&self, files: Vec<Candidate>, backend: Backend) -> Outcome {
+        self.run_routed(files.into_iter().map(|c| (c, backend)).collect())
+    }
+
+    /// Compresses `files` (all classified as to-compress), each with its backend, batches
+    /// running in parallel. A batch never mixes backends.
+    pub fn run_routed(&self, files: Vec<(Candidate, Backend)>) -> Outcome {
+        let batches = batches_of(files, self.batch_size);
         if batches.is_empty() {
             return Outcome::default();
         }
@@ -644,7 +660,8 @@ impl<'a> Compressor<'a> {
                         loop {
                             let next = queue.lock().unwrap_or_else(|e| e.into_inner()).next();
                             let Some((no, batch)) = next else { break };
-                            self.run_batch(no, &batch, &mut bufs, &mut out);
+                            let (backend, batch) = batch;
+                            self.run_batch(no, backend, &batch, &mut bufs, &mut out);
                         }
                         out
                     })
@@ -743,7 +760,14 @@ impl<'a> Compressor<'a> {
 
     /// Stages a batch (one match root, one device) in the match root; when that is impossible
     /// or the root is on another device, stages per parent directory instead.
-    fn run_batch(&self, no: usize, batch: &[Candidate], bufs: &mut Buffers, out: &mut Outcome) {
+    fn run_batch(
+        &self,
+        no: usize,
+        backend: Backend,
+        batch: &[Candidate],
+        bufs: &mut Buffers,
+        out: &mut Outcome,
+    ) {
         let root = &batch[0].match_root;
         let same_dev = fs::symlink_metadata(root).is_ok_and(|m| m.dev() == batch[0].key.dev);
         let staged_in_root = if same_dev {
@@ -754,7 +778,7 @@ impl<'a> Compressor<'a> {
         match staged_in_root {
             Ok(staging) => {
                 let files: Vec<&Candidate> = batch.iter().collect();
-                self.process(&staging, &files, bufs, out);
+                self.process(&staging, &files, backend, bufs, out);
             }
             Err(e) => {
                 self.log.debug(format_args!(
@@ -775,7 +799,7 @@ impl<'a> Compressor<'a> {
                         continue;
                     }
                     match Self::make_staging(parent, no) {
-                        Ok(staging) => self.process(&staging, &files, bufs, out),
+                        Ok(staging) => self.process(&staging, &files, backend, bufs, out),
                         Err(e) => {
                             let perm = e.kind() == io::ErrorKind::PermissionDenied;
                             if perm {
@@ -806,9 +830,16 @@ impl<'a> Compressor<'a> {
         }
     }
 
-    /// Makes the staged copies of `files` in `staging` (ditto, or applesauce per file), commits
-    /// every staged copy, removes `staging`.
-    fn process(&self, staging: &Path, files: &[&Candidate], bufs: &mut Buffers, out: &mut Outcome) {
+    /// Makes the staged copies of `files` in `staging` with `backend` (ditto, or applesauce per
+    /// file), commits every staged copy, removes `staging`.
+    fn process(
+        &self,
+        staging: &Path,
+        files: &[&Candidate],
+        backend: Backend,
+        bufs: &mut Buffers,
+        out: &mut Outcome,
+    ) {
         // Files in a directory already found not writable would fail the swap again.
         let (blocked, files): (Vec<&Candidate>, Vec<&Candidate>) =
             files.iter().partition(|c| self.parent_unwritable(c));
@@ -830,7 +861,7 @@ impl<'a> Compressor<'a> {
             self.remove_staging(staging);
             return;
         }
-        let ditto_args = match self.backend {
+        let ditto_args = match backend {
             Backend::Ditto(args) => args,
             Backend::Applesauce => return self.process_applesauce(staging, files, bufs, out),
         };
@@ -947,7 +978,14 @@ impl<'a> Compressor<'a> {
                 if self.parent_unwritable(c) {
                     break Self::discard(&staged, self.fail_unwritable(c));
                 }
-                let r = self.commit(c, &staged, from_failed_call, bufs, &sys::rename_swap);
+                let r = self.commit(
+                    c,
+                    backend,
+                    &staged,
+                    from_failed_call,
+                    bufs,
+                    &sys::rename_swap,
+                );
                 if from_failed_call && matches!(r, Commit::Incompressible(_)) {
                     // Uncompressed copy from a failed call: retry alone before believing it.
                     need_retry = true;
@@ -1001,7 +1039,14 @@ impl<'a> Compressor<'a> {
                             hook(c);
                         }
                         // Always byte-compared, whatever `verify` says.
-                        self.commit(c, &staged, true, bufs, &sys::rename_swap)
+                        self.commit(
+                            c,
+                            Backend::Applesauce,
+                            &staged,
+                            true,
+                            bufs,
+                            &sys::rename_swap,
+                        )
                     }
                     Ok(Staged::Incompressible) => {
                         self.log
@@ -1084,12 +1129,14 @@ impl<'a> Compressor<'a> {
         Self::discard(staged, Commit::Skipped)
     }
 
-    /// Checks the staged copy against the original and swaps it in. The byte compare runs when
+    /// Checks the staged copy made by `backend` against the original and swaps it in. The
+    /// byte compare runs when
     /// `verify` is configured or `force_verify` is set (copy from a failed ditto call). `swap` is
     /// [`sys::rename_swap`] in production; tests inject failures through it.
     fn commit(
         &self,
         c: &Candidate,
+        backend: Backend,
         staged: &Path,
         force_verify: bool,
         bufs: &mut Buffers,
@@ -1116,7 +1163,7 @@ impl<'a> Compressor<'a> {
             .open(staged);
         // Setting an mtime older than the birthtime lowers the birthtime on APFS: the
         // applesauce copy got the original's birthtime in staging, put it back after.
-        let keep_birth = self.backend == Backend::Applesauce;
+        let keep_birth = backend == Backend::Applesauce;
         let set = |f: File| -> io::Result<()> {
             let birth = if keep_birth {
                 Some(f.metadata()?.created()?)
@@ -1165,7 +1212,7 @@ impl<'a> Compressor<'a> {
             return Self::discard(staged, Commit::Incompressible(c.key));
         }
         // The xattrs ditto would carry over, checked for applesauce copies only.
-        if self.backend == Backend::Applesauce {
+        if backend == Backend::Applesauce {
             match xattr_diff(&c.path, &c.key, staged) {
                 Ok(XattrCheck::Same) => {}
                 Ok(XattrCheck::Changed) => return self.changed(c, staged),
@@ -1568,8 +1615,12 @@ mod tests {
     }
 
     impl Fixture {
+        fn backend(&self) -> Backend {
+            Backend::Ditto(ditto_args())
+        }
+
         fn compressor(&self) -> Compressor<'_> {
-            Compressor::new(&self.log, true, 10, 1, Backend::Ditto(ditto_args()), 0)
+            Compressor::new(&self.log, true, 10, 1, 0)
         }
 
         /// Replaces the original by a new inode with different content.
@@ -1589,6 +1640,7 @@ mod tests {
         let f = fixture("ok");
         let r = f.compressor().commit(
             &f.cand,
+            f.backend(),
             &f.staged,
             false,
             &mut Buffers::default(),
@@ -1632,6 +1684,7 @@ mod tests {
         let cmp = f.compressor();
         let r = cmp.commit(
             &f.cand,
+            f.backend(),
             &f.staged,
             false,
             &mut Buffers::default(),
@@ -1657,6 +1710,7 @@ mod tests {
         f.replace_original();
         let r = f.compressor().commit(
             &f.cand,
+            f.backend(),
             &f.staged,
             false,
             &mut Buffers::default(),
@@ -1678,9 +1732,14 @@ mod tests {
             }
             sys::rename_swap(a, b)
         };
-        let r = f
-            .compressor()
-            .commit(&f.cand, &f.staged, false, &mut Buffers::default(), &swap);
+        let r = f.compressor().commit(
+            &f.cand,
+            f.backend(),
+            &f.staged,
+            false,
+            &mut Buffers::default(),
+            &swap,
+        );
         assert_eq!(r, Commit::Skipped);
         assert_eq!(calls.get(), 2);
         assert_eq!(fs::read_to_string(&f.cand.path).unwrap(), "new content");
@@ -1701,9 +1760,14 @@ mod tests {
                 Err(io::Error::other("injected swap-back failure"))
             }
         };
-        let r = f
-            .compressor()
-            .commit(&f.cand, &f.staged, false, &mut Buffers::default(), &swap);
+        let r = f.compressor().commit(
+            &f.cand,
+            f.backend(),
+            &f.staged,
+            false,
+            &mut Buffers::default(),
+            &swap,
+        );
         let Commit::Rescued(rescue) = r else {
             panic!("{r:?}")
         };
@@ -1745,6 +1809,7 @@ mod tests {
         cmp.verify = false;
         let r = cmp.commit(
             &f.cand,
+            f.backend(),
             &f.staged,
             true,
             &mut Buffers::default(),
@@ -1902,15 +1967,8 @@ mod tests {
         let log = Logger::open(&dir.join("log"), 1 << 20, 1, false).unwrap();
         let files = files_in(&dir, "a", 3);
         let before: Vec<u64> = files.iter().map(|c| c.key.ino).collect();
-        let out = Compressor::new(
-            &log,
-            true,
-            100,
-            2,
-            Backend::Ditto(ditto_args()),
-            u64::MAX / 2,
-        )
-        .run(files.clone());
+        let out = Compressor::new(&log, true, 100, 2, u64::MAX / 2)
+            .run(files.clone(), Backend::Ditto(ditto_args()));
         assert_eq!((out.ditto_calls, out.compressed, out.errors), (0, 0, 0));
         assert_eq!(out.skipped_low_space, 3);
         for (c, ino) in files.iter().zip(before) {
@@ -1931,13 +1989,82 @@ mod tests {
     }
 
     #[test]
+    fn batches_never_mix_backends() {
+        let dir = temp_dir("routed");
+        let log = Logger::open(&dir.join("log"), 1 << 20, 1, false).unwrap();
+        let files = files_in(&dir, "a", 4);
+        let content: Vec<Vec<u8>> = files.iter().map(|c| fs::read(&c.path).unwrap()).collect();
+        let ditto = Backend::Ditto(ditto_args());
+        // One match root, one device: only the backend splits them.
+        let routed: Vec<(Candidate, Backend)> = files
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                (
+                    c.clone(),
+                    if i % 2 == 0 {
+                        ditto
+                    } else {
+                        Backend::Applesauce
+                    },
+                )
+            })
+            .collect();
+        let batches = batches_of(routed.clone(), 100);
+        assert_eq!(batches.len(), 2);
+        for (backend, batch) in &batches {
+            for c in batch {
+                assert!(routed.iter().any(|(r, b)| r.path == c.path && b == backend));
+            }
+        }
+        let out = quiet(&log).run_routed(routed);
+        // Two ditto files in one call; the applesauce ones never reach ditto.
+        assert_eq!((out.compressed, out.errors, out.ditto_calls), (4, 0, 1));
+        for (c, want) in files.iter().zip(&content) {
+            let m = fs::symlink_metadata(&c.path).unwrap();
+            assert_ne!(m.st_flags() & UF_COMPRESSED, 0);
+            assert_eq!(&fs::read(&c.path).unwrap(), want);
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn applesauce_write_error_fails_the_file_without_swap() {
+        let dir = temp_dir("as-error");
+        let log = Logger::open(&dir.join("log"), 1 << 20, 1, false).unwrap();
+        let files = files_in(&dir, "a", 2);
+        let before: Vec<u64> = files.iter().map(|c| c.key.ino).collect();
+        // A file where the part dir belongs: every stage returns an io error.
+        let staging = dir.join("root/staging");
+        fs::create_dir(&staging).unwrap();
+        fs::write(staging.join(applesauce::PART_DIR), "").unwrap();
+        let refs: Vec<&Candidate> = files.iter().collect();
+        let mut out = Outcome::default();
+        quiet(&log).process(
+            &staging,
+            &refs,
+            Backend::Applesauce,
+            &mut Buffers::default(),
+            &mut out,
+        );
+        assert_eq!((out.compressed, out.errors), (0, 2));
+        assert!(log_text(&dir).contains("cannot write compressed copy"));
+        for (c, ino) in files.iter().zip(before) {
+            let m = fs::symlink_metadata(&c.path).unwrap();
+            assert_eq!(m.ino(), ino);
+            assert_eq!(m.st_flags() & UF_COMPRESSED, 0);
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn applesauce_backend_compresses_and_verifies() {
         let dir = temp_dir("applesauce");
         let log = Logger::open(&dir.join("log"), 1 << 20, 1, false).unwrap();
         let files = files_in(&dir, "a", 3);
         let content: Vec<Vec<u8>> = files.iter().map(|c| fs::read(&c.path).unwrap()).collect();
         // Verify off in the config: applesauce copies are byte-compared anyway.
-        let out = Compressor::new(&log, false, 100, 2, Backend::Applesauce, 0).run(files.clone());
+        let out = Compressor::new(&log, false, 100, 2, 0).run(files.clone(), Backend::Applesauce);
         assert_eq!((out.compressed, out.errors, out.ditto_calls), (3, 0, 0));
         for (c, want) in files.iter().zip(&content) {
             let m = fs::symlink_metadata(&c.path).unwrap();
@@ -1999,7 +2126,7 @@ mod tests {
         let log = Logger::open(&dir.join("log"), 1 << 20, 1, false).unwrap();
         let files = files_in(&dir, "v", 1);
         let want = fs::read(&files[0].path).unwrap();
-        let mut comp = Compressor::new(&log, false, 100, 1, Backend::Applesauce, 0);
+        let mut comp = Compressor::new(&log, false, 100, 1, 0);
         // Same size and mtime, other bytes: only a byte compare can tell.
         comp.after_stage = Some(|c| {
             let mut data = fs::read(&c.path).unwrap();
@@ -2013,7 +2140,7 @@ mod tests {
                 .set_modified(t)
                 .unwrap();
         });
-        let out = comp.run(files.clone());
+        let out = comp.run(files.clone(), Backend::Applesauce);
         assert_eq!((out.compressed, out.errors), (0, 1));
         let p = &files[0].path;
         assert_eq!(
@@ -2042,7 +2169,7 @@ mod tests {
         let ro = dir.join("root/ro");
         fs::set_permissions(&ro, fs::Permissions::from_mode(0o555)).unwrap();
         let out =
-            Compressor::new(&log, true, 100, 1, Backend::Ditto(ditto_args()), 0).run(files.clone());
+            Compressor::new(&log, true, 100, 1, 0).run(files.clone(), Backend::Ditto(ditto_args()));
         fs::set_permissions(&ro, fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(
             (out.ditto_calls, out.compressed, out.errors),
@@ -2083,7 +2210,7 @@ mod tests {
     }
 
     fn quiet(log: &Logger) -> Compressor<'_> {
-        Compressor::new(log, false, 100, 2, Backend::Ditto(ditto_args()), 0)
+        Compressor::new(log, false, 100, 2, 0)
     }
 
     #[test]
@@ -2093,7 +2220,13 @@ mod tests {
         let (a, b) = case_pair(&dir);
         let staging = Compressor::make_staging(&a.match_root, 0).unwrap();
         let mut out = Outcome::default();
-        quiet(&log).process(&staging, &[&a, &b], &mut Buffers::default(), &mut out);
+        quiet(&log).process(
+            &staging,
+            &[&a, &b],
+            Backend::Ditto(ditto_args()),
+            &mut Buffers::default(),
+            &mut out,
+        );
         assert_eq!(out.errors, 0, "{}", log_text(&dir));
         assert_eq!(out.compressed, 2, "{}", log_text(&dir));
         assert_eq!(
@@ -2112,7 +2245,7 @@ mod tests {
         let dir = temp_dir("case-run");
         let log = Logger::open(&dir.join("log"), 1 << 20, 1, false).unwrap();
         let (a, b) = case_pair(&dir);
-        let out = quiet(&log).run(vec![a.clone(), b.clone()]);
+        let out = quiet(&log).run(vec![a.clone(), b.clone()], Backend::Ditto(ditto_args()));
         assert_eq!((out.errors, out.compressed, out.ditto_calls), (0, 2, 2));
         assert_eq!(
             fs::read_to_string(&a.path).unwrap(),
@@ -2143,7 +2276,7 @@ mod tests {
                 )
             })
             .collect();
-        let out = quiet(&log).run(files);
+        let out = quiet(&log).run(files, Backend::Ditto(ditto_args()));
         // One batch call + three single retries, then the batch is given up.
         assert_eq!(out.ditto_calls, 4);
         assert_eq!(out.errors, 6);
