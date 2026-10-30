@@ -27,5 +27,4 @@ caniclose: those always run.
   the verified `RENAME_SWAP` of a compressed copy, only `/usr/bin/ditto` (and `/bin/launchctl`
   from the launchd commands) is executed.
 - No new dependency beyond `serde`, `toml`, `globset` was added without the owner's approval.
-- Nothing committed mentions the untracked local files (CLAUDE.md, AGENTS.md, .claude/,
-  launchd/, local.mk).
+- Nothing committed mentions the untracked local files listed in `.git/info/exclude`.
