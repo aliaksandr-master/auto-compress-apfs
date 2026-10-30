@@ -191,10 +191,12 @@ auto-compress-apfs -h|--help | -V|--version
   that would do it: `Nothing changed. Run 'auto-compress-apfs compress --apply ...' to compress
   these N files (X GiB).` Roots that could not be read get a `not accessible (see ERROR above)`
   line, and with nothing else to compress the hint becomes `Fix access first`; roots refused by
-  the guard get their own `refused by the volume/protection guard (see WARN above)` line. It never
-  spawns ditto and never writes staging dirs, the cache, `state.tsv` or `quarantine.txt`; it may
-  create the config, the log dir and the log, and like every run it empties
-  `<log_dir>/launchd.log` once that file exceeds 1 MiB.
+  the guard get their own `refused by the volume/protection guard (see WARN above)` line. Without
+  progress (the default when stderr is not a terminal, or `--no-progress`) and without `-v` those
+  lines go only to the log, and the notes name the log file instead of `above`. It never spawns
+  ditto and never writes staging dirs, the cache, `state.tsv` or `quarantine.txt`; it may create
+  the config, the log dir and the log, and like every run it empties `<log_dir>/launchd.log` once
+  that file exceeds 1 MiB.
   `--dry-run` is kept as a hidden alias.
 - `compress --apply` does the work.
 - Without any pattern (empty `patterns` in the config and no `--search`) `compress` prints one

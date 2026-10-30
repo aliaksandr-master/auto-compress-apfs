@@ -1238,10 +1238,12 @@ fn run(
 
     let guard = walk::Guard::new(home, &cfg.allow_volumes, log)?;
     let matcher = walk::Matcher::new(&patterns, &exclude, scope.as_deref())?;
-    if args
+    let progress = args
         .progress
-        .unwrap_or_else(|| std::io::stderr().is_terminal())
-    {
+        .unwrap_or_else(|| std::io::stderr().is_terminal());
+    // Without progress or -v, ERROR/WARN lines go to the log file only.
+    let notes_in = (!progress && !args.verbose).then(|| log.path());
+    if progress {
         let width = std::env::var("COLUMNS")
             .ok()
             .and_then(|c| c.parse().ok())
@@ -1462,7 +1464,7 @@ fn run(
         }
         out
     } else {
-        print_preview(&todo, &preview_skips, home, args, preview_roots);
+        print_preview(&todo, &preview_skips, home, args, preview_roots, notes_in);
         Outcome::default()
     };
 
@@ -1552,14 +1554,16 @@ pub(crate) fn shell_quote(s: &str) -> String {
 
 /// Preview on stdout: every file that would be compressed with its size, the skipped files,
 /// totals with the biggest roots, and the command that would do it. `(inaccessible, refused)`
-/// walk roots get a note each before the totals ([`preview_notes`]); inaccessible ones also
-/// change the closing hint ([`preview_hint`]).
+/// walk roots get a note each before the totals ([`preview_notes`], pointing at `log` when the
+/// ERROR/WARN lines were not shown on stderr); inaccessible ones also change the closing hint
+/// ([`preview_hint`]).
 fn print_preview(
     todo: &[walk::Candidate],
     skips: &[PreviewSkip],
     home: &Path,
     args: &CompressArgs,
     (inaccessible, refused): (u64, u64),
+    log: Option<&Path>,
 ) {
     use std::io::Write;
     let mut out = std::io::stdout().lock();
@@ -1587,7 +1591,7 @@ fn print_preview(
     }
     let mut roots: Vec<_> = roots.into_iter().collect();
     roots.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
-    let _ = write!(out, "{}", preview_notes(inaccessible, refused));
+    let _ = write!(out, "{}", preview_notes(inaccessible, refused, log));
     let _ = writeln!(
         out,
         "\nwould compress: {} files, {} ({} skipped)",
@@ -1614,18 +1618,20 @@ fn print_preview(
 }
 
 /// Notes before the preview totals: roots that could not be read (an access problem, ERROR
-/// logged) and roots refused by the guard (by design, WARN logged), each on its own line.
-fn preview_notes(inaccessible: u64, refused: u64) -> String {
+/// logged) and roots refused by the guard (by design, WARN logged), each on its own line. The
+/// note says where those lines are: "above" on stderr, or in `log` when they went only there.
+fn preview_notes(inaccessible: u64, refused: u64, log: Option<&Path>) -> String {
+    let at = log.map_or_else(|| "above".to_owned(), |p| format!("in {}", p.display()));
     let mut s = String::new();
     if inaccessible > 0 {
         s += &format!(
-            "\n{inaccessible} root(s) not accessible (see ERROR above); files there are not \
+            "\n{inaccessible} root(s) not accessible (see ERROR {at}); files there are not \
              listed\n"
         );
     }
     if refused > 0 {
         s += &format!(
-            "\n{refused} root(s) refused by the volume/protection guard (see WARN above)\n"
+            "\n{refused} root(s) refused by the volume/protection guard (see WARN {at})\n"
         );
     }
     s
@@ -1733,16 +1739,20 @@ mod tests {
 
     #[test]
     fn preview_notes_keep_guard_refusals_apart() {
-        let refused = preview_notes(0, 1);
+        let refused = preview_notes(0, 1, None);
         assert!(refused.contains("1 root(s) refused by the volume/protection guard (see WARN"));
         assert!(!refused.contains("see ERROR"), "{refused}");
         assert!(!preview_hint(0, 0, 0, "").contains("Fix access"));
-        let both = preview_notes(2, 1);
+        let both = preview_notes(2, 1, None);
         assert!(
             both.contains("2 root(s) not accessible (see ERROR above)"),
             "{both}"
         );
-        assert!(preview_notes(0, 0).is_empty());
+        assert!(preview_notes(0, 0, None).is_empty());
+        let logged = preview_notes(1, 1, Some(Path::new("/l/acz.log")));
+        assert!(logged.contains("(see ERROR in /l/acz.log)"), "{logged}");
+        assert!(logged.contains("(see WARN in /l/acz.log)"), "{logged}");
+        assert!(!logged.contains("above"), "{logged}");
     }
 
     fn parse(args: &[&str]) -> Result<Cli, String> {

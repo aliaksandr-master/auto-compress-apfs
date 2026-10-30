@@ -271,6 +271,11 @@ impl Logger {
         PathBuf::from(s)
     }
 
+    /// The current log file.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     pub fn flush(&self) {
         let mut inner = self.lock();
         if let Err(e) = inner.out.flush() {
