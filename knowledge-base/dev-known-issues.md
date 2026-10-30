@@ -40,6 +40,10 @@ terminal in Full Disk Access (or `tccutil reset SystemPolicyDownloadsFolder com.
 and allow the prompt), then quit and reopen the terminal. The scheduled run needs Full Disk Access
 for the release binary separately. Hypothesis: a new ad-hoc signature after a rebuild may need the
 grant again.
+**Diag**: terminal runs and the scheduled run write to the same `auto-compress-apfs.log`, so the
+latest `no access` lines may come from a terminal run only. To judge the scheduled run, read the
+lines stamped at its start time (`grep 'T09:0'`): `compressed .../Downloads/...` there means the
+binary has access.
 
 ## Clones keep compression; uv venvs are clones
 
