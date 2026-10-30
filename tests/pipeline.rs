@@ -1298,3 +1298,34 @@ fn too_large_for_ditto_is_skipped_and_uncached() {
         env.log_text()
     );
 }
+
+#[test]
+fn too_small_file_keeps_its_state_row() {
+    let env = Env::new("small", "");
+    let venv = env.base.join("tree/Work_s/.venv");
+    fs::write(
+        &env.config,
+        fs::read_to_string(&env.config).unwrap()
+            + &format!("patterns = [\"{}\"]\nexclude = []\n", venv.display()),
+    )
+    .unwrap();
+    fs::create_dir_all(&venv).unwrap();
+    let file = venv.join("a.txt");
+    fs::write(&file, compressible("a")).unwrap();
+    let s = env.apply();
+    assert_eq!(s["compressed"], "1", "{s:?}");
+    assert!(
+        env.streak(&file).is_some(),
+        "no state row after compressing"
+    );
+
+    // Rewritten small in place: its parent is fully read, so the unrestricted run prunes.
+    fs::write(&file, "0123456789").unwrap();
+    let s = env.apply();
+    assert_eq!(s["too_small"], "1", "{s:?}");
+    assert!(
+        env.streak(&file).is_some(),
+        "{}",
+        fs::read_to_string(env.state()).unwrap()
+    );
+}
