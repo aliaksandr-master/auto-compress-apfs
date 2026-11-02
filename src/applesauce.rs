@@ -633,4 +633,99 @@ mod tests {
         assert!(born(&by_ditto) >= born(&src));
         fs::remove_dir_all(&dir).unwrap();
     }
+
+    /// Checks a compressed file against XNU's `decmpfs_disk_header` (LE magic `fpmc`, type,
+    /// uncompressed size) and, for a resource-fork type, its block table; returns the type.
+    fn check_decmpfs(path: &Path, content: &[u8]) -> u32 {
+        let what = path.display();
+        let m = fs::symlink_metadata(path).unwrap();
+        assert_ne!(m.st_flags() & UF_COMPRESSED, 0, "{what}");
+        assert_eq!(m.size(), content.len() as u64, "{what}");
+        let h = xattr(path, sys::DECMPFS).unwrap();
+        assert!(h.len() >= 16, "{what}");
+        let le32 = |b: &[u8], o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+        let be32 = |b: &[u8], o: usize| u32::from_be_bytes(b[o..o + 4].try_into().unwrap());
+        assert_eq!(le32(&h, 0), 0x636d_7066, "{what}: magic");
+        let kind = le32(&h, 4);
+        assert!([3, 4, 7, 8, 11, 12].contains(&kind), "{what}: type {kind}");
+        assert_eq!(
+            u64::from_le_bytes(h[8..16].try_into().unwrap()),
+            content.len() as u64,
+            "{what}"
+        );
+        let blocks = content.len().div_ceil(BLOCK_SIZE);
+        let fork = xattr(path, sys::RESOURCE_FORK);
+        match kind {
+            // Inline: the data follows the header, no resource fork.
+            3 | 7 | 11 => {
+                assert!(h.len() > 16, "{what}");
+                assert!(fork.is_none(), "{what}");
+            }
+            // zlib: a classic resource fork; at its data offset a BE length, then an LE
+            // count and (offset, size) pairs relative to the count.
+            4 => {
+                let fork = fork.unwrap();
+                let data = be32(&fork, 0) as usize;
+                let base = data + 4;
+                let n = le32(&fork, base) as usize;
+                assert_eq!(n, blocks, "{what}");
+                let mut prev = 0;
+                for k in 0..n {
+                    let (off, len) = (le32(&fork, base + 4 + 8 * k), le32(&fork, base + 8 + 8 * k));
+                    assert!(off as usize >= prev, "{what}: block {k}");
+                    assert!(
+                        base + (off + len) as usize <= fork.len(),
+                        "{what}: block {k}"
+                    );
+                    prev = (off + len) as usize;
+                }
+            }
+            // LZVN / LZFSE: n + 1 LE offsets from the start of the fork, the first right
+            // after the table, the last the fork's end.
+            _ => {
+                let fork = fork.unwrap();
+                let first = le32(&fork, 0) as usize;
+                assert_eq!(first % 4, 0, "{what}");
+                let n = first / 4 - 1;
+                assert_eq!(n, blocks, "{what}");
+                let offs: Vec<usize> = (0..=n).map(|k| le32(&fork, 4 * k) as usize).collect();
+                assert!(offs.windows(2).all(|w| w[0] < w[1]), "{what}: {offs:?}");
+                assert_eq!(offs[n], fork.len(), "{what}");
+            }
+        }
+        assert_eq!(fs::read(path).unwrap(), content, "{what}");
+        kind
+    }
+
+    #[test]
+    fn decmpfs_format_matches_xnu_for_ditto_and_applesauce() {
+        let dir = temp_dir("xnu");
+        let mut bufs = Buffers::default();
+        // ditto leaves files of 16384 bytes or less uncompressed: the small one is above that,
+        // but compresses into the xattr.
+        for (name, content) in [("big", mixed(1 << 20)), ("small", text(20_000))] {
+            let src = dir.join(name);
+            fs::write(&src, &content).unwrap();
+            let out = dir.join(format!("ditto-{name}"));
+            fs::create_dir(&out).unwrap();
+            let mut dest = out.clone().into_os_string();
+            dest.push("/");
+            let ditto = Command::new("/usr/bin/ditto")
+                .args(["--hfsCompression", "--noclone"])
+                .arg(&src)
+                .arg(&dest)
+                .status()
+                .unwrap();
+            assert!(ditto.success());
+            check_decmpfs(&out.join(name), &content);
+            let staging = dir.join(format!("s-{name}"));
+            fs::create_dir(&staging).unwrap();
+            let Staged::Copy(copy) = stage(&candidate(&src), &staging, &mut bufs).unwrap() else {
+                panic!("{name}: not staged");
+            };
+            let ours = check_decmpfs(&copy, &content);
+            assert_eq!(ours, if name == "big" { 12 } else { 11 }, "{name}");
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
 }
