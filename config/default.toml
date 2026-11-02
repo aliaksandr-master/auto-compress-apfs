@@ -150,8 +150,8 @@ run = false
 # for trash/purge apply. Nothing happens without `--apply` (`tm-exclude --apply`);
 # `run` as for [trash].
 # Install a binary that knows this section before adding it to an existing config: older
-# binaries reject unknown sections. An exclude containing `/` must be literal up to its last
-# component.
+# binaries reject unknown sections. An exclude may not lie inside a directory a pattern names
+# (`.../node_modules/keep` with `**/node_modules`): the exclusion covers it anyway.
 [tm_exclude]
 patterns = [
   # "~/Work_*/**/target",

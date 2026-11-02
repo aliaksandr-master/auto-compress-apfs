@@ -461,8 +461,9 @@ resolution), so `exclude = ["/private/var/**"]` does not exclude a walk started 
 - `[compress]`: only `run` (`true` by default), for the compress step of `run`.
 - `[dedup]`: `patterns` (empty by default), `exclude` (default `[".git", "target",
   "node_modules"]`), `min_size` (bytes, default 1048576, at least 1) and `run` (`false` by
-  default). A `[tm_exclude]` exclude containing `/` must be literal up to its last
-  component, since an exclusion covers everything inside a matched directory. Install a binary
+  default). A `[tm_exclude]` exclude may not lie inside a directory a pattern
+  names (`.../node_modules/keep` with `**/node_modules`), since an exclusion covers everything
+  inside a matched directory. Install a binary
   that knows `[tm_exclude]` before adding it to an existing config: older binaries reject the
   unknown section.
 

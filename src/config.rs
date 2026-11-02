@@ -498,16 +498,44 @@ impl Config {
         if self.dedup.min_size < 1 {
             return Err("[dedup] `min_size` must be >= 1".into());
         }
-        // An exclusion covers everything inside a matched directory, so an exclude can only
-        // keep a directory itself unexcluded: a wildcard above it would look like it protects
-        // entries deeper down that the exclusion still covers.
-        if let Some(e) = self.tm_exclude.exclude.iter().find(|e| {
-            e.rfind('/')
-                .is_some_and(|i| e[..i].contains(['*', '?', '[', '{']))
+        // An exclusion covers everything inside a matched directory, so an exclude below a
+        // directory a pattern names (`.../node_modules/keep`) would look like it protects
+        // entries the exclusion still covers. Caught by name: a literal last component of a
+        // pattern may not be a non-last component of an exclude (a trailing `/**` dropped from
+        // both, as the matcher does). A pattern `X/**` matches the children of `X`, so an
+        // exclude may still name a child itself. Known misses: a pattern whose last component
+        // is a glob.
+        let dir = |s: &str| {
+            let s = s.trim_end_matches('/');
+            match s.strip_suffix("/**").filter(|x| !x.is_empty()) {
+                Some(d) => (d.trim_end_matches('/').to_owned(), 1),
+                None => (s.to_owned(), 0),
+            }
+        };
+        let names: Vec<(String, usize)> = self
+            .tm_exclude
+            .patterns
+            .iter()
+            .filter_map(|p| {
+                let (d, extra) = dir(p);
+                Some((d.rsplit('/').next()?.to_owned(), extra))
+            })
+            .filter(|(n, _)| !n.is_empty() && !n.contains(['*', '?', '[', '{']))
+            .collect();
+        if let Some((e, n)) = self.tm_exclude.exclude.iter().find_map(|e| {
+            let d = dir(e).0;
+            let parts: Vec<&str> = d.split('/').collect();
+            let last = parts.len().checked_sub(1)?;
+            parts.iter().enumerate().find_map(|(i, c)| {
+                names
+                    .iter()
+                    .find(|(n, extra)| n == c && i + extra < last)
+                    .map(|(n, _)| (e, n.clone()))
+            })
         }) {
             return Err(format!(
-                "[tm_exclude] exclude `{e}`: a path exclude must be literal up to its last \
-                 component (an exclusion covers everything inside a matched directory)"
+                "[tm_exclude] exclude `{e}` lies inside a directory named `{n}`, which a pattern \
+                 may exclude (an exclusion covers everything inside a matched directory)"
             ));
         }
         if let Some(v) = self.allow_volumes.iter().find(|v| !v.starts_with('/')) {
@@ -819,24 +847,34 @@ mod tests {
         assert_eq!(cfg.tm_exclude.run, RunMode::On);
         let err = Config::parse("[tm_exclude]\npatterns = [\"rel/**\"]", &home()).unwrap_err();
         assert!(err.contains("[tm_exclude] pattern `rel/**`"), "{err}");
+        let pats = "patterns = [\"~/Work_*/**/node_modules\", \"~/Work_*/**/*.tmp\"]";
         for e in [
-            "~/Work_*/x/target",
-            "/a/**/b",
-            "/a/b?/c",
-            "/a/[bc]/d",
-            "/a/{b,c}/d",
+            "~/Work_*/**/node_modules/keep",
+            "/a/node_modules/b/c",
+            "**/node_modules/x",
+            "/a/node_modules/x/**",
         ] {
-            let text = format!("[tm_exclude]\nexclude = [\"{e}\"]");
+            let text = format!("[tm_exclude]\n{pats}\nexclude = [\"{e}\"]");
             let err = Config::parse(&text, &home()).unwrap_err();
-            assert!(
-                err.contains("must be literal up to its last component"),
-                "{err}"
-            );
+            assert!(err.contains("named `node_modules`"), "{err}");
         }
-        // `**/x` has a wildcard before its last `/`: rejected too.
-        assert!(Config::parse("[tm_exclude]\nexclude = [\"**/x\"]", &home()).is_err());
-        let ok = "[tm_exclude]\nexclude = [\"/a/b/*.tmp\", \"n*\"]";
-        assert!(Config::parse(ok, &home()).is_ok());
+        // A pattern ending in `/**` names the directory before it.
+        // A pattern ending in `/**` matches the children, so a child itself may be excluded.
+        let cache = |e: &str| {
+            let text = format!("[tm_exclude]\npatterns = [\"/a/cache/**\"]\nexclude = [\"{e}\"]");
+            Config::parse(&text, &home())
+        };
+        assert!(cache("/a/cache/sub/keep").is_err());
+        assert!(cache("/a/cache/keep").is_ok());
+        assert!(cache("/a/cache/keep/**").is_ok());
+        // Wildcards anywhere are fine when the exclude is not below a pattern's directory; a
+        // pattern whose last component is a glob names no directory to check against.
+        let ok = format!(
+            "[tm_exclude]\n{pats}\nexclude = [\"~/Work_*/**/*.fixtures\", \"/a/**/b\", \
+             \"**/x\", \"/a/b/*.tmp\", \"n*\", \"/a/node_modules\", \"/a/x.tmp/y\", \
+             \"/a/node_modules/**\", \"**/node_modules/**\"]"
+        );
+        assert!(Config::parse(&ok, &home()).is_ok());
     }
 
     #[test]
