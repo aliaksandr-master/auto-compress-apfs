@@ -117,3 +117,24 @@ dirs before matching them, and run `tm-exclude` without `--apply` first.
 error 4)` (2026-10-31) and skipped that whole subtree for the day.
 **Cause**: hypothesis: a signal interrupted the directory read; the walk does not retry on EINTR.
 **Real fix (TODO)**: retry the read on `ErrorKind::Interrupted`.
+
+## decmpfs facts behind `verify = "extended"`
+
+**Symptom**: none; these are measured facts (macOS 27.2, 2026-11-02) that the extended verify
+relies on, worth re-checking on a new macOS.
+**Cause / facts**:
+- `ditto --hfsCompression` writes only decmpfs type 8 (LZVN in the resource fork), never inline;
+  an incompressible block is stored raw with a `0x06` prefix. The applesauce backend writes type 11
+  (inline) or 12. applesauce-core with the `lzfse` + `lzvn` features decodes all of them
+  byte-identically to a kernel read.
+- `F_NOCACHE` does not help to read a compressed file cold: the pages land in the cache anyway.
+  Right after ditto no page of the copy is cached, so the plain compare already decodes it through
+  the kernel. To force a fresh decode later (post-swap check), `mmap` + `msync(MS_SYNC|MS_INVALIDATE)`
+  on a read-only mapping evicts the pages; the compressed flag stays.
+- `setxattr` of `com.apple.ResourceFork` on a `UF_COMPRESSED` file makes the kernel decompress
+  the file (flag cleared, data kept): stored data of a compressed file cannot be tampered with
+  from userspace, so tamper tests use files without the flag.
+- `F_FULLFSYNC` (std `sync_all` on macOS) costs ~4 ms per file, a plain `fsync` ~0.13 ms.
+**Action**: a new decmpfs type from a future ditto fails every file in extended mode; the startup
+probe reports it once ("ditto copies cannot be verified independently"); `verify = true` is the
+fallback until a decoder exists.
