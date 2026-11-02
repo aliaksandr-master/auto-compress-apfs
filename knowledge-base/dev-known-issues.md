@@ -138,3 +138,20 @@ relies on, worth re-checking on a new macOS.
 **Action**: a new decmpfs type from a future ditto fails every file in extended mode; the startup
 probe reports it once ("ditto copies cannot be verified independently"); `verify = true` is the
 fallback until a decoder exists.
+
+## `dedup`: freed space shows up only after snapshots go
+
+**Symptom**: `dedup --apply` reports `freed≈14.2 GiB`, but `df` barely moves.
+**Cause**: the replaced files' old blocks are still referenced by Time Machine local snapshots
+(fact, checked 2026-11-02: after the snapshots were deleted, used space dropped from 847G to 812G).
+Already-cloned files (equal `ATTR_CMNEXT_CLONEID`) are counted as `already_shared` and free nothing.
+**Action**: expect the space after the next snapshot expiry, or delete local snapshots by hand
+(`tmutil deletelocalsnapshots`, needs the owner). Spot-check a few deduped pairs with `cmp`.
+
+## A large `dedup --apply` can rotate its own log away
+
+**Symptom**: fewer `deduped` lines in the log than the summary counts.
+**Cause**: with `log_keep = 1` one big run outgrows the log size limit and the rotation drops the
+earliest lines (fact, observed 2026-11-02 on a run of 2578 replacements).
+**Action**: raise `log_keep` before a first large dedup run if the per-file lines matter; the
+`dedup_summary` line is always written last.
