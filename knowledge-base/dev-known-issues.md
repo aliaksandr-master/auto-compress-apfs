@@ -88,3 +88,32 @@ on behaviour the source no longer has; the binary under `target/debug` predates 
 **Cause**: hypothesis: the packaging build leaves a fingerprint that makes cargo treat the old
 binary as fresh. The stale binary itself was observed (2026-10-20).
 **Action**: `cargo clean -p auto-compress-apfs`, then `make test` again.
+
+## Time Machine sticky exclusion without tmutil
+
+**Symptom**: `tm-exclude` must exclude directories from Time Machine without executing anything
+but ditto; how the attribute behaves was unknown.
+**Facts** (verified 2026-11-02 on macOS 27): the sticky exclusion is the xattr
+`com.apple.metadata:com_apple_backup_excludeItem`, a 61-byte binary plist holding the string
+`com.apple.backupd` (what `tmutil addexclusion` writes). `fsetxattr` on a directory fd opened
+`O_RDONLY | O_NOFOLLOW | O_DIRECTORY` works; `XATTR_CREATE` makes a second write fail with
+`EEXIST` (so an existing exclusion is never replaced); `XATTR_NOFOLLOW` on an fd call fails with
+`EINVAL`. `tmutil isexcluded` reports a directory with the written value as `[Excluded]`.
+**Action**: undo by hand with `tmutil removeexclusion <path>`; the tool never removes one.
+
+## Not every gitignored directory is rebuildable
+
+**Symptom**: when choosing `[tm_exclude]` patterns, "ignored by git" looked like "safe to drop
+from backups".
+**Cause**: project scratch dirs such as `.var` hold build output next to local data (database
+backups, client reports, exports), and a name like `target` also occurs as a source directory
+(a crate's `src/target`, e2e fixtures, ESP-IDF examples).
+**Action**: check a `target` dir for `CACHEDIR.TAG` or `.rustc_info.json`, inspect `.var`-like
+dirs before matching them, and run `tm-exclude` without `--apply` first.
+
+## Reading a directory can fail with EINTR
+
+**Symptom**: one daily run logged `WARN cannot read dir ~/Downloads: Interrupted system call (os
+error 4)` (2026-10-31) and skipped that whole subtree for the day.
+**Cause**: hypothesis: a signal interrupted the directory read; the walk does not retry on EINTR.
+**Real fix (TODO)**: retry the read on `ErrorKind::Interrupted`.
