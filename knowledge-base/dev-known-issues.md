@@ -115,8 +115,10 @@ dirs before matching them, and run `tm-exclude` without `--apply` first.
 
 **Symptom**: one daily run logged `WARN cannot read dir ~/Downloads: Interrupted system call (os
 error 4)` (2026-10-31) and skipped that whole subtree for the day.
-**Cause**: hypothesis: a signal interrupted the directory read; the walk does not retry on EINTR.
-**Real fix (TODO)**: retry the read on `ErrorKind::Interrupted`.
+**Cause**: hypothesis: a signal interrupted the directory read; the walk did not retry on EINTR.
+**Fix**: `walk::read_retrying` reads the whole listing up front and starts over when the open or
+an entry read returns `Interrupted`, at most 3 attempts; only then is the directory logged as
+unreadable.
 
 ## decmpfs facts behind `verify = "extended"`
 

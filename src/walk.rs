@@ -663,8 +663,8 @@ impl Walker<'_> {
 
     /// Reads one directory, appending found candidates/stale dirs to `out` and subdirectories to `children`.
     fn visit(&self, job: &Job, out: &mut WalkResult, children: &mut Vec<Job>) {
-        let entries = match fs::read_dir(&job.dir) {
-            Ok(rd) => rd,
+        let entries = match read_retrying(|| fs::read_dir(&job.dir)) {
+            Ok(entries) => entries,
             Err(e) => {
                 self.read_error(job, &e, out);
                 return;
@@ -1209,9 +1209,109 @@ fn walk_with_fault(
     result
 }
 
+/// Attempts at reading one directory when a read is interrupted by a signal (EINTR).
+const READ_ATTEMPTS: u32 = 3;
+
+/// Reads a whole directory listing, starting over when the open or any entry read fails with
+/// `Interrupted` (at most [`READ_ATTEMPTS`] times), so a signal does not skip the directory.
+/// Any other entry error ends the listing as its last item, as an unbuffered read would.
+fn read_retrying<T, I>(mut open: impl FnMut() -> io::Result<I>) -> io::Result<Vec<io::Result<T>>>
+where
+    I: Iterator<Item = io::Result<T>>,
+{
+    let mut attempt = 1;
+    'read: loop {
+        let mut entries = Vec::new();
+        let it = match open() {
+            Ok(it) => it,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted && attempt < READ_ATTEMPTS => {
+                attempt += 1;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        for entry in it {
+            match entry {
+                Err(e) if e.kind() == io::ErrorKind::Interrupted && attempt < READ_ATTEMPTS => {
+                    attempt += 1;
+                    continue 'read;
+                }
+                Err(e) => {
+                    entries.push(Err(e));
+                    break;
+                }
+                ok => entries.push(ok),
+            }
+        }
+        return Ok(entries);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_retrying_starts_over_on_eintr() {
+        let eintr = || io::Error::from(io::ErrorKind::Interrupted);
+        // Interrupted mid-listing once, then a full read: only the full read is returned.
+        let mut calls = 0;
+        let r = read_retrying(|| {
+            calls += 1;
+            Ok(if calls == 1 {
+                vec![Ok(1), Err(eintr())]
+            } else {
+                vec![Ok(1), Ok(2)]
+            }
+            .into_iter())
+        })
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(
+            r.into_iter().map(Result::unwrap).collect::<Vec<_>>(),
+            [1, 2]
+        );
+        // An interrupted open is retried too.
+        let mut calls = 0;
+        let r = read_retrying(|| {
+            calls += 1;
+            if calls == 1 {
+                Err(eintr())
+            } else {
+                Ok(vec![Ok(7)].into_iter())
+            }
+        })
+        .unwrap();
+        assert_eq!((calls, r.len()), (2, 1));
+        // Never more than READ_ATTEMPTS reads; the last EINTR is the reported error.
+        let mut calls = 0;
+        let e = read_retrying(|| -> io::Result<std::vec::IntoIter<io::Result<u8>>> {
+            calls += 1;
+            Err(eintr())
+        })
+        .unwrap_err();
+        assert_eq!(
+            (calls, e.kind()),
+            (READ_ATTEMPTS, io::ErrorKind::Interrupted)
+        );
+        // An EINTR mid-listing on the last attempt ends the listing as an error item.
+        let mut calls = 0;
+        let r = read_retrying(|| {
+            calls += 1;
+            Ok(vec![Ok(1), Err(eintr())].into_iter())
+        })
+        .unwrap();
+        assert_eq!((calls, r.len()), (READ_ATTEMPTS, 2));
+        assert_eq!(
+            r[1].as_ref().unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        // Another error ends the listing, keeping what was read before it.
+        let r = read_retrying(|| Ok(vec![Ok(1), Err(io::Error::other("x")), Ok(3)].into_iter()))
+            .unwrap();
+        assert_eq!(r.len(), 2);
+        assert!(r[1].is_err());
+    }
 
     #[test]
     fn literal_prefix_split() {

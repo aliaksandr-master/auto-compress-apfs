@@ -91,6 +91,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- A directory whose read is interrupted by a signal (EINTR) is read again, up to 3 times,
+  instead of being skipped for the day with `cannot read dir ...: Interrupted system call`.
 - The release binary keeps its symbol table (`strip = false`): an endpoint security agent
   quarantined the stripped build right after it was linked.
 - macOS 27: ditto clones files by default there and a clone is never compressed, so
