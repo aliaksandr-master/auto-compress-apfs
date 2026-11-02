@@ -23,9 +23,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   later change of the ranges) drops the cache once. An applesauce file whose compressed
   resource fork would exceed 4 GiB is cached as incompressible.
   `--backend NAME` gives every file from the lowest `min_size` up to one backend for the run.
+- `verify = "extended"` (config, the new default): the compare before the swap also decodes the
+  copy's decmpfs data in-process (applesauce-core, now with LZVN too), independently of the
+  kernel; decmpfs types other than 7, 8, 11, 12 fail the file. After the swap the file at the
+  path is compared with the original once more (cached pages evicted); a mismatch swaps the
+  original back, or rescues the staging dir when that is not safe. With ditto in use the probe
+  must decode too. A run killed during that post-swap compare leaves a staging dir with
+  `.acz-keep`, kept by later runs like a rescue dir.
 
 ### Changed
 
+- `verify` takes `false`, `true` or `"extended"`; the default is `"extended"` (was `true`). An
+  existing `verify = true` (what `make config` wrote) keeps the plain compare; only a new
+  config or an edit gets `"extended"`.
 - License: GPL-3.0-or-later (was Apache-2.0), since the new applesauce backend links the
   GPL-3.0 `applesauce-core` crate.
 - The log line of a file no backend range covers: "outside every backend size range, skipped".

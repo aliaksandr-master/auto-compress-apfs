@@ -54,8 +54,11 @@ threads = 0
 # Maximum number of files per /usr/bin/ditto call.
 batch_size = 1000
 
-# Byte-compare the compressed copy with the original before replacing it.
-verify = true
+# How the compressed copy is checked: false = not compared (ditto only); true = its bytes as
+# the kernel decompresses them are compared with the original before the swap; "extended" =
+# also decodes its decmpfs data independently of the kernel and, after the swap, compares the
+# file at the path with the original once more (a mismatch swaps the original back).
+verify = "extended"
 
 # Files modified less than this many seconds ago are skipped (they may still be written to).
 min_age_secs = 300
@@ -75,7 +78,7 @@ log_keep = 1
 # --hfsCompression (the system's compressor); it leaves files of 16384 bytes or less and files
 # over 512 MiB (536870912) uncompressed, so a ditto range must lie inside 16385..536870912 to
 # be useful and may not go above 536870912. "applesauce" compresses in-process with LZFSE (the
-# applesauce-core decmpfs writer) and always byte-compares the copy, whatever `verify` says;
+# applesauce-core decmpfs writer) and always byte-compares the copy, even with verify = false;
 # a file whose compressed form would exceed 4 GiB is cached as incompressible. Files below the
 # lowest min_size are ignored; a file outside every range is skipped. Ranges must not overlap.
 # `--backend` forces one backend for a run. Changing the ranges re-checks the files cached as

@@ -8,10 +8,14 @@
 //! remembered for the rest of the run.
 
 use crate::applesauce::{self, PART_DIR, Staged};
+use crate::config::VerifyMode;
 use crate::logger::{Level, Logger};
 use crate::progress::{FileEvent, human};
 use crate::sys::{self, O_NOFOLLOW, UF_COMPRESSED};
 use crate::walk::{Candidate, FileKey, RESCUE_PREFIX, STAGING_PREFIX, is_stale_staging_name};
+use applesauce_core::compressor::{self as codec, Kind};
+use applesauce_core::reader::Reader;
+use applesauce_core::{BLOCK_SIZE, decmpfs};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, DirBuilder, File, FileTimes, Metadata};
 use std::io::{self, Read};
@@ -148,6 +152,21 @@ pub(crate) struct Buffers {
     a: Vec<u8>,
     b: Vec<u8>,
     applesauce: Option<applesauce::Buffers>,
+    decode: Decode,
+}
+
+/// Buffers of the independent decode of [`verify_extended`], allocated on first use.
+#[derive(Default)]
+struct Decode {
+    /// One verify chunk as decoded from the stored data.
+    chunk: Vec<u8>,
+    /// One decompressed block; one byte more than [`BLOCK_SIZE`] (the decompressor fails
+    /// when the output fills its buffer).
+    block: Vec<u8>,
+    /// One compressed block as stored.
+    compressed: Vec<u8>,
+    lzvn: Option<codec::Compressor>,
+    lzfse: Option<codec::Compressor>,
 }
 
 impl Buffers {
@@ -157,6 +176,17 @@ impl Buffers {
             self.b = vec![0; VERIFY_BUF];
         }
         (&mut self.a, &mut self.b)
+    }
+
+    /// The verify buffers plus the decode buffers.
+    fn get_extended(&mut self) -> (&mut [u8], &mut [u8], &mut Decode) {
+        self.get();
+        let d = &mut self.decode;
+        if d.chunk.is_empty() {
+            d.chunk = vec![0; VERIFY_BUF];
+            d.block = vec![0; BLOCK_SIZE + 1];
+        }
+        (&mut self.a, &mut self.b, d)
     }
 
     fn applesauce(&mut self) -> &mut applesauce::Buffers {
@@ -363,6 +393,34 @@ pub fn probe_applesauce(dir: &Path) -> Result<(), ProbeError> {
     Err(ProbeError::NoCompression(format!("applesauce: {why}")))
 }
 
+/// For `verify = "extended"`, after a passed [`probe`] in `dir`: the ditto copy of the probe
+/// must have a decmpfs type the independent decoder reads and decode to the probe source.
+pub fn probe_decode(dir: &Path) -> Result<(), ProbeError> {
+    let src = dir.join(PROBE_NAME);
+    let copy = dir.join(PROBE_OUT).join(PROBE_NAME);
+    let no = |e: String| ProbeError::NoCompression(format!("independent decode: {e}"));
+    let f = File::open(&copy).map_err(|e| no(format!("cannot open {}: {e}", copy.display())))?;
+    let header = sys::fget_xattr(&f, sys::DECMPFS, true)
+        .map_err(|e| no(format!("cannot read the decmpfs xattr: {e}")))?
+        .ok_or_else(|| no("the ditto copy has no decmpfs xattr".to_owned()))?;
+    let value = decmpfs::Value::from_data(&header).map_err(|e| no(e.to_string()))?;
+    let t = value.compression_type.raw_type();
+    if !DECODABLE_TYPES.contains(&t) {
+        return Err(no(format!(
+            "ditto writes decmpfs type {t}; set verify = true"
+        )));
+    }
+    let m = fs::symlink_metadata(&src)
+        .map_err(|e| ProbeError::Setup(format!("cannot stat {}: {e}", src.display())))?;
+    let c = Candidate::new(src.clone(), Arc::from(dir), &m);
+    match verify_extended(&c, &copy, &mut Buffers::default()) {
+        Ok(Verify::Same) => Ok(()),
+        Ok(Verify::Changed) => Err(no("the probe source changed".to_owned())),
+        Ok(Verify::Mismatch) => Err(no("the decoded copy differs from the source".to_owned())),
+        Err(e) => Err(no(e.to_string())),
+    }
+}
+
 /// Recreates the empty probe output dir `out`.
 fn reset_probe_out(out: &Path) -> Result<(), ProbeError> {
     match fs::remove_dir_all(out) {
@@ -499,6 +557,34 @@ pub(crate) enum Verify {
     Mismatch,
 }
 
+/// What a rescued staging dir holds, phrased around its path.
+type Preserved = fn(&str) -> String;
+
+const PRESERVED_PREVIOUS: Preserved =
+    |at| format!("the file that was at this path is preserved at {at}");
+const PRESERVED_COPY: Preserved = |at| {
+    format!(
+        "the compressed copy (not the original) is preserved at {at}; the original is at the path"
+    )
+};
+const PRESERVED_CHANGED: Preserved = |at| {
+    format!(
+        "the file that was at this path after the swap, possibly with newer writes, is preserved at {at}; the original is back at the path"
+    )
+};
+const PRESERVED_UNKNOWN: Preserved =
+    |at| format!("state unknown, nothing deleted: check both the path and {at}");
+
+/// Creates the [`KEEP_MARKER`] directory in `staging` (a directory, so it can never truncate
+/// or clobber a user file of that name); an existing marker directory is fine.
+fn mark_keep(staging: &Path) -> io::Result<()> {
+    match DirBuilder::new().create(staging.join(KEEP_MARKER)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists && has_keep_marker(staging) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 /// True when `dir` contains the rescue marker directory.
 fn has_keep_marker(dir: &Path) -> bool {
     fs::symlink_metadata(dir.join(KEEP_MARKER)).is_ok_and(|m| m.is_dir())
@@ -601,7 +687,7 @@ fn shared_staged(staging: &Path, files: &[&Candidate]) -> HashSet<usize> {
 
 pub struct Compressor<'a> {
     pub log: &'a Logger,
-    pub verify: bool,
+    pub verify: VerifyMode,
     pub batch_size: usize,
     pub threads: usize,
     /// Free bytes that must remain on the volume after a batch's data.
@@ -613,12 +699,15 @@ pub struct Compressor<'a> {
     /// Test seam: runs between an applesauce stage and its commit.
     #[cfg(test)]
     after_stage: Option<fn(&Candidate)>,
+    /// Test seam: replaces the post-swap compare of `verify = "extended"`; gets the path.
+    #[cfg(test)]
+    recheck: Option<fn(&Path) -> io::Result<Verify>>,
 }
 
 impl<'a> Compressor<'a> {
     pub fn new(
         log: &'a Logger,
-        verify: bool,
+        verify: VerifyMode,
         batch_size: usize,
         threads: usize,
         min_free_bytes: u64,
@@ -633,6 +722,8 @@ impl<'a> Compressor<'a> {
             unwritable: Mutex::new(HashSet::new()),
             #[cfg(test)]
             after_stage: None,
+            #[cfg(test)]
+            recheck: None,
         }
     }
 
@@ -1130,9 +1221,11 @@ impl<'a> Compressor<'a> {
     }
 
     /// Checks the staged copy made by `backend` against the original and swaps it in. The
-    /// byte compare runs when
-    /// `verify` is configured or `force_verify` is set (copy from a failed ditto call). `swap` is
-    /// [`sys::rename_swap`] in production; tests inject failures through it.
+    /// byte compare runs unless `verify = false` and `force_verify` is unset (`force_verify`:
+    /// an applesauce copy or a copy from a failed ditto call); with `verify = "extended"` it is
+    /// [`verify_extended`] (a ditto copy is `F_FULLFSYNC`ed first) and the swapped-in file is
+    /// compared again by [`Self::recheck_swapped`]. `swap` is [`sys::rename_swap`] in
+    /// production; tests inject failures through it.
     fn commit(
         &self,
         c: &Candidate,
@@ -1241,8 +1334,21 @@ impl<'a> Compressor<'a> {
             return Self::discard(staged, r);
         }
         // c. Byte compare against the very inode the walk saw.
-        if self.verify || force_verify {
-            match verify(c, staged, bufs) {
+        if self.verify != VerifyMode::Off || force_verify {
+            let extended = self.verify == VerifyMode::Extended;
+            let checked = if !extended {
+                verify(c, staged, bufs)
+            } else if matches!(backend, Backend::Ditto(_))
+                && let Err(e) = File::open(staged).and_then(|f| f.sync_all())
+            {
+                Err(io::Error::new(
+                    e.kind(),
+                    format!("cannot sync staged copy: {e}"),
+                ))
+            } else {
+                verify_extended(c, staged, bufs)
+            };
+            match checked {
                 Ok(Verify::Same) => {}
                 Ok(Verify::Changed) => return self.changed(c, staged),
                 Ok(Verify::Mismatch) => {
@@ -1289,8 +1395,18 @@ impl<'a> Compressor<'a> {
         if !swapped_out_ok {
             return match swap(staged, &c.path) {
                 Ok(()) => self.changed(c, staged),
-                Err(e) => self.rescue(c, staged, &e),
+                Err(e) => self.rescue(
+                    c,
+                    staged,
+                    &format!("changed during run and swap back failed ({e})"),
+                    PRESERVED_PREVIOUS,
+                ),
             };
+        }
+        if self.verify == VerifyMode::Extended
+            && let Some(r) = self.recheck_swapped(c, staged, &sm, bufs, swap)
+        {
+            return r;
         }
         if let Err(e) = fs::remove_file(staged) {
             self.log.warn(format_args!(
@@ -1316,20 +1432,168 @@ impl<'a> Compressor<'a> {
         }
     }
 
-    /// Swap-back failed: the file that was at the path now sits in staging. Mark the staging
-    /// dir with the [`KEEP_MARKER`] directory first (so stale cleanup never removes it), then move it to a
-    /// rescue dir that `compress` never cleans, walks or removes (only `clean --apply` deletes it).
-    fn rescue(&self, c: &Candidate, staged: &Path, err: &io::Error) -> Commit {
-        let staging = staged.parent().unwrap_or(Path::new("/"));
-        // A directory, so it can never truncate or clobber a user file of that name.
-        let marked = match DirBuilder::new().create(staging.join(KEEP_MARKER)) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists && has_keep_marker(staging) => {
-                Ok(())
-            }
-            Err(e) => Err(e),
+    /// `verify = "extended"`, right after the swap (the original now at `staged`): the file at
+    /// the path, opened once without following a symlink, must still be the swapped-in copy
+    /// (`sm`, walked size and mtime, compressed); with its cached pages evicted it is then
+    /// byte-compared with the original, under the [`KEEP_MARKER`] of the staging dir. `None`
+    /// = commit as usual: compare passed, or the path no longer holds the copy (the user wrote
+    /// after the swap: DEBUG line, no swap back). On a mismatch or error the original is
+    /// swapped back; when anything but the untouched copy then sits in staging, or the
+    /// swap back fails, the staging dir is rescued instead of removing anything.
+    fn recheck_swapped(
+        &self,
+        c: &Candidate,
+        staged: &Path,
+        sm: &Metadata,
+        bufs: &mut Buffers,
+        swap: &dyn Fn(&Path, &Path) -> io::Result<()>,
+    ) -> Option<Commit> {
+        let identity = |m: &Metadata| {
+            (
+                m.size(),
+                m.mtime(),
+                m.mtime_nsec(),
+                m.st_flags() & UF_COMPRESSED,
+            )
         };
-        if let Err(e) = marked {
+        let opened = File::options()
+            .read(true)
+            .custom_flags(O_NOFOLLOW)
+            .open(&c.path);
+        let (cur, seen) = match opened.and_then(|f| f.metadata().map(|m| (f, m))) {
+            Ok((f, m))
+                if m.is_file()
+                    && (m.dev(), m.ino()) == (c.key.dev, sm.ino())
+                    && identity(&m)
+                        == (c.size(), c.key.mtime_sec, c.key.mtime_nsec, UF_COMPRESSED) =>
+            {
+                (f, m)
+            }
+            other => {
+                let (level, why) = match other {
+                    Ok(_) => (Level::Debug, "no longer the swapped-in copy".to_owned()),
+                    Err(e) => {
+                        // NotFound, PermissionDenied, or ELOOP (a symlink now).
+                        let expected = matches!(
+                            e.kind(),
+                            io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+                        ) || e.raw_os_error() == Some(libc::ELOOP);
+                        let level = if expected { Level::Debug } else { Level::Warn };
+                        (level, format!("cannot be opened ({e})"))
+                    }
+                };
+                let line = format!(
+                    "{}: {why} right after the swap, not re-checked; the after-size is from the pre-swap stat",
+                    c.path.display()
+                );
+                if level == Level::Warn {
+                    self.log.warn(format_args!("{line}"));
+                } else {
+                    self.log.debug(format_args!("{line}"));
+                }
+                return None;
+            }
+        };
+        let staging = staged.parent().unwrap_or(Path::new("/"));
+        if let Err(e) = mark_keep(staging) {
+            self.log.warn(format_args!(
+                "cannot create {} in {}: {e}",
+                KEEP_MARKER,
+                staging.display()
+            ));
+        }
+        let compare = |bufs: &mut Buffers| -> io::Result<Verify> {
+            #[cfg(test)]
+            if let Some(seam) = self.recheck {
+                return seam(&c.path);
+            }
+            sys::evict_cached(&cur, c.size()).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("cannot evict cached pages of the copy: {e}"),
+                )
+            })?;
+            let orig = File::options()
+                .read(true)
+                .custom_flags(O_NOFOLLOW)
+                .open(staged)
+                .map_err(|e| {
+                    io::Error::new(e.kind(), format!("cannot reopen original in staging: {e}"))
+                })?;
+            if FileKey::of(&orig.metadata()?) != c.key {
+                return Ok(Verify::Changed);
+            }
+            let (a, b) = bufs.get();
+            same_bytes(&orig, &cur, a, b)
+        };
+        let checked = compare(bufs);
+        let what = match checked {
+            Ok(Verify::Same) => {
+                let _ = fs::remove_dir(staging.join(KEEP_MARKER));
+                return None;
+            }
+            Ok(Verify::Changed) => "original in staging changed".to_owned(),
+            Ok(Verify::Mismatch) => "file at the path differs from the original".to_owned(),
+            Err(e) => e.to_string(),
+        };
+        if let Err(e) = swap(staged, &c.path) {
+            return Some(self.rescue(
+                c,
+                staged,
+                &format!("verify failed after swap ({what}) and swap back failed ({e})"),
+                PRESERVED_PREVIOUS,
+            ));
+        }
+        // The copy must be back in staging untouched and the walked original at the path.
+        let restored = cur
+            .metadata()
+            .is_ok_and(|m| identity(&m) == identity(&seen))
+            && fs::symlink_metadata(staged).is_ok_and(|m| m.ino() == seen.ino())
+            && fs::symlink_metadata(&c.path).is_ok_and(|m| FileKey::of(&m) == c.key);
+        let original_back =
+            || fs::symlink_metadata(&c.path).is_ok_and(|m| FileKey::of(&m) == c.key);
+        if !restored {
+            return Some(self.rescue(
+                c,
+                staged,
+                &format!(
+                    "verify failed after swap ({what}) and the files changed before the swap back"
+                ),
+                if original_back() {
+                    PRESERVED_CHANGED
+                } else {
+                    PRESERVED_UNKNOWN
+                },
+            ));
+        }
+        if let Err(e) = fs::remove_file(staged) {
+            return Some(self.rescue(
+                c,
+                staged,
+                &format!("verify failed after swap ({what}) and the copy cannot be removed ({e})"),
+                if original_back() {
+                    PRESERVED_COPY
+                } else {
+                    PRESERVED_UNKNOWN
+                },
+            ));
+        }
+        let _ = fs::remove_dir(staging.join(KEEP_MARKER));
+        Some(self.fail(
+            c,
+            "verify",
+            format_args!("verify failed after swap: {what}; original restored"),
+        ))
+    }
+
+    /// The file that was at the path now sits in staging and must survive: mark the staging
+    /// dir with the [`KEEP_MARKER`] directory first (so stale cleanup never removes it), then
+    /// move it to a rescue dir that `compress` never cleans, walks or removes (only
+    /// `clean --apply` deletes it). `why` starts the ERROR line; `held` (a `PRESERVED_*`
+    /// text with `{}` for the place) says what sits in staging.
+    fn rescue(&self, c: &Candidate, staged: &Path, why: &str, held: Preserved) -> Commit {
+        let staging = staged.parent().unwrap_or(Path::new("/"));
+        if let Err(e) = mark_keep(staging) {
             self.log.error(format_args!(
                 "cannot create {} in {}: {e}",
                 KEEP_MARKER,
@@ -1343,10 +1607,7 @@ impl<'a> Compressor<'a> {
                 self.fail(
                     c,
                     "swap",
-                    format_args!(
-                        "changed during run and swap back failed ({err}); the file that was at this path is preserved at {}",
-                        rescue.join(base).display()
-                    ),
+                    format_args!("{why}; {}", held(&rescue.join(base).display().to_string())),
                 );
                 Commit::Rescued(rescue)
             }
@@ -1355,8 +1616,8 @@ impl<'a> Compressor<'a> {
                     c,
                     "swap",
                     format_args!(
-                        "changed during run and swap back failed ({err}); the file that was at this path is preserved at {} (cannot move it to {}: {e})",
-                        staged.display(),
+                        "{why}; {} (cannot move it to {}: {e})",
+                        held(&staged.display().to_string()),
                         rescue.display()
                     ),
                 );
@@ -1444,7 +1705,7 @@ fn xattr_diff(orig: &Path, key: &FileKey, staged: &Path) -> io::Result<XattrChec
 /// Opens the original once (no symlink follow), checks it is still the walked inode and
 /// byte-compares it with the staged copy.
 pub(crate) fn verify(c: &Candidate, staged: &Path, bufs: &mut Buffers) -> io::Result<Verify> {
-    let mut orig = match File::options()
+    let orig = match File::options()
         .read(true)
         .custom_flags(O_NOFOLLOW)
         .open(&c.path)
@@ -1457,11 +1718,16 @@ pub(crate) fn verify(c: &Candidate, staged: &Path, bufs: &mut Buffers) -> io::Re
     if !m.is_file() || FileKey::of(&m) != c.key {
         return Ok(Verify::Changed);
     }
-    let mut copy = File::open(staged)?;
+    let copy = File::open(staged)?;
     let (a, b) = bufs.get();
+    same_bytes(&orig, &copy, a, b)
+}
+
+/// Byte-compares `orig` and `copy` from their current offsets to EOF in chunks of `a.len()`.
+fn same_bytes(orig: &File, copy: &File, a: &mut [u8], b: &mut [u8]) -> io::Result<Verify> {
     loop {
-        let na = read_full(&mut orig, a)?;
-        let nb = read_full(&mut copy, b)?;
+        let na = read_full(orig, a)?;
+        let nb = read_full(copy, b)?;
         if na != nb || a[..na] != b[..nb] {
             return Ok(Verify::Mismatch);
         }
@@ -1469,6 +1735,164 @@ pub(crate) fn verify(c: &Candidate, staged: &Path, bufs: &mut Buffers) -> io::Re
             return Ok(Verify::Same);
         }
     }
+}
+
+/// decmpfs types the independent decoder reads: LZVN and LZFSE, inline or in the resource fork.
+const DECODABLE_TYPES: [u32; 4] = [7, 8, 11, 12];
+
+fn invalid(msg: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, msg)
+}
+
+/// The decmpfs data stored in a compressed copy, decoded block by block in-process
+/// (applesauce-core), without the kernel's decompression.
+struct StoredData<'f> {
+    reader: Reader<sys::RforkReader<'f>>,
+    kind: Kind,
+    /// Uncompressed size from the decmpfs header (checked equal to the original's).
+    size: u64,
+    /// Bytes decoded so far.
+    total: u64,
+    /// Valid bytes of the current block and how many of them were consumed.
+    block_len: usize,
+    block_pos: usize,
+}
+
+impl<'f> StoredData<'f> {
+    /// Reads and validates the decmpfs header of `copy`: a decodable type (else an error,
+    /// fail closed) and an uncompressed size of `size`.
+    fn open(copy: &'f File, size: u64) -> io::Result<Self> {
+        let header = sys::fget_xattr(copy, sys::DECMPFS, true)?
+            .ok_or_else(|| invalid("no decmpfs xattr".to_owned()))?;
+        let value = decmpfs::Value::from_data(&header)?;
+        let t = value.compression_type.raw_type();
+        if !DECODABLE_TYPES.contains(&t) {
+            return Err(invalid(format!(
+                "compression type {t} cannot be decoded independently"
+            )));
+        }
+        if value.uncompressed_size != size {
+            return Err(invalid(format!(
+                "decmpfs size {} differs from the file size {size}",
+                value.uncompressed_size
+            )));
+        }
+        // Inline data (types 7, 11) never touches the resource fork.
+        let rfork = if matches!(t, 7 | 11) {
+            sys::RforkReader::empty(copy)
+        } else {
+            sys::RforkReader::new(copy)?
+        };
+        let reader = Reader::new(&header, || rfork)?;
+        Ok(Self {
+            kind: reader.compression_kind(),
+            reader,
+            size,
+            total: 0,
+            block_len: 0,
+            block_pos: 0,
+        })
+    }
+
+    /// Decodes the next block into `d.block`; every block but the last must hold exactly
+    /// [`BLOCK_SIZE`] bytes. `false` once `size` bytes were decoded and no block is left.
+    fn next_block(&mut self, d: &mut Decode) -> io::Result<bool> {
+        if self.total == self.size {
+            if self.reader.remaining_blocks() != 0 {
+                return Err(invalid("stored data has blocks past its size".to_owned()));
+            }
+            return Ok(false);
+        }
+        d.compressed.clear();
+        if !self.reader.read_block_into(&mut d.compressed)? {
+            return Err(invalid(format!(
+                "stored data ends after {} of {} bytes",
+                self.total, self.size
+            )));
+        }
+        let slot = match self.kind {
+            Kind::Lzfse => &mut d.lzfse,
+            _ => &mut d.lzvn,
+        };
+        let comp = match slot {
+            Some(c) => c,
+            None => slot.insert(
+                self.kind
+                    .compressor()
+                    .ok_or_else(|| invalid(format!("no {} decoder built in", self.kind)))?,
+            ),
+        };
+        let n = comp.decompress(&mut d.block, &d.compressed)?;
+        let want = (self.size - self.total).min(BLOCK_SIZE as u64) as usize;
+        if n != want {
+            return Err(invalid(format!(
+                "block at {} decodes to {n} bytes, expected {want}",
+                self.total
+            )));
+        }
+        self.total += n as u64;
+        self.block_len = n;
+        self.block_pos = 0;
+        Ok(true)
+    }
+
+    /// Fills `out` with the next decoded bytes; fewer only at the end of the data.
+    fn read_into(&mut self, out: &mut [u8], d: &mut Decode) -> io::Result<usize> {
+        let mut n = 0;
+        while n < out.len() {
+            if self.block_pos == self.block_len && !self.next_block(d)? {
+                break;
+            }
+            let k = (out.len() - n).min(self.block_len - self.block_pos);
+            out[n..n + k].copy_from_slice(&d.block[self.block_pos..self.block_pos + k]);
+            self.block_pos += k;
+            n += k;
+        }
+        Ok(n)
+    }
+}
+
+/// [`verify`] plus an independent decode: in one pass, every chunk of the original must equal
+/// both the kernel's read of the copy and the copy's decmpfs data decoded in-process. Stored
+/// data that cannot be decoded (unknown type, bad block table, wrong block size) is an error.
+fn verify_extended(c: &Candidate, staged: &Path, bufs: &mut Buffers) -> io::Result<Verify> {
+    let orig = match File::options()
+        .read(true)
+        .custom_flags(O_NOFOLLOW)
+        .open(&c.path)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Verify::Changed),
+        Err(e) => return Err(e),
+    };
+    let m = orig.metadata()?;
+    if !m.is_file() || FileKey::of(&m) != c.key {
+        return Ok(Verify::Changed);
+    }
+    let copy = File::open(staged)?;
+    let mut stored = StoredData::open(&copy, c.size())?;
+    let (a, b, d) = bufs.get_extended();
+    let mut chunk = std::mem::take(&mut d.chunk);
+    let r = (|| loop {
+        let na = read_full(&orig, a)?;
+        let nb = read_full(&copy, b)?;
+        if na != nb || a[..na] != b[..nb] {
+            return Ok(Verify::Mismatch);
+        }
+        let nd = stored.read_into(&mut chunk[..na], d)?;
+        if nd != na || a[..na] != chunk[..nd] {
+            return Ok(Verify::Mismatch);
+        }
+        if na == 0 {
+            // The decoded data must end exactly here too.
+            return match stored.next_block(d)? {
+                false => Ok(Verify::Same),
+                true => Ok(Verify::Mismatch),
+            };
+        }
+    })();
+    d.chunk = chunk;
+    r
 }
 
 #[cfg(test)]
@@ -1620,7 +2044,7 @@ mod tests {
         }
 
         fn compressor(&self) -> Compressor<'_> {
-            Compressor::new(&self.log, true, 10, 1, 0)
+            Compressor::new(&self.log, VerifyMode::Compare, 10, 1, 0)
         }
 
         /// Replaces the original by a new inode with different content.
@@ -1806,7 +2230,7 @@ mod tests {
         assert!(run_ditto(ditto_args(), &[&src], &staging2, Duration::from_secs(120)).success());
         fs::rename(staging2.join("data.txt"), &f.staged).unwrap();
         let mut cmp = f.compressor();
-        cmp.verify = false;
+        cmp.verify = VerifyMode::Off;
         let r = cmp.commit(
             &f.cand,
             f.backend(),
@@ -1967,7 +2391,7 @@ mod tests {
         let log = Logger::open(&dir.join("log"), 1 << 20, 1, false).unwrap();
         let files = files_in(&dir, "a", 3);
         let before: Vec<u64> = files.iter().map(|c| c.key.ino).collect();
-        let out = Compressor::new(&log, true, 100, 2, u64::MAX / 2)
+        let out = Compressor::new(&log, VerifyMode::Compare, 100, 2, u64::MAX / 2)
             .run(files.clone(), Backend::Ditto(ditto_args()));
         assert_eq!((out.ditto_calls, out.compressed, out.errors), (0, 0, 0));
         assert_eq!(out.skipped_low_space, 3);
@@ -2064,7 +2488,8 @@ mod tests {
         let files = files_in(&dir, "a", 3);
         let content: Vec<Vec<u8>> = files.iter().map(|c| fs::read(&c.path).unwrap()).collect();
         // Verify off in the config: applesauce copies are byte-compared anyway.
-        let out = Compressor::new(&log, false, 100, 2, 0).run(files.clone(), Backend::Applesauce);
+        let out = Compressor::new(&log, VerifyMode::Off, 100, 2, 0)
+            .run(files.clone(), Backend::Applesauce);
         assert_eq!((out.compressed, out.errors, out.ditto_calls), (3, 0, 0));
         for (c, want) in files.iter().zip(&content) {
             let m = fs::symlink_metadata(&c.path).unwrap();
@@ -2126,7 +2551,7 @@ mod tests {
         let log = Logger::open(&dir.join("log"), 1 << 20, 1, false).unwrap();
         let files = files_in(&dir, "v", 1);
         let want = fs::read(&files[0].path).unwrap();
-        let mut comp = Compressor::new(&log, false, 100, 1, 0);
+        let mut comp = Compressor::new(&log, VerifyMode::Off, 100, 1, 0);
         // Same size and mtime, other bytes: only a byte compare can tell.
         comp.after_stage = Some(|c| {
             let mut data = fs::read(&c.path).unwrap();
@@ -2168,8 +2593,8 @@ mod tests {
         files.extend(files_in(&dir, "rw", 1));
         let ro = dir.join("root/ro");
         fs::set_permissions(&ro, fs::Permissions::from_mode(0o555)).unwrap();
-        let out =
-            Compressor::new(&log, true, 100, 1, 0).run(files.clone(), Backend::Ditto(ditto_args()));
+        let out = Compressor::new(&log, VerifyMode::Compare, 100, 1, 0)
+            .run(files.clone(), Backend::Ditto(ditto_args()));
         fs::set_permissions(&ro, fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(
             (out.ditto_calls, out.compressed, out.errors),
@@ -2210,7 +2635,7 @@ mod tests {
     }
 
     fn quiet(log: &Logger) -> Compressor<'_> {
-        Compressor::new(log, false, 100, 2, 0)
+        Compressor::new(log, VerifyMode::Off, 100, 2, 0)
     }
 
     #[test]
@@ -2289,6 +2714,451 @@ mod tests {
         for e in fs::read_dir(&root).unwrap() {
             fs::set_permissions(e.unwrap().path(), fs::Permissions::from_mode(0o644)).unwrap();
         }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Pseudo-random, incompressible bytes (xorshift).
+    fn noise(n: usize, mut x: u64) -> Vec<u8> {
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect()
+    }
+
+    /// An original `<dir>/root/<name>` with `data` and its ditto copy in `<dir>/copies/`.
+    fn original_and_copy(dir: &Path, name: &str, data: &[u8]) -> (Candidate, PathBuf) {
+        let root = dir.join("root");
+        let copies = dir.join("copies");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&copies).unwrap();
+        let path = root.join(name);
+        fs::write(&path, data).unwrap();
+        let m = fs::symlink_metadata(&path).unwrap();
+        let c = Candidate::new(path.clone(), Arc::from(root.as_path()), &m);
+        assert!(run_ditto(ditto_args(), &[&path], &copies, Duration::from_secs(120)).success());
+        (c, copies.join(name))
+    }
+
+    /// A plain (not UF_COMPRESSED) file with `data` in its data fork and the given decmpfs
+    /// xattr and resource fork: the kernel reads `data`, only the decoder sees the rest.
+    fn forged(path: &Path, data: &[u8], header: &[u8], rfork: &[u8]) {
+        let _ = fs::remove_file(path);
+        fs::write(path, data).unwrap();
+        let f = File::options().read(true).write(true).open(path).unwrap();
+        sys::fset_xattr(&f, sys::DECMPFS, header, 0).unwrap();
+        if !rfork.is_empty() {
+            std::io::Write::write_all(&mut sys::RforkWriter::new(&f), rfork).unwrap();
+        }
+        assert_eq!(flags(path) & UF_COMPRESSED, 0);
+    }
+
+    fn stored(copy: &Path) -> (Vec<u8>, Vec<u8>) {
+        let f = File::open(copy).unwrap();
+        let header = sys::fget_xattr(&f, sys::DECMPFS, true).unwrap().unwrap();
+        let rfork = sys::fget_xattr(&f, sys::RESOURCE_FORK, true)
+            .unwrap()
+            .unwrap_or_default();
+        (header, rfork)
+    }
+
+    fn extended(c: &Candidate, copy: &Path) -> io::Result<Verify> {
+        verify_extended(c, copy, &mut Buffers::default())
+    }
+
+    #[test]
+    fn extended_verify_decodes_ditto_copies_of_every_shape() {
+        let dir = temp_dir("ext-shapes");
+        let text = |n: usize| b"decode me independently\n".repeat(n / 24 + 1)[..n].to_vec();
+        let mut three = text(BLOCK_SIZE);
+        three.extend(noise(BLOCK_SIZE, 7)); // stored raw (0x06 prefix)
+        three.extend(text(1000));
+        let mut sparse = vec![0u8; 3 * BLOCK_SIZE + 5];
+        sparse[BLOCK_SIZE + 3..BLOCK_SIZE + 10].copy_from_slice(b"islands");
+        let shapes = [
+            ("a16385", text(16385)),
+            ("a65536", text(65536)),
+            ("a65537", text(65537)),
+            ("three", three),
+            ("big", text(VERIFY_BUF + 3 * BLOCK_SIZE + 17)),
+        ];
+        for (name, data) in &shapes {
+            let (c, copy) = original_and_copy(&dir, name, data);
+            assert_ne!(flags(&copy) & UF_COMPRESSED, 0, "{name}");
+            assert!(matches!(extended(&c, &copy), Ok(Verify::Same)), "{name}");
+        }
+        // Sparse source and a user xattr.
+        let root = dir.join("root");
+        let p = root.join("sparse");
+        let f = File::create(&p).unwrap();
+        f.set_len(sparse.len() as u64).unwrap();
+        std::os::unix::fs::FileExt::write_all_at(&f, b"islands", BLOCK_SIZE as u64 + 3).unwrap();
+        sys::fset_xattr(&f, c"user.acz", b"v", 0).unwrap();
+        drop(f);
+        let m = fs::symlink_metadata(&p).unwrap();
+        let c = Candidate::new(p.clone(), Arc::from(root.as_path()), &m);
+        let copies = dir.join("copies");
+        assert!(run_ditto(ditto_args(), &[&p], &copies, Duration::from_secs(120)).success());
+        assert_eq!(fs::read(&p).unwrap(), sparse);
+        assert!(matches!(
+            extended(&c, &copies.join("sparse")),
+            Ok(Verify::Same)
+        ));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn extended_verify_rejects_tampered_stored_data() {
+        let dir = temp_dir("ext-tamper");
+        let mut data = b"tamper with me\n".repeat(BLOCK_SIZE / 15 + 1)[..BLOCK_SIZE].to_vec();
+        data.extend(noise(BLOCK_SIZE, 3));
+        data.extend(b"tail".repeat(300));
+        let (c, copy) = original_and_copy(&dir, "data", &data);
+        let (header, rfork) = stored(&copy);
+        let forged_at = dir.join("forged");
+        let check = |header: &[u8], rfork: &[u8]| {
+            forged(&forged_at, &data, header, rfork);
+            extended(&c, &forged_at)
+        };
+        // The untouched stored data passes through a forged file too.
+        assert!(matches!(check(&header, &rfork), Ok(Verify::Same)));
+        // A flipped byte in the last (compressed) block.
+        let mut flip = rfork.clone();
+        let at = flip.len() - 10;
+        flip[at] ^= 0x55;
+        assert!(!matches!(check(&header, &flip), Ok(Verify::Same)));
+        // A flipped byte in the raw middle block: decodes, but to other bytes.
+        let mut raw = rfork.clone();
+        let mid = rfork.len() / 2;
+        raw[mid] ^= 0x01;
+        assert!(matches!(check(&header, &raw), Ok(Verify::Mismatch)));
+        for delta in [1i64, -1] {
+            let mut h = header.clone();
+            let size = (data.len() as i64 + delta) as u64;
+            h[8..16].copy_from_slice(&size.to_le_bytes());
+            assert!(check(&h, &rfork).is_err(), "size {delta:+}");
+        }
+        let mut zlib = header.clone();
+        zlib[4..8].copy_from_slice(&4u32.to_le_bytes());
+        let e = check(&zlib, &rfork).err().unwrap();
+        assert!(
+            e.to_string()
+                .contains("type 4 cannot be decoded independently"),
+            "{e}"
+        );
+        assert!(
+            check(&header, &rfork[..rfork.len() - 7]).is_err(),
+            "truncated"
+        );
+        let mut shifted = rfork.clone();
+        let first = u32::from_le_bytes(shifted[..4].try_into().unwrap()) + 1;
+        shifted[..4].copy_from_slice(&first.to_le_bytes());
+        assert!(check(&header, &shifted).is_err(), "shifted block table");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn extended_verify_rejects_tampered_inline_data() {
+        let dir = temp_dir("ext-inline");
+        let root = dir.join("root");
+        fs::create_dir(&root).unwrap();
+        let path = root.join("small.txt");
+        let data = b"inline\n".repeat(4000);
+        fs::write(&path, &data).unwrap();
+        let m = fs::symlink_metadata(&path).unwrap();
+        let c = Candidate::new(path.clone(), Arc::from(root.as_path()), &m);
+        let staging = Compressor::make_staging(&root, 0).unwrap();
+        let Ok(Staged::Copy(copy)) = applesauce::stage(&c, &staging, &mut Default::default())
+        else {
+            panic!("not staged")
+        };
+        let (header, rfork) = stored(&copy);
+        assert_eq!(u32::from_le_bytes(header[4..8].try_into().unwrap()), 11);
+        assert!(rfork.is_empty());
+        assert!(matches!(extended(&c, &copy), Ok(Verify::Same)));
+        let forged_at = dir.join("forged");
+        let mut flip = header.clone();
+        let at = flip.len() - 3;
+        flip[at] ^= 0x10;
+        forged(&forged_at, &data, &flip, &[]);
+        assert!(!matches!(extended(&c, &forged_at), Ok(Verify::Same)));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn extended_commit(
+        f: &Fixture,
+        cmp: &Compressor,
+        swap: &dyn Fn(&Path, &Path) -> io::Result<()>,
+    ) -> Commit {
+        cmp.commit(
+            &f.cand,
+            f.backend(),
+            &f.staged,
+            false,
+            &mut Buffers::default(),
+            swap,
+        )
+    }
+
+    fn extended_compressor(f: &Fixture) -> Compressor<'_> {
+        let mut cmp = f.compressor();
+        cmp.verify = VerifyMode::Extended;
+        cmp
+    }
+
+    const FIXTURE_TEXT: &str = "compress me please\n";
+
+    #[test]
+    fn extended_commit_of_ditto_and_applesauce_copies() {
+        let f = fixture("ext-ok");
+        let r = extended_commit(&f, &extended_compressor(&f), &sys::rename_swap);
+        assert!(matches!(r, Commit::Compressed { .. }), "{r:?}");
+        assert_eq!(
+            fs::read_to_string(&f.cand.path).unwrap(),
+            FIXTURE_TEXT.repeat(20_000)
+        );
+        assert!(!f.staged.parent().unwrap().join(KEEP_MARKER).exists());
+        fs::remove_dir_all(&f.dir).unwrap();
+
+        let dir = temp_dir("ext-applesauce");
+        let log = Logger::open(&dir.join("log"), 1 << 20, 1, false).unwrap();
+        let files = files_in(&dir, "a", 2);
+        let out =
+            Compressor::new(&log, VerifyMode::Extended, 100, 1, 0).run(files, Backend::Applesauce);
+        assert_eq!((out.compressed, out.errors), (2, 0));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn extended_verify_fails_a_differing_forced_copy() {
+        let f = fixture("ext-forced");
+        let other = f.dir.join("other");
+        fs::create_dir(&other).unwrap();
+        let src = other.join("data.txt");
+        fs::write(&src, "compress me PLEASE\n".repeat(20_000)).unwrap();
+        let staging2 = f.dir.join("staging2");
+        fs::create_dir(&staging2).unwrap();
+        assert!(run_ditto(ditto_args(), &[&src], &staging2, Duration::from_secs(120)).success());
+        fs::rename(staging2.join("data.txt"), &f.staged).unwrap();
+        let r = extended_commit(&f, &extended_compressor(&f), &sys::rename_swap);
+        assert_eq!(r, Commit::Failed);
+        assert_eq!(flags(&f.cand.path) & UF_COMPRESSED, 0);
+        assert_eq!(
+            fs::read_to_string(&f.cand.path).unwrap(),
+            FIXTURE_TEXT.repeat(20_000)
+        );
+        fs::remove_dir_all(&f.dir).unwrap();
+    }
+
+    #[test]
+    fn post_swap_mismatch_swaps_the_original_back() {
+        let f = fixture("ext-recheck");
+        let mut cmp = extended_compressor(&f);
+        // The keep marker protects the staging dir during the post-swap compare.
+        cmp.recheck = Some(|p| {
+            let marked = fs::read_dir(p.parent().unwrap())?.any(|e| {
+                e.is_ok_and(|e| {
+                    e.file_name().to_string_lossy().starts_with(STAGING_PREFIX)
+                        && has_keep_marker(&e.path())
+                })
+            });
+            Ok(if marked {
+                Verify::Mismatch
+            } else {
+                Verify::Same
+            })
+        });
+        let r = extended_commit(&f, &cmp, &sys::rename_swap);
+        assert_eq!(r, Commit::Failed);
+        assert!(!has_keep_marker(f.staged.parent().unwrap()));
+        let m = fs::symlink_metadata(&f.cand.path).unwrap();
+        assert_eq!(FileKey::of(&m), f.cand.key);
+        assert_eq!(m.ino(), f.cand.key.ino);
+        assert_eq!(m.st_flags() & UF_COMPRESSED, 0);
+        assert!(!f.staged.exists(), "copy left in staging");
+        f.log.flush();
+        let log = log_text(&f.dir);
+        assert!(
+            log.contains(" ERROR ") && log.contains("verify failed after swap"),
+            "{log}"
+        );
+        assert!(log.contains("original restored"), "{log}");
+        fs::remove_dir_all(&f.dir).unwrap();
+    }
+
+    #[test]
+    fn post_swap_mismatch_with_failed_swap_back_is_rescued() {
+        let f = fixture("ext-recheck-rescue");
+        let mut cmp = extended_compressor(&f);
+        cmp.recheck = Some(|_| Err(io::Error::other("injected")));
+        let calls = Cell::new(0);
+        let swap = |a: &Path, b: &Path| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                sys::rename_swap(a, b)
+            } else {
+                Err(io::Error::other("injected swap-back failure"))
+            }
+        };
+        let r = extended_commit(&f, &cmp, &swap);
+        let Commit::Rescued(rescue) = r else {
+            panic!("{r:?}")
+        };
+        assert!(rescue.join(KEEP_MARKER).exists());
+        // The original survives in the rescue dir, the verified-at-first copy is at the path.
+        let kept = fs::symlink_metadata(rescue.join("data.txt")).unwrap();
+        assert_eq!(FileKey::of(&kept), f.cand.key);
+        assert_eq!(
+            fs::read_to_string(&f.cand.path).unwrap(),
+            FIXTURE_TEXT.repeat(20_000)
+        );
+        fs::remove_dir_all(&f.dir).unwrap();
+    }
+
+    #[test]
+    fn post_swap_mismatch_after_a_user_write_is_rescued() {
+        let f = fixture("ext-recheck-write");
+        let mut cmp = extended_compressor(&f);
+        cmp.recheck = Some(|p| {
+            let mut w = File::options().append(true).open(p)?;
+            std::io::Write::write_all(&mut w, b"user")?;
+            Ok(Verify::Mismatch)
+        });
+        let r = extended_commit(&f, &cmp, &sys::rename_swap);
+        let Commit::Rescued(rescue) = r else {
+            panic!("{r:?}")
+        };
+        let m = fs::symlink_metadata(&f.cand.path).unwrap();
+        assert_eq!(FileKey::of(&m), f.cand.key);
+        let modified = fs::read(rescue.join("data.txt")).unwrap();
+        assert!(modified.ends_with(b"user"));
+        f.log.flush();
+        let log = log_text(&f.dir);
+        assert!(
+            log.contains("possibly with newer writes")
+                && !log.contains("the compressed copy (not the original)"),
+            "{log}"
+        );
+        fs::remove_dir_all(&f.dir).unwrap();
+    }
+
+    /// After the swap, changes the original (now at `a`) by `edit`, keeping its times.
+    fn swap_then_edit_original(
+        f: &Fixture,
+        edit: fn(&Path),
+    ) -> impl Fn(&Path, &Path) -> io::Result<()> + '_ {
+        move |a: &Path, b: &Path| {
+            sys::rename_swap(a, b)?;
+            if fs::symlink_metadata(a).is_ok_and(|m| m.ino() == f.cand.key.ino) {
+                edit(a);
+                let times = FileTimes::new()
+                    .set_accessed(system_time(f.cand.atime_sec, f.cand.atime_nsec))
+                    .set_modified(system_time(f.cand.key.mtime_sec, f.cand.key.mtime_nsec));
+                File::options()
+                    .write(true)
+                    .open(a)
+                    .unwrap()
+                    .set_times(times)
+                    .unwrap();
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn post_swap_real_compare_detects_a_changed_original() {
+        let f = fixture("ext-real-flip");
+        let swap = swap_then_edit_original(&f, |a| {
+            let mut data = fs::read(a).unwrap();
+            data[100] ^= 0x01;
+            fs::write(a, data).unwrap();
+        });
+        let r = extended_commit(&f, &extended_compressor(&f), &swap);
+        assert_eq!(r, Commit::Failed);
+        let m = fs::symlink_metadata(&f.cand.path).unwrap();
+        assert_eq!(m.ino(), f.cand.key.ino);
+        assert!(!f.staged.exists(), "copy left in staging");
+        f.log.flush();
+        let log = log_text(&f.dir);
+        assert!(
+            log.contains("verify failed after swap") && log.contains("original restored"),
+            "{log}"
+        );
+        fs::remove_dir_all(&f.dir).unwrap();
+    }
+
+    #[test]
+    fn post_swap_real_compare_detects_a_grown_original() {
+        let f = fixture("ext-real-grow");
+        let swap = swap_then_edit_original(&f, |a| {
+            let mut w = File::options().append(true).open(a).unwrap();
+            std::io::Write::write_all(&mut w, b"x").unwrap();
+        });
+        let r = extended_commit(&f, &extended_compressor(&f), &swap);
+        // A changed size is caught by the swapped-out check before the post-swap compare:
+        // swapped back and skipped.
+        assert_eq!(r, Commit::Skipped);
+        let m = fs::symlink_metadata(&f.cand.path).unwrap();
+        assert_eq!(m.ino(), f.cand.key.ino);
+        assert_eq!(m.st_flags() & UF_COMPRESSED, 0);
+        assert!(fs::read(&f.cand.path).unwrap().ends_with(b"x"));
+        fs::remove_dir_all(&f.dir).unwrap();
+    }
+
+    #[test]
+    fn write_right_after_the_swap_is_kept_without_swap_back() {
+        let f = fixture("ext-after-write");
+        let calls = Cell::new(0);
+        let swap = |a: &Path, b: &Path| {
+            calls.set(calls.get() + 1);
+            sys::rename_swap(a, b)?;
+            fs::write(b, "user wrote this").unwrap();
+            Ok(())
+        };
+        let r = extended_commit(&f, &extended_compressor(&f), &swap);
+        assert!(matches!(r, Commit::Compressed { .. }), "{r:?}");
+        assert_eq!(calls.get(), 1, "swapped back");
+        assert_eq!(fs::read_to_string(&f.cand.path).unwrap(), "user wrote this");
+        // The DEBUG line is not written by a non-verbose logger; the outcome is what counts.
+        fs::remove_dir_all(&f.dir).unwrap();
+    }
+
+    #[test]
+    fn symlink_right_after_the_swap_is_not_swapped_back() {
+        let f = fixture("ext-after-link");
+        let calls = Cell::new(0);
+        let target = f.dir.join("target");
+        let swap = |a: &Path, b: &Path| {
+            calls.set(calls.get() + 1);
+            sys::rename_swap(a, b)?;
+            fs::rename(b, &target).unwrap();
+            std::os::unix::fs::symlink(&target, b).unwrap();
+            Ok(())
+        };
+        let r = extended_commit(&f, &extended_compressor(&f), &swap);
+        assert!(matches!(r, Commit::Compressed { .. }), "{r:?}");
+        assert_eq!(calls.get(), 1, "swapped back");
+        assert!(fs::symlink_metadata(&f.cand.path).unwrap().is_symlink());
+        fs::remove_dir_all(&f.dir).unwrap();
+    }
+
+    #[test]
+    fn extended_probe_decodes_the_ditto_probe_copy() {
+        let dir = temp_dir("probe-decode");
+        probe(&dir).unwrap();
+        assert!(probe_content().len() > 12_000);
+        assert_eq!(probe_decode(&dir), Ok(()));
+        // A copy without decmpfs data gets its own error.
+        let copy = dir.join(PROBE_OUT).join(PROBE_NAME);
+        fs::remove_file(&copy).unwrap();
+        fs::write(&copy, probe_content()).unwrap();
+        let e = probe_decode(&dir).unwrap_err().to_string();
+        assert!(e.contains("the ditto copy has no decmpfs xattr"), "{e}");
+        fs::remove_file(&copy).unwrap();
+        assert!(probe_decode(&dir).is_err());
         fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -2,7 +2,7 @@
 
 use std::ffi::{CStr, CString, c_char, c_int, c_long, c_uint};
 use std::fs::File;
-use std::io::{self, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -358,6 +358,59 @@ pub fn fget_xattr(f: &File, name: &CStr, show_compression: bool) -> io::Result<O
     }
 }
 
+/// Reads the xattr `name` of `f` from byte `position` into `buf` with
+/// `XATTR_SHOWCOMPRESSION` (only the resource fork takes a non-zero position); returns the
+/// bytes read, 0 at or past the end of the value.
+pub fn fget_xattr_at(f: &File, name: &CStr, buf: &mut [u8], position: u32) -> io::Result<usize> {
+    // SAFETY: `buf` is a live allocation of `buf.len()` writable bytes, the fd is open for the
+    // lifetime of `f` and `name` is NUL-terminated; fgetxattr writes at most `buf.len()` bytes
+    // and retains no pointer.
+    let got = unsafe {
+        libc::fgetxattr(
+            f.as_raw_fd(),
+            name.as_ptr(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            position,
+            libc::XATTR_SHOWCOMPRESSION,
+        )
+    };
+    if got >= 0 {
+        return Ok(got as usize);
+    }
+    Err(io::Error::last_os_error())
+}
+
+/// Drops the cached pages of the first `len` bytes of `f`, so the next read decompresses
+/// from disk: a read-only shared mapping is `msync`ed with `MS_INVALIDATE`, then unmapped.
+/// A no-op for `len` 0.
+pub fn evict_cached(f: &File, len: u64) -> io::Result<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    let len = usize::try_from(len).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // SAFETY: a fresh read-only mapping of an fd open for the lifetime of `f`; the kernel
+    // picks the address, and nothing dereferences the mapping.
+    let addr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            f.as_raw_fd(),
+            0,
+        )
+    };
+    if addr == libc::MAP_FAILED {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `addr`/`len` are exactly the mapping created above, still mapped.
+    let synced = check(unsafe { libc::msync(addr, len, libc::MS_SYNC | libc::MS_INVALIDATE) });
+    // SAFETY: unmaps exactly the mapping created above; no reference into it exists.
+    let unmapped = check(unsafe { libc::munmap(addr, len) });
+    synced.and(unmapped)
+}
+
 /// Writes `value` into the xattr `name` of `f` at byte `position` (only the resource fork
 /// takes a non-zero position), with `XATTR_SHOWCOMPRESSION`.
 pub fn fset_xattr(f: &File, name: &CStr, value: &[u8], position: u32) -> io::Result<()> {
@@ -514,6 +567,93 @@ impl Seek for RforkWriter<'_> {
     }
 }
 
+/// The resource fork of a file as a seekable read stream, the counterpart of
+/// [`RforkWriter`]: reads are [`fget_xattr_at`] of [`RESOURCE_FORK`] refilling a 1 MiB
+/// buffer. The fork length is taken when created; positions beyond `u32::MAX` are errors.
+pub struct RforkReader<'a> {
+    file: &'a File,
+    pos: u64,
+    len: u64,
+    buf: Vec<u8>,
+    /// Fork offset of `buf[0]`; `buf_len` bytes of `buf` are valid.
+    buf_start: u64,
+    buf_len: usize,
+}
+
+const RFORK_READ_BUF: usize = 1 << 20;
+
+impl<'a> RforkReader<'a> {
+    /// A reader at position 0; an absent fork reads as empty.
+    pub fn new(file: &'a File) -> io::Result<Self> {
+        let len = fxattr_len(file, RESOURCE_FORK, true)?.unwrap_or(0) as u64;
+        Ok(Self {
+            file,
+            pos: 0,
+            len,
+            buf: vec![0; RFORK_READ_BUF],
+            buf_start: 0,
+            buf_len: 0,
+        })
+    }
+
+    /// A reader of no bytes that never calls into the kernel nor allocates its buffer: the
+    /// stand-in for data stored inline in the decmpfs xattr.
+    pub fn empty(file: &'a File) -> Self {
+        Self {
+            file,
+            pos: 0,
+            len: 0,
+            buf: Vec::new(),
+            buf_start: 0,
+            buf_len: 0,
+        }
+    }
+}
+
+impl Read for RforkReader<'_> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if self.pos >= self.len || out.is_empty() {
+            return Ok(0);
+        }
+        let in_buf = self.pos >= self.buf_start && self.pos < self.buf_start + self.buf_len as u64;
+        if !in_buf {
+            let at = u32::try_from(self.pos).map_err(|_| too_far())?;
+            let got = fget_xattr_at(self.file, RESOURCE_FORK, &mut self.buf, at)?;
+            self.buf_start = self.pos;
+            self.buf_len = got;
+            if got == 0 {
+                return Ok(0);
+            }
+        }
+        let at = (self.pos - self.buf_start) as usize;
+        let n = out.len().min(self.buf_len - at);
+        out[..n].copy_from_slice(&self.buf[at..at + n]);
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for RforkReader<'_> {
+    fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
+        let pos = match to {
+            SeekFrom::Start(p) => Some(p),
+            SeekFrom::Current(d) => self.pos.checked_add_signed(d),
+            SeekFrom::End(d) => self.len.checked_add_signed(d),
+        };
+        match pos {
+            Some(p) if p <= u64::from(u32::MAX) => {
+                self.pos = p;
+                Ok(p)
+            }
+            Some(_) => Err(too_far()),
+            None => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seek before the start of the resource fork",
+            )),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -631,6 +771,47 @@ mod tests {
         assert!(w.seek(SeekFrom::Start(u64::from(u32::MAX) + 1)).is_err());
         w.seek(SeekFrom::Start(u64::from(u32::MAX) - 1)).unwrap();
         assert!(w.write(b"xy").is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rfork_reader_seeks_and_ends() {
+        let dir = std::env::temp_dir().join(format!("acz-sys-rfork-r-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("f");
+        std::fs::write(&p, "").unwrap();
+        let f = File::options().read(true).write(true).open(&p).unwrap();
+        // Longer than the reader's buffer, so a refill is crossed.
+        let data: Vec<u8> = (0..RFORK_READ_BUF + 1000)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        RforkWriter::new(&f).write_all(&data).unwrap();
+        let mut r = RforkReader::new(&f).unwrap();
+        let mut all = Vec::new();
+        r.read_to_end(&mut all).unwrap();
+        assert_eq!(all, data);
+        let mut two = [0u8; 2];
+        r.seek(SeekFrom::Start(5)).unwrap();
+        r.read_exact(&mut two).unwrap();
+        assert_eq!(two, [5, 6]);
+        r.seek(SeekFrom::End(-1)).unwrap();
+        assert_eq!(r.read(&mut two).unwrap(), 1, "short read at the end");
+        assert_eq!(two[0], data[data.len() - 1]);
+        assert_eq!(r.read(&mut two).unwrap(), 0);
+        // fget_xattr_at at or past the fork end reads nothing.
+        let len = data.len() as u32;
+        assert_eq!(fget_xattr_at(&f, RESOURCE_FORK, &mut two, len).unwrap(), 0);
+        assert_eq!(
+            fget_xattr_at(&f, RESOURCE_FORK, &mut two, len + 10).unwrap(),
+            0
+        );
+        assert!(r.seek(SeekFrom::Start(u64::from(u32::MAX) + 1)).is_err());
+        assert!(r.seek(SeekFrom::Current(-(data.len() as i64) - 1)).is_err());
+        // test: n/a - eviction is not observable without mincore; only the calls succeed.
+        evict_cached(&f, 0).unwrap();
+        std::fs::write(&p, &data).unwrap();
+        evict_cached(&f, data.len() as u64).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

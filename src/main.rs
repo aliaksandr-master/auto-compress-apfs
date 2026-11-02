@@ -1355,7 +1355,7 @@ fn run(
     for b in [config::Backend::Ditto, config::Backend::Applesauce] {
         if routing.iter().any(|r| r.backend == b) {
             let ready = if apply {
-                probe_backend(config_path, home, log, b)?
+                probe_backend(config_path, home, log, b, cfg.verify)?
             } else {
                 Backend::Ditto(&[])
             };
@@ -1731,12 +1731,15 @@ fn run(
 
 /// The backend ready to compress here: for ditto the options that compress, for applesauce a
 /// passed self-probe. Probed next to the config, or in the state dir when the probe files
-/// cannot be written there (or it is not on APFS). `Err` when the backend does not compress.
+/// cannot be written there (or it is not on APFS). With `verify = "extended"` the ditto
+/// probe copy must also decode independently ([`compress::probe_decode`]). `Err` when the
+/// backend does not compress (or cannot be verified that way).
 fn probe_backend(
     config_path: &Path,
     home: &Path,
     log: &Logger,
     backend: config::Backend,
+    verify: config::VerifyMode,
 ) -> Result<Backend, String> {
     type Probe = fn(&Path) -> Result<Backend, ProbeError>;
     let (name, probe): (&str, Probe) = match backend {
@@ -1754,6 +1757,15 @@ fn probe_backend(
         r = fs::create_dir_all(&dir)
             .map_err(|e| ProbeError::Setup(format!("cannot create {}: {e}", dir.display())))
             .and_then(|()| probe(&dir));
+    }
+    if verify == config::VerifyMode::Extended
+        && let Ok(Backend::Ditto(_)) = r
+        && let Err(e) = compress::probe_decode(&dir)
+    {
+        return Err(format!(
+            "ditto copies cannot be verified independently, nothing was changed (probe in {}: {e})",
+            dir.display()
+        ));
     }
     match r {
         Ok(Backend::Ditto(args)) => {

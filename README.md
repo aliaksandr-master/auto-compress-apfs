@@ -154,9 +154,21 @@ holds the lock exits 0 at once.
      uncompressed copy from a successful ditto call means the data is incompressible and is
      remembered in the cache (from a failed call the file is retried alone first);
    - with `verify = true` the original (opened once, `O_NOFOLLOW`, inode re-checked) and the copy
-     are byte-compared;
+     are byte-compared; with `verify = "extended"` (the default) in the same pass the copy's
+     decmpfs data (types 7, 8, 11, 12) is also decoded in-process by applesauce-core,
+     independently of the kernel, and must match too (a ditto copy is `F_FULLFSYNC`ed first;
+     stored data of another type, a bad block table or a wrong block size fails the file);
+     `verify = false` skips the compare of ditto copies. An existing `verify = true` (what
+     `make config` wrote so far) keeps the plain compare; only a new config or an edit gets
+     `"extended"`;
    - `renamex_np(RENAME_SWAP)` atomically exchanges copy and original; the swapped-out file must
      still be the expected version, otherwise the swap is reversed and the file skipped;
+   - with `verify = "extended"` the path is then opened once more (`O_NOFOLLOW`): if it is still
+     the swapped-in copy (inode, size, mtime, compressed), its cached pages are evicted and it is
+     byte-compared with the original still in staging (protected by `.acz-keep` meanwhile). A
+     mismatch swaps the original back (ERROR verify); if the copy changed in that window or the
+     swap back fails, the staging dir is rescued instead. A path that no longer holds the copy
+     (the user wrote to it right after the swap) is left as is;
      only then the old original is unlinked.
 
    If ditto fails for a batch, every staged copy that passes all checks is still committed (always
@@ -502,7 +514,8 @@ quarantine after three run days.
   compressed when an applesauce range covers them. A file whose compressed resource fork would
   exceed 4 GiB is cached as incompressible.
 - **Verify cost.** With `verify = true` every file is read twice (original and copy), so a 1.5 GiB
-  dump costs 3 GiB of reads.
+  dump costs 3 GiB of reads; `"extended"` adds the in-process decode of the copy and, after the
+  swap, one more read of the original and of the copy (decompressed from disk again).
 - **Side effects of the swap** (new inode): Time Machine backs the swapped files up once more and
   Spotlight reindexes them. Hypothesis, not verified: the `com.apple.macl` attribute may not
   survive the copy, so per-file app grants on files in `~/Downloads` may be lost.

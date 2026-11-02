@@ -34,7 +34,8 @@ pub struct Config {
     pub one_file_system: bool,
     pub threads: usize,
     pub batch_size: usize,
-    pub verify: bool,
+    /// How a compressed copy is checked before (and after) it replaces the original.
+    pub verify: VerifyMode,
     /// Old single-backend form: how compressed copies are made. Not allowed together with
     /// `backend_by_size`.
     pub backend: Option<Backend>,
@@ -58,6 +59,48 @@ pub struct Config {
     pub purge: Rule,
     /// `tm-exclude`: matched directories get the Time Machine exclusion attribute.
     pub tm_exclude: Rule,
+}
+
+/// `verify`: `false`, `true` or `"extended"`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum VerifyMode {
+    /// `false`: no compare of a ditto copy (an applesauce copy is still compared).
+    Off,
+    /// `true`: the copy's kernel-decompressed bytes are compared with the original.
+    Compare,
+    /// `"extended"`: the compare also decodes the copy's decmpfs data independently of the
+    /// kernel, and after the swap the file at the path is compared with the original again.
+    #[default]
+    Extended,
+}
+
+impl<'de> Deserialize<'de> for VerifyMode {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = VerifyMode;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str(r#"true, false or "extended""#)
+            }
+            fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<VerifyMode, E> {
+                Ok(if v {
+                    VerifyMode::Compare
+                } else {
+                    VerifyMode::Off
+                })
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<VerifyMode, E> {
+                match v {
+                    "extended" => Ok(VerifyMode::Extended),
+                    _ => Err(E::invalid_value(serde::de::Unexpected::Str(v), &self)),
+                }
+            }
+            fn visit_string<E: serde::de::Error>(self, v: String) -> Result<VerifyMode, E> {
+                self.visit_str(&v)
+            }
+        }
+        d.deserialize_any(Visitor)
+    }
 }
 
 /// The compressor that writes the staged copies.
@@ -217,7 +260,7 @@ impl Default for Config {
             one_file_system: true,
             threads: 0,
             batch_size: 1000,
-            verify: true,
+            verify: VerifyMode::default(),
             backend: None,
             min_size: None,
             backend_by_size: None,
@@ -468,8 +511,28 @@ mod tests {
         // A user value is honoured as written, not clamped to the default.
         let one = Config::parse("min_size = 1", &home()).unwrap();
         assert_eq!(one.routing[0], range(Backend::Ditto, 1, Some(MAX_SIZE)));
-        assert!(parsed.verify && parsed.one_file_system);
+        assert_eq!(parsed.verify, VerifyMode::Extended);
+        assert!(parsed.one_file_system);
         assert_eq!((parsed.backend, parsed.min_size), (None, None));
+    }
+
+    #[test]
+    fn verify_parses_bool_or_extended() {
+        let parse = |t: &str| Config::parse(t, &home()).map(|c| c.verify);
+        assert_eq!(parse("verify = false").unwrap(), VerifyMode::Off);
+        assert_eq!(parse("verify = true").unwrap(), VerifyMode::Compare);
+        assert_eq!(
+            parse("verify = \"extended\"").unwrap(),
+            VerifyMode::Extended
+        );
+        assert_eq!(parse("").unwrap(), VerifyMode::Extended);
+        for bad in ["verify = \"Extended\"", "verify = \"true\"", "verify = 1"] {
+            let err = parse(bad).unwrap_err();
+            assert!(
+                err.contains(r#"expected true, false or "extended""#),
+                "{bad}: {err}"
+            );
+        }
     }
 
     fn range(backend: Backend, min_size: u64, max_size: Option<u64>) -> SizeRange {
