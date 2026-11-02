@@ -1055,4 +1055,54 @@ mod tests {
         assert!(staging_in(&dir).is_empty());
         fs::remove_dir_all(&dir).unwrap();
     }
+
+    #[test]
+    fn failed_swap_back_keeps_the_original_in_a_rescue_dir() {
+        let (dir, r, t) = pair("swap-back-fails");
+        let calls = std::cell::Cell::new(0);
+        let swap = |a: &Path, b: &Path| {
+            calls.set(calls.get() + 1);
+            if calls.get() > 1 {
+                return Err(io::Error::other("injected swap-back failure"));
+            }
+            sys::rename_swap(a, b)?;
+            // A write through an fd of the old file, now in staging: the recheck swaps back.
+            let f = File::options().append(true).open(a).unwrap();
+            std::io::Write::write_all(&mut &f, b"x").unwrap();
+            Ok(())
+        };
+        let mut bufs = (vec![0u8; BUF], vec![0u8; BUF]);
+        let why = match replace(&r, &t, &mut bufs, &swap) {
+            Err(Miss::Kept(why)) => why,
+            _ => panic!("not kept"),
+        };
+        assert_eq!(calls.get(), 2);
+        assert!(why.contains("the swap back failed"), "{why}");
+        let mut expected = vec![5u8; 300_000];
+        expected.push(b'x');
+        // The rescue dir holds the original (with its write), under the keep marker.
+        let left = staging_in(&dir);
+        assert_eq!(left.len(), 1, "{left:?}");
+        let rescue = &left[0];
+        let name = rescue.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with(RESCUE_PREFIX), "{name}");
+        assert!(crate::compress::has_keep_marker(rescue));
+        let kept = rescue.join("t");
+        assert!(why.ends_with(&kept.display().to_string()), "{why}");
+        assert_eq!(fs::symlink_metadata(&kept).unwrap().ino(), t.c.key.ino);
+        assert_eq!(fs::read(&kept).unwrap(), expected);
+        // The path keeps what the swap put there: the clone, unchanged.
+        let at = fs::symlink_metadata(&t.c.path).unwrap();
+        assert_ne!(at.ino(), t.c.key.ino);
+        assert_eq!(fs::read(&t.c.path).unwrap(), vec![5u8; 300_000]);
+        assert_eq!(
+            (at.mtime(), at.mtime_nsec()),
+            (t.c.key.mtime_sec, t.c.key.mtime_nsec)
+        );
+        // The reference is untouched.
+        let rm = fs::symlink_metadata(&r.c.path).unwrap();
+        assert!(unchanged(&r, &rm));
+        assert_eq!(fs::read(&r.c.path).unwrap(), vec![5u8; 300_000]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
 }
