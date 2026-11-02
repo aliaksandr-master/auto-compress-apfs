@@ -7,6 +7,7 @@ mod classify;
 mod clean;
 mod compress;
 mod config;
+mod dedup;
 mod launchd;
 mod logger;
 mod progress;
@@ -51,6 +52,7 @@ Usage:
   auto-compress-apfs trash [--apply] [--config PATH]
   auto-compress-apfs purge [--apply] [--config PATH]
   auto-compress-apfs tm-exclude [--apply] [--config PATH]
+  auto-compress-apfs dedup [--apply] [--config PATH] [-v]
   auto-compress-apfs run [--apply] [--config PATH]
   auto-compress-apfs stat [--top N] [--all] [--config PATH]
   auto-compress-apfs quarantine list [--config PATH]
@@ -94,8 +96,10 @@ written to <log_dir>/removed.tsv. Protected locations and the tool's own dirs ar
 tm-exclude: directories matched by the [tm_exclude] patterns are listed; with --apply excluded
 from Time Machine (the sticky attribute `tmutil addexclusion` sets; tmutil is not run). An
 existing exclusion is never removed or changed.
-run: trash and purge when their rule has `scheduled = true`, then compress, then tm-exclude
-when scheduled (what launchd runs).
+dedup: identical files below the [dedup] patterns are listed by group; with --apply each
+duplicate whose metadata equals the kept file's is replaced by an APFS clone of it.
+run: trash, purge, compress, dedup, tm-exclude, each as its section's `run` says (true, false
+or dry-run-only; compress is on by default, the others off); what launchd runs.
 
 install-launchd: writes run.sh next to the config and a per-user launchd agent that starts it
 at login and daily at 09:00; run.sh runs `run --apply` once a day from 09:00 on (a missed
@@ -136,6 +140,13 @@ struct CleanArgs {
     apply: bool,
 }
 
+/// Options of `dedup`.
+#[derive(Debug)]
+struct DedupArgs {
+    clean: CleanArgs,
+    verbose: bool,
+}
+
 #[derive(Debug)]
 enum QuarantineCmd {
     List,
@@ -159,6 +170,7 @@ enum Cli {
     Remove(CleanArgs, remove::Action),
     /// `tm-exclude` (same options as `clean`).
     TmExclude(CleanArgs),
+    Dedup(DedupArgs),
     /// `run`: the configured steps in order, as the launchd agent starts them.
     Run(CleanArgs),
     Quarantine {
@@ -331,6 +343,30 @@ fn parse_clean(mut it: impl Iterator<Item = String>) -> Result<Cli, String> {
     Ok(Cli::Clean(a))
 }
 
+fn parse_dedup(mut it: impl Iterator<Item = String>) -> Result<Cli, String> {
+    let mut a = DedupArgs {
+        clean: CleanArgs {
+            config: None,
+            apply: false,
+        },
+        verbose: false,
+    };
+    while let Some(arg) = it.next() {
+        if let Some(exit) = help_or_version(&arg) {
+            return Ok(exit);
+        }
+        if config_opt(&arg, &mut it, &mut a.clean.config)? {
+            continue;
+        }
+        match arg.as_str() {
+            "--apply" => a.clean.apply = true,
+            "-v" | "--verbose" => a.verbose = true,
+            other => return Err(format!("unknown argument `{other}`")),
+        }
+    }
+    Ok(Cli::Dedup(a))
+}
+
 fn parse_quarantine(mut it: impl Iterator<Item = String>) -> Result<Cli, String> {
     let mut config = None;
     let mut words = Vec::new();
@@ -395,6 +431,7 @@ fn parse_args(it: impl Iterator<Item = String>) -> Result<Cli, String> {
         }
         Some("compress") => parse_compress(it.skip(1)),
         Some("stat") => parse_stat(it.skip(1)),
+        Some("dedup") => parse_dedup(it.skip(1)),
         Some("clean") => parse_clean(it.skip(1)),
         Some("quarantine") => parse_quarantine(it.skip(1)),
         Some("install-launchd") => parse_launchd(it.skip(1), LaunchdCmd::Install),
@@ -424,6 +461,7 @@ fn main() -> ExitCode {
         Cli::Clean(args) => return cmd_clean(&args, &home),
         Cli::Remove(args, action) => return cmd_remove(&args, action, &home),
         Cli::TmExclude(args) => return cmd_tm_exclude(&args, &home),
+        Cli::Dedup(args) => return cmd_dedup(&args, &home),
         Cli::Run(args) => return cmd_run(&args, &home),
         Cli::Quarantine { config, cmd } => cmd_quarantine(config, &cmd, &home),
         Cli::Launchd { config, cmd } => cmd_launchd(config, cmd, &home),
@@ -1073,8 +1111,147 @@ fn run_tm_exclude(
     })
 }
 
-/// `run`: `trash` and `purge` when their rule is `scheduled`, then `compress`, each with the
-/// same `--apply` and `--config`, then `tm-exclude` when scheduled. Exit 1 when any step failed.
+/// `dedup`: preview by default; with `--apply` under the run lock. Exit 1 when the config
+/// cannot be loaded, the log cannot be opened, the lock is busy, or a replacement failed.
+fn cmd_dedup(args: &DedupArgs, home: &Path) -> ExitCode {
+    let config_path = config_path(args.clean.config.as_ref(), home);
+    let (cfg, created) = match Config::load_or_create(&config_path, home) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{NAME}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if created {
+        println!("created {}", config_path.display());
+    }
+    if cfg.dedup.patterns.is_empty() {
+        println!("no [dedup] patterns: add them to {}", config_path.display());
+        return ExitCode::SUCCESS;
+    }
+    let log_dir = cfg.log_dir();
+    let log = match Logger::open(&log_dir, cfg.log_max_bytes, cfg.log_keep, args.verbose) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("{NAME}: cannot open log in {}: {e}", log_dir.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let code = match run_dedup(&args.clean, &cfg, &config_path, home, &log) {
+        Ok(code) => code,
+        Err(e) => {
+            log.error(&e);
+            if !args.verbose {
+                eprintln!("{NAME}: {e}");
+            }
+            ExitCode::FAILURE
+        }
+    };
+    log.flush();
+    code
+}
+
+fn run_dedup(
+    args: &CleanArgs,
+    cfg: &Config,
+    config_path: &Path,
+    home: &Path,
+    log: &Logger,
+) -> Result<ExitCode, String> {
+    log.info(format_args!(
+        "start {NAME} {VERSION} dedup config={} dry_run={}",
+        config_path.display(),
+        !args.apply
+    ));
+    // Hashing and comparing read file data: a dataless file must never be downloaded.
+    if let Err(e) = sys::disable_dataless_materialization() {
+        log.warn(format_args!(
+            "cannot turn off materialization of dataless files: {e}"
+        ));
+    }
+    let _lock = if args.apply {
+        match acquire_lock(&state_dir(home))? {
+            Some(f) => Some(f),
+            None => {
+                log.info("another run in progress, exiting");
+                eprintln!("{NAME}: a run is in progress, try again when it has finished");
+                return Ok(ExitCode::FAILURE);
+            }
+        }
+    } else {
+        None
+    };
+    let rule = &cfg.dedup;
+    let guard = walk::Guard::new(home, &cfg.allow_volumes, log)?;
+    let matcher = walk::Matcher::new(&rule.patterns, &rule.exclude, None)?;
+    let walked = walk::walk(
+        &matcher,
+        &guard,
+        cfg.one_file_system,
+        cfg.worker_threads(),
+        log,
+        None,
+    );
+    let found = walked.candidates.len() as u64;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    let cands = dedup::eligible(
+        walked.candidates,
+        rule.min_size,
+        sys::effective_uid(),
+        now.saturating_sub_unsigned(cfg.min_age_secs),
+    );
+    let plan = dedup::plan(cands, found, log);
+    let targets: usize = plan.groups.iter().map(|g| g.targets.len()).sum();
+    let out = if args.apply {
+        let out = dedup::apply(&plan, log);
+        println!(
+            "dedup: deduped={} freed\u{2248}{} skipped={} failed={}\n{}",
+            out.deduped,
+            human(out.freed),
+            out.skipped,
+            out.failed,
+            dedup::SNAPSHOT_NOTE
+        );
+        out
+    } else {
+        let extra: String = args
+            .config
+            .iter()
+            .map(|p| format!(" --config {}", shell_quote(&p.display().to_string())))
+            .collect();
+        print!(
+            "{}",
+            dedup::render(&plan, home, &format!("{NAME} dedup --apply{extra}"))
+        );
+        dedup::Outcome::default()
+    };
+    log.info(format_args!(
+        "dedup_summary walked={} groups={} targets={} already_shared={} unreadable={} \
+         deduped={} freed={} skipped={} failed={} dry_run={}",
+        plan.walked,
+        plan.groups.len(),
+        targets,
+        plan.already_shared,
+        plan.unreadable,
+        out.deduped,
+        out.freed,
+        out.skipped,
+        out.failed,
+        !args.apply
+    ));
+    Ok(if out.failed > 0 {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+/// `run`: trash, purge, compress, dedup and tm-exclude in that order, each as its section's
+/// `run` says: `false` skips it, `true` runs it with the same `--apply` and `--config`,
+/// `"dry-run-only"` runs it as a preview even under `--apply`. A section without patterns is
+/// skipped (compress prints its own hint). Exit 1 when any step failed.
 fn cmd_run(args: &CleanArgs, home: &Path) -> ExitCode {
     let config_path = config_path(args.config.as_ref(), home);
     let cfg = match Config::load_or_create(&config_path, home) {
@@ -1085,30 +1262,74 @@ fn cmd_run(args: &CleanArgs, home: &Path) -> ExitCode {
         }
     };
     let mut failed = false;
-    for (action, rule) in [
-        (remove::Action::Trash, &cfg.trash),
-        (remove::Action::Purge, &cfg.purge),
-    ] {
-        if rule.scheduled && !rule.patterns.is_empty() {
-            println!("== {} ==", action.name());
-            failed |= cmd_remove(args, action, home) != ExitCode::SUCCESS;
-        }
-    }
-    println!("== compress ==");
-    let compress = CompressArgs {
-        config: args.config.clone(),
-        apply: args.apply,
-        ..CompressArgs::default()
-    };
-    failed |= cmd_compress(&compress, home) != ExitCode::SUCCESS;
-    if cfg.tm_exclude.scheduled && !cfg.tm_exclude.patterns.is_empty() {
-        println!("== tm-exclude ==");
-        failed |= cmd_tm_exclude(args, home) != ExitCode::SUCCESS;
+    let steps = [
+        ("trash", cfg.trash.run, !cfg.trash.patterns.is_empty()),
+        ("purge", cfg.purge.run, !cfg.purge.patterns.is_empty()),
+        ("compress", cfg.compress.run, true),
+        ("dedup", cfg.dedup.run, !cfg.dedup.patterns.is_empty()),
+        (
+            "tm-exclude",
+            cfg.tm_exclude.run,
+            !cfg.tm_exclude.patterns.is_empty(),
+        ),
+    ];
+    for (name, mode, has_patterns) in steps {
+        let apply = match mode {
+            config::RunMode::Off => continue,
+            _ if !has_patterns => continue,
+            config::RunMode::On => args.apply,
+            config::RunMode::DryRunOnly => {
+                log_run_step(&cfg, name);
+                false
+            }
+        };
+        println!("== {name} ==");
+        let step = CleanArgs {
+            config: args.config.clone(),
+            apply,
+        };
+        let code = match name {
+            "trash" => cmd_remove(&step, remove::Action::Trash, home),
+            "purge" => cmd_remove(&step, remove::Action::Purge, home),
+            "compress" => cmd_compress(
+                &CompressArgs {
+                    config: step.config,
+                    apply,
+                    ..CompressArgs::default()
+                },
+                home,
+            ),
+            "dedup" => cmd_dedup(
+                &DedupArgs {
+                    clean: step,
+                    verbose: false,
+                },
+                home,
+            ),
+            _ => cmd_tm_exclude(&step, home),
+        };
+        failed |= code != ExitCode::SUCCESS;
     }
     if failed {
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
+    }
+}
+
+/// Logs that `run` executes the step `name` as a preview only (`run = "dry-run-only"`).
+fn log_run_step(cfg: &Config, name: &str) {
+    let line = format!("run step {name} mode=dry-run-only");
+    println!("{line}");
+    match Logger::open(&cfg.log_dir(), cfg.log_max_bytes, cfg.log_keep, false) {
+        Ok(log) => {
+            log.info(&line);
+            log.flush();
+        }
+        Err(e) => eprintln!(
+            "{NAME}: cannot open log in {}: {e}",
+            cfg.log_dir().display()
+        ),
     }
 }
 
@@ -2039,6 +2260,12 @@ mod tests {
             Ok(Cli::TmExclude(a)) if a.apply && a.config.is_some()
         ));
         assert!(matches!(parse(&["tm-exclude"]), Ok(Cli::TmExclude(a)) if !a.apply));
+        assert!(matches!(
+            parse(&["dedup", "--apply", "-v", "--config", "/c"]),
+            Ok(Cli::Dedup(a)) if a.clean.apply && a.verbose && a.clean.config.is_some()
+        ));
+        assert!(matches!(parse(&["dedup"]), Ok(Cli::Dedup(a)) if !a.clean.apply && !a.verbose));
+        assert!(parse(&["dedup", "--dir", "/x"]).is_err());
         assert!(parse(&["tm-exclude", "x"]).is_err());
         assert!(parse(&["trash", "x"]).is_err());
         assert!(compress(&["compress", "--apply"]).apply);

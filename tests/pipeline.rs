@@ -1755,3 +1755,227 @@ fn changing_range_bounds_drops_the_incompressible_cache() {
         env.log_text()
     );
 }
+
+/// Path, inode, mtime, mode and bytes of every file below `dir`.
+fn file_states(dir: &Path) -> Vec<(PathBuf, u64, i64, i64, u32, Vec<u8>)> {
+    snapshot(dir)
+        .into_iter()
+        .filter(|(p, _)| lstat(p).is_file())
+        .map(|(p, ino)| {
+            let m = lstat(&p);
+            let bytes = fs::read(&p).unwrap();
+            (p, ino, m.mtime(), m.mtime_nsec(), m.mode(), bytes)
+        })
+        .collect()
+}
+
+fn dedup_summary(log: &str) -> String {
+    log.lines()
+        .rev()
+        .find(|l| l.contains(" dedup_summary "))
+        .expect("dedup_summary line")
+        .to_owned()
+}
+
+#[test]
+fn dedup_preview_run_modes_and_apply() {
+    let env = Env::new("dedup", "");
+    let dir = env.base.join("tree/dd");
+    fs::create_dir_all(dir.join("sub")).unwrap();
+    let data = random_bytes(1_200_000);
+    let (a1, a2, a3) = (dir.join("a1"), dir.join("a2"), dir.join("sub/a3"));
+    for p in [&a1, &a2, &a3] {
+        fs::write(p, &data).unwrap();
+    }
+    // a2 is the oldest: the reference.
+    backdate(&a2);
+    // Same size, different content.
+    let mut other = data.clone();
+    other[600_000] ^= 1;
+    fs::write(dir.join("b1"), &other).unwrap();
+    other[600_001] ^= 1;
+    fs::write(dir.join("b2"), &other).unwrap();
+    // Identical, but the mode or an xattr differs.
+    let m = random_bytes(1_100_000);
+    let (m1, m2) = (dir.join("m1"), dir.join("m2"));
+    fs::write(&m1, &m).unwrap();
+    fs::write(&m2, &m).unwrap();
+    fs::set_permissions(&m2, fs::Permissions::from_mode(0o600)).unwrap();
+    let x = random_bytes(1_050_000);
+    let (x1, x2) = (dir.join("x1"), dir.join("x2"));
+    fs::write(&x1, &x).unwrap();
+    fs::write(&x2, &x).unwrap();
+    let st = Command::new("/usr/bin/xattr")
+        .args(["-w", "user.acz", "v"])
+        .arg(&x2)
+        .status()
+        .unwrap();
+    assert!(st.success());
+    // An uncompressed file's resource fork is user data: compared like any xattr.
+    let rf = random_bytes(1_400_000);
+    let (r1, r2) = (dir.join("r1"), dir.join("r2"));
+    fs::write(&r1, &rf).unwrap();
+    fs::write(&r2, &rf).unwrap();
+    let fork = |args: &[&str]| {
+        Command::new("/usr/bin/xattr")
+            .args(args)
+            .arg(&r2)
+            .output()
+            .unwrap()
+    };
+    assert!(
+        fork(&["-w", "com.apple.ResourceFork", "fork"])
+            .status
+            .success()
+    );
+    // Hardlinked: never touched, its identical twin has no partner left.
+    let h = random_bytes(1_300_000);
+    fs::write(dir.join("h1"), &h).unwrap();
+    fs::hard_link(dir.join("h1"), dir.join("h2")).unwrap();
+    fs::write(dir.join("h3"), &h).unwrap();
+    let base = fs::read_to_string(&env.config).unwrap();
+    let with = |dedup_run: &str, compress_run: &str| {
+        fs::write(
+            &env.config,
+            format!(
+                "{base}\n[compress]\nrun = {compress_run}\n\n[dedup]\npatterns = [\"{}\"]\nrun = {dedup_run}\n",
+                dir.display()
+            ),
+        )
+        .unwrap();
+    };
+    with("false", "false");
+    let before = file_states(&dir);
+    // Preview: groups listed, nothing changed.
+    let out = env.exec(&["dedup"], None);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        text.contains("  keep  ") && text.contains("dd/a2"),
+        "{text}"
+    );
+    assert!(
+        text.contains("  clone ") && text.contains("dd/sub/a3"),
+        "{text}"
+    );
+    assert!(
+        text.contains("m2: skipped: metadata differs (mode)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("x2: skipped: metadata differs (xattr names)"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("b1") && !text.contains("h1") && !text.contains("h3"),
+        "{text}"
+    );
+    assert!(
+        text.contains("dedup: groups=4 files=2 would_free="),
+        "{text}"
+    );
+    assert!(
+        text.contains("dedup --apply") && text.contains("snapshots"),
+        "{text}"
+    );
+    assert_eq!(file_states(&dir), before);
+    assert!(dedup_summary(&env.log_text()).contains("dry_run=true"));
+    // run --apply with dedup off and compress off: neither step.
+    let out = env.exec(&["run", "--apply"], None);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        !text.contains("== dedup ==") && !text.contains("== compress =="),
+        "{text}"
+    );
+    // dry-run-only: a preview even under --apply.
+    with("\"dry-run-only\"", "false");
+    let out = env.exec(&["run", "--apply"], None);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{out:?}");
+    assert!(text.contains("run step dedup mode=dry-run-only"), "{text}");
+    assert!(
+        text.contains("== dedup ==") && text.contains("would_free="),
+        "{text}"
+    );
+    assert!(!text.contains("== compress =="), "{text}");
+    assert_eq!(file_states(&dir), before);
+    let log = env.log_text();
+    assert!(
+        log.contains(" INFO run step dedup mode=dry-run-only"),
+        "{log}"
+    );
+    assert!(dedup_summary(&log).contains("dry_run=true"));
+    // run = true: replaced under run --apply (compress back on: it runs first).
+    with("true", "true");
+    let out = env.exec(&["run", "--apply"], None);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{out:?}");
+    let (c, d) = (
+        text.find("== compress ==").unwrap(),
+        text.find("== dedup ==").unwrap(),
+    );
+    assert!(c < d, "{text}");
+    assert!(
+        text.contains("dedup: deduped=2 ") && text.contains(" failed=0"),
+        "{text}"
+    );
+    let summary = dedup_summary(&env.log_text());
+    assert!(
+        summary.contains(" deduped=2 ") && summary.contains("dry_run=false"),
+        "{summary}"
+    );
+    let after = file_states(&dir);
+    assert_eq!(after.len(), before.len());
+    for (b, a) in before.iter().zip(&after) {
+        // Same path, mtime, mode and bytes everywhere.
+        assert_eq!((&b.0, b.2, b.3, b.4, &b.5), (&a.0, a.2, a.3, a.4, &a.5));
+        let replaced = a.0 == a1 || a.0 == a3;
+        assert_eq!(b.1 != a.1, replaced, "{}", a.0.display());
+    }
+    assert!(lstat(&a1).nlink() == 1 && lstat(&a3).nlink() == 1);
+    assert!(staging_left(&dir).is_empty(), "{:?}", staging_left(&dir));
+    let log = env.log_text();
+    assert!(
+        log.contains(&format!(
+            "deduped {} clone_of={}",
+            a1.display(),
+            a2.display()
+        )),
+        "{log}"
+    );
+    // The clones share the reference's clone id now: nothing left to do.
+    let out = env.exec(&["dedup"], None);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("dedup: groups=3 files=0 "), "{text}");
+    assert!(
+        text.contains("r2: skipped: metadata differs (xattr names)"),
+        "{text}"
+    );
+    let out = fork(&["-p", "com.apple.ResourceFork"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "fork");
+    assert!(!text.contains("dd/a"), "{text}");
+    // `scheduled` and `run` in one section: refused at startup.
+    fs::write(
+        &env.config,
+        format!("{base}\n[trash]\nscheduled = true\nrun = true\n"),
+    )
+    .unwrap();
+    let out = env.exec(&["run"], None);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("give only `run`"),
+        "{out:?}"
+    );
+    fs::write(
+        &env.config,
+        format!("{base}\n[dedup]\nrun = \"sometimes\"\n"),
+    )
+    .unwrap();
+    let out = env.exec(&["dedup"], None);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains(r#"true, false or "dry-run-only""#),
+        "{out:?}"
+    );
+}

@@ -57,8 +57,49 @@ pub struct Config {
     pub trash: Rule,
     /// `purge`: matched files and directories are deleted for good.
     pub purge: Rule,
+    /// `compress` as a step of `run`.
+    pub compress: CompressRule,
+    /// `dedup`: identical files are replaced by APFS clones of one of them.
+    pub dedup: DedupRule,
     /// `tm-exclude`: matched directories get the Time Machine exclusion attribute.
     pub tm_exclude: Rule,
+}
+
+/// `run` of a command section: whether (and how) `run` executes that command.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RunMode {
+    /// `false`: skipped by `run`.
+    #[default]
+    Off,
+    /// `true`: run, with `--apply` when `run --apply`.
+    On,
+    /// `"dry-run-only"`: always a preview, even under `run --apply`.
+    DryRunOnly,
+}
+
+impl<'de> Deserialize<'de> for RunMode {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = RunMode;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str(r#"true, false or "dry-run-only""#)
+            }
+            fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<RunMode, E> {
+                Ok(if v { RunMode::On } else { RunMode::Off })
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<RunMode, E> {
+                match v {
+                    "dry-run-only" => Ok(RunMode::DryRunOnly),
+                    _ => Err(E::invalid_value(serde::de::Unexpected::Str(v), &self)),
+                }
+            }
+            fn visit_string<E: serde::de::Error>(self, v: String) -> Result<RunMode, E> {
+                self.visit_str(&v)
+            }
+        }
+        d.deserialize_any(Visitor)
+    }
 }
 
 /// `verify`: `false`, `true` or `"extended"`.
@@ -230,13 +271,80 @@ fn check_routing(ranges: &[SizeRange]) -> Result<Vec<SizeRange>, String> {
 }
 
 /// Patterns and excludes of `trash`, `purge` or `tm_exclude` (same syntax as the compress
-/// ones). A matched directory is acted on as a whole; `scheduled` puts the rule into `run`.
+/// ones). A matched directory is acted on as a whole; `run` says what `run` does with the rule
+/// (the old `scheduled = true|false` is read as `run = true|false`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(try_from = "RawRule")]
 pub struct Rule {
     pub patterns: Vec<String>,
     pub exclude: Vec<String>,
-    pub scheduled: bool,
+    pub run: RunMode,
+}
+
+/// [`Rule`] as written: `scheduled` and `run` may not both be given.
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawRule {
+    patterns: Vec<String>,
+    exclude: Vec<String>,
+    run: Option<RunMode>,
+    scheduled: Option<bool>,
+}
+
+impl TryFrom<RawRule> for Rule {
+    type Error = String;
+    fn try_from(r: RawRule) -> Result<Self, String> {
+        let run = match (r.run, r.scheduled) {
+            (Some(_), Some(_)) => {
+                return Err("`scheduled` is the old name of `run`: give only `run`".into());
+            }
+            (Some(run), None) => run,
+            (None, Some(true)) => RunMode::On,
+            (None, Some(false) | None) => RunMode::Off,
+        };
+        Ok(Self {
+            patterns: r.patterns,
+            exclude: r.exclude,
+            run,
+        })
+    }
+}
+
+/// `[compress]`: only what `run` does with compress (on by default).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CompressRule {
+    pub run: RunMode,
+}
+
+impl Default for CompressRule {
+    fn default() -> Self {
+        Self { run: RunMode::On }
+    }
+}
+
+/// `[dedup]`: files below the patterns of at least `min_size` bytes are compared; identical
+/// ones are replaced by APFS clones of one of them.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DedupRule {
+    pub patterns: Vec<String>,
+    pub exclude: Vec<String>,
+    pub min_size: u64,
+    pub run: RunMode,
+}
+
+impl Default for DedupRule {
+    fn default() -> Self {
+        Self {
+            patterns: Vec::new(),
+            exclude: [".git", "target", "node_modules"]
+                .map(String::from)
+                .to_vec(),
+            min_size: MIB,
+            run: RunMode::Off,
+        }
+    }
 }
 
 impl Default for Config {
@@ -271,6 +379,8 @@ impl Default for Config {
             log_keep: 1,
             trash: Rule::default(),
             purge: Rule::default(),
+            compress: CompressRule::default(),
+            dedup: DedupRule::default(),
             tm_exclude: Rule::default(),
         }
     }
@@ -314,6 +424,8 @@ impl Config {
             .chain(cfg.trash.exclude.iter_mut())
             .chain(cfg.purge.patterns.iter_mut())
             .chain(cfg.purge.exclude.iter_mut())
+            .chain(cfg.dedup.patterns.iter_mut())
+            .chain(cfg.dedup.exclude.iter_mut())
             .chain(cfg.tm_exclude.patterns.iter_mut())
             .chain(cfg.tm_exclude.exclude.iter_mut())
         {
@@ -366,17 +478,25 @@ impl Config {
             return Err(format!("pattern `{p}` is not absolute after `~` expansion"));
         }
         validate_excludes(&self.exclude)?;
-        for (name, rule) in [
-            ("trash", &self.trash),
-            ("purge", &self.purge),
-            ("tm_exclude", &self.tm_exclude),
+        for (name, patterns, exclude) in [
+            ("trash", &self.trash.patterns, &self.trash.exclude),
+            ("purge", &self.purge.patterns, &self.purge.exclude),
+            ("dedup", &self.dedup.patterns, &self.dedup.exclude),
+            (
+                "tm_exclude",
+                &self.tm_exclude.patterns,
+                &self.tm_exclude.exclude,
+            ),
         ] {
-            if let Some(p) = rule.patterns.iter().find(|p| !p.starts_with('/')) {
+            if let Some(p) = patterns.iter().find(|p| !p.starts_with('/')) {
                 return Err(format!(
                     "[{name}] pattern `{p}` is not absolute after `~` expansion"
                 ));
             }
-            validate_excludes(&rule.exclude).map_err(|e| format!("[{name}] {e}"))?;
+            validate_excludes(exclude).map_err(|e| format!("[{name}] {e}"))?;
+        }
+        if self.dedup.min_size < 1 {
+            return Err("[dedup] `min_size` must be >= 1".into());
         }
         // An exclusion covers everything inside a matched directory, so an exclude can only
         // keep a directory itself unexcluded: a wildcard above it would look like it protects
@@ -696,7 +816,7 @@ mod tests {
         let cfg = Config::parse(text, &home()).unwrap();
         assert_eq!(cfg.tm_exclude.patterns, ["/Users/u/Work_*/**/target"]);
         assert_eq!(cfg.tm_exclude.exclude, ["keep", "/Users/u/Work_a/x/target"]);
-        assert!(cfg.tm_exclude.scheduled);
+        assert_eq!(cfg.tm_exclude.run, RunMode::On);
         let err = Config::parse("[tm_exclude]\npatterns = [\"rel/**\"]", &home()).unwrap_err();
         assert!(err.contains("[tm_exclude] pattern `rel/**`"), "{err}");
         for e in [
@@ -717,6 +837,67 @@ mod tests {
         assert!(Config::parse("[tm_exclude]\nexclude = [\"**/x\"]", &home()).is_err());
         let ok = "[tm_exclude]\nexclude = [\"/a/b/*.tmp\", \"n*\"]";
         assert!(Config::parse(ok, &home()).is_ok());
+    }
+
+    #[test]
+    fn run_modes_and_scheduled_alias() {
+        let cfg = Config::parse("", &home()).unwrap();
+        assert_eq!(cfg.compress.run, RunMode::On);
+        for r in [&cfg.trash, &cfg.purge, &cfg.tm_exclude] {
+            assert_eq!(r.run, RunMode::Off);
+        }
+        assert_eq!(cfg.dedup.run, RunMode::Off);
+        let parse = |t: &str| Config::parse(t, &home());
+        let cfg = parse(
+            "[trash]\nrun = true\n[purge]\nrun = \"dry-run-only\"\n[compress]\nrun = false\n\
+             [dedup]\nrun = \"dry-run-only\"\n[tm_exclude]\nscheduled = true",
+        )
+        .unwrap();
+        assert_eq!(cfg.trash.run, RunMode::On);
+        assert_eq!(cfg.purge.run, RunMode::DryRunOnly);
+        assert_eq!(cfg.compress.run, RunMode::Off);
+        assert_eq!(cfg.dedup.run, RunMode::DryRunOnly);
+        assert_eq!(cfg.tm_exclude.run, RunMode::On);
+        assert_eq!(
+            parse("[purge]\nscheduled = false").unwrap().purge.run,
+            RunMode::Off
+        );
+        let e = parse("[trash]\nscheduled = true\nrun = true").unwrap_err();
+        assert!(e.contains("give only `run`"), "{e}");
+        for bad in [
+            "[trash]\nrun = \"yes\"",
+            "[compress]\nrun = 1",
+            "[dedup]\nrun = \"dry-run\"",
+        ] {
+            let e = parse(bad).unwrap_err();
+            assert!(e.contains(r#"true, false or "dry-run-only""#), "{bad}: {e}");
+        }
+        // `scheduled` is no key of the new sections.
+        assert!(parse("[dedup]\nscheduled = true").is_err());
+        assert!(parse("[compress]\nscheduled = true").is_err());
+    }
+
+    #[test]
+    fn dedup_section() {
+        let cfg = Config::parse("", &home()).unwrap();
+        assert_eq!(cfg.dedup, DedupRule::default());
+        assert_eq!(cfg.dedup.exclude, [".git", "target", "node_modules"]);
+        assert_eq!(cfg.dedup.min_size, 1048576);
+        let cfg = Config::parse(
+            "[dedup]\npatterns = [\"~/x/**\"]\nexclude = [\"~/x/keep\"]\nmin_size = 1",
+            &home(),
+        )
+        .unwrap();
+        assert_eq!(cfg.dedup.patterns, ["/Users/u/x/**"]);
+        assert_eq!(cfg.dedup.exclude, ["/Users/u/x/keep"]);
+        for bad in [
+            "[dedup]\nmin_size = 0",
+            "[dedup]\npatterns = [\"rel/**\"]",
+            "[dedup]\nexclude = [\"rel/x\"]",
+            "[dedup]\nbogus = 1",
+        ] {
+            assert!(Config::parse(bad, &home()).is_err(), "accepted: {bad}");
+        }
     }
 
     #[test]

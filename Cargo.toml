@@ -16,6 +16,8 @@ include = ["/src", "/config/default.toml", "/README.md", "/CHANGELOG.md", "/LICE
 [dependencies]
 # In-process decmpfs writer (opt-in `backend = "applesauce"`); its lzfse-sys is pinned below.
 applesauce-core = { version = "=0.4.14", default-features = false, features = ["lzfse", "lzvn"] }
+# Content hashes of `dedup` candidates.
+blake3 = "=1.8.7"
 globset = "0.4"
 libc = "0.2"
 # Pinned: its version is part of the incompressible-cache record of the applesauce backend.

@@ -528,7 +528,7 @@ fn split_batches(files: Vec<Candidate>, max_files: usize, max_bytes: usize) -> V
     batches
 }
 
-fn system_time(sec: i64, nsec: i64) -> SystemTime {
+pub(crate) fn system_time(sec: i64, nsec: i64) -> SystemTime {
     let nanos = Duration::from_nanos(nsec as u64);
     if sec >= 0 {
         UNIX_EPOCH + Duration::from_secs(sec as u64) + nanos
@@ -577,7 +577,7 @@ const PRESERVED_UNKNOWN: Preserved =
 
 /// Creates the [`KEEP_MARKER`] directory in `staging` (a directory, so it can never truncate
 /// or clobber a user file of that name); an existing marker directory is fine.
-fn mark_keep(staging: &Path) -> io::Result<()> {
+pub(crate) fn mark_keep(staging: &Path) -> io::Result<()> {
     match DirBuilder::new().create(staging.join(KEEP_MARKER)) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists && has_keep_marker(staging) => Ok(()),
@@ -586,7 +586,7 @@ fn mark_keep(staging: &Path) -> io::Result<()> {
 }
 
 /// True when `dir` contains the rescue marker directory.
-fn has_keep_marker(dir: &Path) -> bool {
+pub(crate) fn has_keep_marker(dir: &Path) -> bool {
     fs::symlink_metadata(dir.join(KEEP_MARKER)).is_ok_and(|m| m.is_dir())
 }
 
@@ -1724,7 +1724,12 @@ pub(crate) fn verify(c: &Candidate, staged: &Path, bufs: &mut Buffers) -> io::Re
 }
 
 /// Byte-compares `orig` and `copy` from their current offsets to EOF in chunks of `a.len()`.
-fn same_bytes(orig: &File, copy: &File, a: &mut [u8], b: &mut [u8]) -> io::Result<Verify> {
+pub(crate) fn same_bytes(
+    orig: &File,
+    copy: &File,
+    a: &mut [u8],
+    b: &mut [u8],
+) -> io::Result<Verify> {
     loop {
         let na = read_full(orig, a)?;
         let nb = read_full(copy, b)?;

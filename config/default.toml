@@ -98,8 +98,11 @@ min_size = 536870913
 # them for good. Same pattern and exclude syntax as above; a matched directory goes as a whole,
 # whatever its age, unless an exclude matches something inside it (then it stays). Only items
 # strictly below the home directory or an allow_volumes mount are acted on. Nothing happens without `--apply` (`trash --apply`,
-# `purge --apply`); `scheduled = true` also runs the rule in `run`, which the launchd agent
-# starts daily (order: trash, purge, compress). Every item is written to
+# `purge --apply`). `run` says what the `run` command (which the launchd agent starts daily)
+# does with a section: false = skipped, true = run (with --apply under `run --apply`),
+# "dry-run-only" = always a preview, even under `run --apply`. Order: trash, purge, compress,
+# dedup, tm-exclude. Old configs: `scheduled = true|false` means `run = true|false` in [trash],
+# [purge] and [tm_exclude]; a section may not hold both. Every item is written to
 # <log_dir>/removed.tsv. Hard protections apply as for compress, and an item is refused when it
 # is the home directory, a protected folder itself, an ancestor of either, is the config file or
 # one of the tool's files next to it, lies in or holds the log, state or cache directory or the
@@ -109,12 +112,33 @@ min_size = 536870913
 [trash]
 patterns = []
 exclude = []
-scheduled = false
+run = false
 
 [purge]
 patterns = []
 exclude = []
-scheduled = false
+run = false
+
+# What `run` does with compress (the top-level patterns above); `run` as for [trash].
+[compress]
+run = true
+
+# `dedup` replaces identical files below these patterns by APFS clones of one of them (copy on
+# write: the files stay separate, their data is stored once). Only regular files of at least
+# min_size bytes (>= 1) are compared, by size, then a BLAKE3 hash of their first and last
+# 64 KiB, then of all their bytes. A file is kept as the reference: one already compressed
+# first, else the oldest, else the first path. Another file is replaced only when its owner,
+# group, mode, BSD flags (except compressed) and extended attributes (except
+# com.apple.lastuseddate#PS) equal the reference's and neither has an ACL; the replaced file
+# gets the clone's com.apple.provenance. Hardlinked, setuid/setgid, too new (min_age_secs),
+# flagged, dataless and other users' files are never touched. The clone is byte-compared with the file before and after the swap. Nothing happens
+# without `--apply` (`dedup --apply`); `run` as for [trash]. Time Machine local snapshots may
+# keep the freed blocks until they expire.
+[dedup]
+patterns = []
+exclude = [".git", "target", "node_modules"]
+min_size = 1048576
+run = false
 
 # `tm-exclude` excludes every directory matched by these patterns from Time Machine backups by
 # setting the sticky exclusion attribute that `tmutil addexclusion` sets (tmutil itself is never
@@ -124,7 +148,7 @@ scheduled = false
 # `xattr -d com.apple.metadata:com_apple_backup_excludeItem <path>`; every excluded path is an
 # INFO line `excluded from Time Machine <path>` in the log. The same location checks as
 # for trash/purge apply. Nothing happens without `--apply` (`tm-exclude --apply`);
-# `scheduled = true` also runs it in `run` (order: trash, purge, compress, tm-exclude).
+# `run` as for [trash].
 # Install a binary that knows this section before adding it to an existing config: older
 # binaries reject unknown sections. An exclude containing `/` must be literal up to its last
 # component.
@@ -136,4 +160,4 @@ patterns = [
   # "~/**/.claude/worktrees",
 ]
 exclude = []
-scheduled = false
+run = false

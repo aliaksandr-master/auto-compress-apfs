@@ -502,6 +502,76 @@ pub fn fcopyfile(src: &File, dst: &File, flags: u32) -> io::Result<()> {
     })
 }
 
+/// `clonefile(2)` flag: fail instead of following a symlink as the source.
+const CLONE_NOFOLLOW: u32 = 0x0001;
+
+/// Creates `name` (one path component, must not exist) in the directory `dir` as an APFS
+/// clone of `src`: its own inode sharing `src`'s data blocks, with `src`'s mode, flags,
+/// extended attributes and ACL (`fclonefileat(2)` with `CLONE_NOFOLLOW`).
+pub fn fclone_at(src: &File, dir: &File, name: &CStr) -> io::Result<()> {
+    // SAFETY: both fds are open for the lifetime of the borrows and `name` is NUL-terminated;
+    // fclonefileat retains no pointer.
+    check(unsafe {
+        libc::fclonefileat(
+            src.as_raw_fd(),
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            CLONE_NOFOLLOW,
+        )
+    })
+}
+
+/// What [`fclone_info`] reads with `fgetattrlist(2)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CloneInfo {
+    /// `ATTR_CMNEXT_CLONEID`: equal for files that are clones of each other; `None` when the
+    /// filesystem does not report it.
+    pub clone_id: Option<u64>,
+    /// `ATTR_CMNEXT_PRIVATESIZE`: bytes of the file not shared with a clone, when reported.
+    pub private_size: Option<u64>,
+    /// `ATTR_CMN_EXTENDED_SECURITY` is set and not empty: the file has an ACL.
+    pub acl: bool,
+}
+
+/// The clone id, private size and ACL presence of `f` (`fgetattrlist(2)` with
+/// `FSOPT_PACK_INVAL_ATTRS`, so the fixed layout holds whatever the filesystem reports).
+pub fn fclone_info(f: &File) -> io::Result<CloneInfo> {
+    let mut req = libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: libc::ATTR_CMN_RETURNED_ATTRS | libc::ATTR_CMN_EXTENDED_SECURITY,
+        volattr: 0,
+        dirattr: 0,
+        fileattr: 0,
+        // With FSOPT_ATTR_CMN_EXTENDED this group holds ATTR_CMNEXT_* bits.
+        forkattr: libc::ATTR_CMNEXT_PRIVATESIZE | libc::ATTR_CMNEXT_CLONEID,
+    };
+    // Layout: u32 length, attribute_set_t (20 bytes), attrreference_t of the ACL (8), then
+    // the extended common attributes in bit order: private size (off_t), clone id (u64). The
+    // ACL data itself follows; a buffer too small for it only truncates that data.
+    let mut buf = [0u8; 4096];
+    // SAFETY: `req` and `buf` are live locals for the duration of the call, `buf.len()` bytes
+    // are writable; the fd is open for the lifetime of `f` and nothing is retained.
+    check(unsafe {
+        libc::fgetattrlist(
+            f.as_raw_fd(),
+            (&raw mut req).cast(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            libc::FSOPT_PACK_INVAL_ATTRS | libc::FSOPT_ATTR_CMN_EXTENDED,
+        )
+    })?;
+    let u32_at = |o: usize| u32::from_ne_bytes(buf[o..o + 4].try_into().expect("4 bytes"));
+    let u64_at = |o: usize| u64::from_ne_bytes(buf[o..o + 8].try_into().expect("8 bytes"));
+    let (common, fork) = (u32_at(4), u32_at(20));
+    let valid = |set: u32, bit: u32| set & bit != 0;
+    Ok(CloneInfo {
+        acl: valid(common, libc::ATTR_CMN_EXTENDED_SECURITY) && u32_at(28) > 0,
+        private_size: valid(fork, libc::ATTR_CMNEXT_PRIVATESIZE).then(|| u64_at(32)),
+        clone_id: valid(fork, libc::ATTR_CMNEXT_CLONEID).then(|| u64_at(40)),
+    })
+}
+
 /// The resource fork of a file as a seekable byte stream: every write is an
 /// [`fset_xattr`] of [`RESOURCE_FORK`] at the current position. Positions beyond `u32::MAX`
 /// are errors (the xattr position is 32-bit). The fork is assumed absent when created.
@@ -678,6 +748,43 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&a).unwrap(), "B");
         assert_eq!(std::fs::read_to_string(&b).unwrap(), "A");
         assert!(rename_swap(&a, &dir.join("missing")).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn clone_shares_clone_id_and_acl_is_seen() {
+        let dir = std::env::temp_dir().join(format!("acz-sys-clone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a");
+        std::fs::write(&a, vec![7u8; 200_000]).unwrap();
+        let src = File::open(&a).unwrap();
+        let d = File::open(&dir).unwrap();
+        fclone_at(&src, &d, c"b").unwrap();
+        assert!(fclone_at(&src, &d, c"b").is_err(), "existing name");
+        let b = File::open(dir.join("b")).unwrap();
+        let (ia, ib) = (fclone_info(&src).unwrap(), fclone_info(&b).unwrap());
+        assert!(ia.clone_id.is_some(), "{ia:?}");
+        assert_eq!(ia.clone_id, ib.clone_id);
+        assert!(!ia.acl);
+        assert_eq!(std::fs::read(dir.join("b")).unwrap(), vec![7u8; 200_000]);
+        let c = dir.join("c");
+        std::fs::write(&c, vec![7u8; 200_000]).unwrap();
+        let ic = fclone_info(&File::open(&c).unwrap()).unwrap();
+        assert_ne!(ic.clone_id, ia.clone_id);
+        let d = dir.join("d");
+        std::fs::write(&d, vec![7u8; 200_000]).unwrap();
+        let id = fclone_info(&File::open(&d).unwrap()).unwrap();
+        assert_ne!(ic.clone_id, id.clone_id);
+        // A shared clone keeps (almost) nothing private.
+        assert!(ib.private_size.is_some_and(|p| p < 200_000), "{ib:?}");
+        let status = std::process::Command::new("/bin/chmod")
+            .args(["+a", "everyone allow read"])
+            .arg(&c)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(fclone_info(&File::open(&c).unwrap()).unwrap().acl);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -8,6 +8,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `dedup [--apply] [--config PATH] [-v]` and the `[dedup]` config section (`patterns`,
+  `exclude`, `min_size`, `run`): identical regular files are replaced by APFS clones of one of
+  them (found by size, clone id, then BLAKE3 of head and tail and of all bytes). Only files
+  whose owner, group, mode, flags and xattrs equal the kept file's and that have no ACL are
+  replaced; the clone is byte-compared before and after the `RENAME_SWAP`. Preview by default.
+- `run` key in `[trash]`, `[purge]`, `[compress]` (new section), `[dedup]` and `[tm_exclude]`:
+  `true`, `false` or `"dry-run-only"` (a preview even under `run --apply`). Defaults keep the old
+  behaviour (compress on, the rest off). Order of `run`: trash, purge, compress, dedup,
+  tm-exclude.
+
 - `tm-exclude [--apply] [--config PATH]` and the `[tm_exclude]` config section (`patterns`,
   `exclude`, `scheduled`). Install the new binary before adding `[tm_exclude]` to an existing
   config: older binaries reject the unknown section. Matched directories get the sticky Time
@@ -32,6 +42,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `.acz-keep`, kept by later runs like a rescue dir.
 
 ### Changed
+
+- `scheduled` in `[trash]`, `[purge]` and `[tm_exclude]` is now an alias of `run = true|false`;
+  giving both in one section is a config error.
 
 - `verify` takes `false`, `true` or `"extended"`; the default is `"extended"` (was `true`). An
   existing `verify = true` (what `make config` wrote) keeps the plain compare; only a new

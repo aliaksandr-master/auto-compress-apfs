@@ -221,6 +221,7 @@ auto-compress-apfs compress [OPTIONS]      preview; with --apply: compress
 auto-compress-apfs trash [--apply] [--config PATH]
 auto-compress-apfs purge [--apply] [--config PATH]
 auto-compress-apfs tm-exclude [--apply] [--config PATH]
+auto-compress-apfs dedup [--apply] [--config PATH] [-v]
 auto-compress-apfs run [--apply] [--config PATH]
 auto-compress-apfs stat [--top N] [--all] [--config PATH]
 auto-compress-apfs quarantine list [--config PATH]
@@ -346,10 +347,38 @@ auto-compress-apfs -h|--help | -V|--version
   `tmutil removeexclusion <path>` or
   `xattr -d com.apple.metadata:com_apple_backup_excludeItem <path>` (the excluded paths are the
   INFO lines above in the log).
-- `run` is what the launchd agent starts: `trash` and `purge` when their rule has
-  `scheduled = true`, then `compress`, then `tm-exclude` when its rule is scheduled, with the
-  same `--apply` and `--config`. Without `--apply` it previews the same steps. Exit 1 when a step
-  failed.
+- `dedup` replaces identical regular files below the `[dedup]` patterns by APFS clones of one
+  of them: the files stay separate (a later write to one does not change the other), their data
+  is stored once. The walk, its hard protections and excludes are those of `compress`. Files
+  below `min_size`, hardlinked, flagged, dataless, owned by another user or modified less than
+  `min_age_secs` ago are never touched. Candidates are grouped by size, files that already
+  share a clone id count once, then BLAKE3 hashes of the first and last 64 KiB and of all bytes
+  regroup them. Per group the reference is a file that is already compressed, else the oldest,
+  else the first path; it is only read. Another file of the group is replaced only when its
+  owner, group, mode, BSD flags (except compressed) and extended attributes (except
+  `com.apple.lastuseddate#PS`; the compressed data of a compressed file is not listed as an
+  xattr, the resource fork of an uncompressed one is compared) equal the reference's and
+  neither has an ACL; otherwise it is listed as `skipped: metadata differs (<what>)`.
+  Setuid/setgid files are skipped. A replaced file's `com.apple.provenance` is the one the clone
+  got, not its old value. Without `--apply` it lists each group (`keep`, `clone`,
+  `skip` lines) and `dedup: groups= files= would_free=` (allocated blocks of the targets,
+  approximately), and changes nothing. With `--apply`, under the run lock, the reference is
+  cloned (`fclonefileat`) into a `.acz-staging-<pid>-<n>` dir next to the target, the clone
+  gets the target's times, its metadata and every byte are compared with the target's, and it
+  replaces the target by `RENAME_SWAP` only while the target is unchanged (device, inode, size,
+  mtime, ctime); after the swap the file at the path is compared with the old one again, and a
+  difference swaps it back (a file written to right after the swap is left as written). The
+  staging dir carries the keep marker from the swap until the outcome is checked; when a swap
+  back fails it is moved to `.acz-rescue-*` with the original inside. Each replacement is an INFO line `deduped <path> clone_of=<ref>
+  bytes=<size>`; the run ends with `dedup: deduped= freed≈ skipped= failed=` and the log line
+  `dedup_summary ... dry_run=`. Time Machine local snapshots may keep the freed blocks until
+  they expire. Exit 1 when a replacement failed.
+- `run` is what the launchd agent starts: `trash`, `purge`, `compress`, `dedup`, `tm-exclude` in
+  that order, each as the `run` key of its config section says: `false` skips it, `true` runs
+  it with the same `--apply` and `--config`, `"dry-run-only"` runs it as a preview even under
+  `run --apply` (logged as `run step <name> mode=dry-run-only`). Compress is on by default, the
+  others off; a section without patterns is skipped. Without `--apply` every step is a preview.
+  Exit 1 when a step failed.
 - `install-launchd` sets up the daily run for the current user (no `sudo`):
   - writes `run.sh` next to the config (mode 0755) with the absolute path of the binary it was
     started as (a symlink stays a symlink, so a rebuilt binary is picked up) and, for a
@@ -425,8 +454,14 @@ resolution), so `exclude = ["/private/var/**"]` does not exclude a walk started 
   the default routing; a top-level `backend` means that backend alone for
   `min_size`..536870912 (one INFO line per run says that other sizes are skipped). Neither may
   be combined with `backend_by_size`; a `min_size` above 536870912 is refused.
-- `[trash]`, `[purge]`, `[tm_exclude]`: `patterns`, `exclude`, `scheduled` for those commands
-  (empty by default). A `[tm_exclude]` exclude containing `/` must be literal up to its last
+- `[trash]`, `[purge]`, `[tm_exclude]`: `patterns`, `exclude` (empty by default) and `run`
+  (`false` by default) for those commands. The old `scheduled = true|false` is still read as
+  `run = true|false`; a section with both is refused. Any other `run` value than `true`,
+  `false` or `"dry-run-only"` is refused.
+- `[compress]`: only `run` (`true` by default), for the compress step of `run`.
+- `[dedup]`: `patterns` (empty by default), `exclude` (default `[".git", "target",
+  "node_modules"]`), `min_size` (bytes, default 1048576, at least 1) and `run` (`false` by
+  default). A `[tm_exclude]` exclude containing `/` must be literal up to its last
   component, since an exclusion covers everything inside a matched directory. Install a binary
   that knows `[tm_exclude]` before adding it to an existing config: older binaries reject the
   unknown section.
