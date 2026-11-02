@@ -112,3 +112,25 @@ scheduled = false
 patterns = []
 exclude = []
 scheduled = false
+
+# `tm-exclude` excludes every directory matched by these patterns from Time Machine backups by
+# setting the sticky exclusion attribute that `tmutil addexclusion` sets (tmutil itself is never
+# executed). Matched files are ignored; a directory matched inside another matched one is
+# covered by it. An existing exclusion is never removed or changed. Undo one by hand with
+# `tmutil removeexclusion <path>` or
+# `xattr -d com.apple.metadata:com_apple_backup_excludeItem <path>`; every excluded path is an
+# INFO line `excluded from Time Machine <path>` in the log. The same location checks as
+# for trash/purge apply. Nothing happens without `--apply` (`tm-exclude --apply`);
+# `scheduled = true` also runs it in `run` (order: trash, purge, compress, tm-exclude).
+# Install a binary that knows this section before adding it to an existing config: older
+# binaries reject unknown sections. An exclude containing `/` must be literal up to its last
+# component.
+[tm_exclude]
+patterns = [
+  # "~/Work_*/**/target",
+  # "~/Work_*/**/node_modules",
+  # "~/Work_*/**/.venv",
+  # "~/**/.claude/worktrees",
+]
+exclude = []
+scheduled = false

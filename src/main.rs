@@ -15,6 +15,7 @@ mod remove;
 mod stat;
 mod state;
 mod sys;
+mod tm_exclude;
 mod walk;
 
 use classify::{Class, Rules};
@@ -49,6 +50,7 @@ Usage:
                                              without a command also mean compress)
   auto-compress-apfs trash [--apply] [--config PATH]
   auto-compress-apfs purge [--apply] [--config PATH]
+  auto-compress-apfs tm-exclude [--apply] [--config PATH]
   auto-compress-apfs run [--apply] [--config PATH]
   auto-compress-apfs stat [--top N] [--all] [--config PATH]
   auto-compress-apfs quarantine list [--config PATH]
@@ -89,7 +91,11 @@ clean options:
 trash / purge: files and directories matched by the [trash] / [purge] patterns of the config
 (a directory as a whole) are listed; with --apply moved to ~/.Trash / deleted for good, each
 written to <log_dir>/removed.tsv. Protected locations and the tool's own dirs are refused.
-run: trash and purge when their rule has `scheduled = true`, then compress (what launchd runs).
+tm-exclude: directories matched by the [tm_exclude] patterns are listed; with --apply excluded
+from Time Machine (the sticky attribute `tmutil addexclusion` sets; tmutil is not run). An
+existing exclusion is never removed or changed.
+run: trash and purge when their rule has `scheduled = true`, then compress, then tm-exclude
+when scheduled (what launchd runs).
 
 install-launchd: writes run.sh next to the config and a per-user launchd agent that starts it
 at login and daily at 09:00; run.sh runs `run --apply` once a day from 09:00 on (a missed
@@ -151,6 +157,8 @@ enum Cli {
     Clean(CleanArgs),
     /// `trash` or `purge` (same options as `clean`).
     Remove(CleanArgs, remove::Action),
+    /// `tm-exclude` (same options as `clean`).
+    TmExclude(CleanArgs),
     /// `run`: the configured steps in order, as the launchd agent starts them.
     Run(CleanArgs),
     Quarantine {
@@ -373,12 +381,13 @@ fn parse_args(it: impl Iterator<Item = String>) -> Result<Cli, String> {
             println!("{USAGE}");
             Ok(Cli::Exit(ExitCode::SUCCESS))
         }
-        Some(c @ ("trash" | "purge" | "run")) => {
+        Some(c @ ("trash" | "purge" | "tm-exclude" | "run")) => {
             let c = c.to_owned();
             match parse_clean(it.skip(1))? {
                 Cli::Clean(a) => Ok(match c.as_str() {
                     "trash" => Cli::Remove(a, remove::Action::Trash),
                     "purge" => Cli::Remove(a, remove::Action::Purge),
+                    "tm-exclude" => Cli::TmExclude(a),
                     _ => Cli::Run(a),
                 }),
                 other => Ok(other),
@@ -414,6 +423,7 @@ fn main() -> ExitCode {
         Cli::Stat(args) => cmd_stat(&args, &home),
         Cli::Clean(args) => return cmd_clean(&args, &home),
         Cli::Remove(args, action) => return cmd_remove(&args, action, &home),
+        Cli::TmExclude(args) => return cmd_tm_exclude(&args, &home),
         Cli::Run(args) => return cmd_run(&args, &home),
         Cli::Quarantine { config, cmd } => cmd_quarantine(config, &cmd, &home),
         Cli::Launchd { config, cmd } => cmd_launchd(config, cmd, &home),
@@ -855,18 +865,7 @@ fn run_remove(
         cfg.worker_threads(),
         log,
     );
-    // The tool's own files next to the config, not that whole directory (it may be HOME).
-    let config_dir = config_path.parent().unwrap_or(Path::new("/"));
-    let own = [
-        config_path.to_path_buf(),
-        config_dir.join(launchd::SCRIPT_NAME),
-        quarantine_file(config_path),
-        config_dir.join("ditto-probe.txt"),
-        config_dir.join("ditto-probe.out"),
-        cfg.log_dir(),
-        state_dir(home),
-        home.join("Library/Caches").join(NAME),
-    ];
+    let own = own_paths(cfg, config_path, home);
     let trash_dir = home.join(".Trash");
     let mut scope = vec![home.to_path_buf()];
     scope.extend(guard.allowed_mounts().iter().cloned());
@@ -925,8 +924,157 @@ fn run_remove(
     })
 }
 
+/// The tool's own files next to the config (not that whole directory: it may be HOME), its log,
+/// state and cache directories.
+fn own_paths(cfg: &Config, config_path: &Path, home: &Path) -> [PathBuf; 8] {
+    let config_dir = config_path.parent().unwrap_or(Path::new("/"));
+    [
+        config_path.to_path_buf(),
+        config_dir.join(launchd::SCRIPT_NAME),
+        quarantine_file(config_path),
+        config_dir.join("ditto-probe.txt"),
+        config_dir.join("ditto-probe.out"),
+        cfg.log_dir(),
+        state_dir(home),
+        home.join("Library/Caches").join(NAME),
+    ]
+}
+
+/// `tm-exclude`: preview by default; with `--apply` under the run lock. Exit 1 when the config
+/// cannot be loaded, the log cannot be opened, the lock is busy, or a directory had an error.
+fn cmd_tm_exclude(args: &CleanArgs, home: &Path) -> ExitCode {
+    let config_path = config_path(args.config.as_ref(), home);
+    let (cfg, created) = match Config::load_or_create(&config_path, home) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{NAME}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if created {
+        println!("created {}", config_path.display());
+    }
+    if cfg.tm_exclude.patterns.is_empty() {
+        println!(
+            "no [tm_exclude] patterns: add them to {}",
+            config_path.display()
+        );
+        return ExitCode::SUCCESS;
+    }
+    let log_dir = cfg.log_dir();
+    let log = match Logger::open(&log_dir, cfg.log_max_bytes, cfg.log_keep, false) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("{NAME}: cannot open log in {}: {e}", log_dir.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let code = match run_tm_exclude(args, &cfg, &config_path, home, &log) {
+        Ok(code) => code,
+        Err(e) => {
+            log.error(&e);
+            eprintln!("{NAME}: {e}");
+            ExitCode::FAILURE
+        }
+    };
+    log.flush();
+    code
+}
+
+fn run_tm_exclude(
+    args: &CleanArgs,
+    cfg: &Config,
+    config_path: &Path,
+    home: &Path,
+    log: &Logger,
+) -> Result<ExitCode, String> {
+    log.info(format_args!(
+        "start {NAME} {VERSION} tm-exclude config={} dry_run={}",
+        config_path.display(),
+        !args.apply
+    ));
+    // Setting an xattr never reads file data, but a stray read must not download.
+    if let Err(e) = sys::disable_dataless_materialization() {
+        log.warn(format_args!(
+            "cannot turn off materialization of dataless files: {e}"
+        ));
+    }
+    let _lock = if args.apply {
+        match acquire_lock(&state_dir(home))? {
+            Some(f) => Some(f),
+            None => {
+                log.info("another run in progress, exiting");
+                eprintln!("{NAME}: a run is in progress, try again when it has finished");
+                return Ok(ExitCode::FAILURE);
+            }
+        }
+    } else {
+        None
+    };
+    let rule = &cfg.tm_exclude;
+    let guard = walk::Guard::new(home, &cfg.allow_volumes, log)?;
+    let matcher = walk::Matcher::new(&rule.patterns, &rule.exclude, None)?;
+    let walked = walk::walk_entries(
+        &matcher,
+        &guard,
+        cfg.one_file_system,
+        cfg.worker_threads(),
+        log,
+    );
+    let own = own_paths(cfg, config_path, home);
+    let trash_dir = home.join(".Trash");
+    let mut scope = vec![home.to_path_buf()];
+    scope.extend(guard.allowed_mounts().iter().cloned());
+    let keep = remove::Keep {
+        scope: &scope,
+        own: &own,
+        trash_dir: &trash_dir,
+    };
+    let items = tm_exclude::plan(
+        walked.matched,
+        &matcher,
+        &guard,
+        &keep,
+        sys::effective_uid(),
+        log,
+    );
+    let out = if args.apply {
+        let out = tm_exclude::apply(&items, sys::effective_uid(), log);
+        println!(
+            "tm-exclude: {} excluded from Time Machine, {} already, {} blocked, {} errors",
+            out.excluded, out.already, out.blocked, out.errors
+        );
+        out
+    } else {
+        let extra: String = args
+            .config
+            .iter()
+            .map(|p| format!(" --config {}", shell_quote(&p.display().to_string())))
+            .collect();
+        print!(
+            "{}",
+            tm_exclude::render(&items, home, &format!("{NAME} tm-exclude --apply{extra}"))
+        );
+        tm_exclude::tally(&items)
+    };
+    log.info(format_args!(
+        "tm_exclude_summary matched={} already={} excluded={} blocked={} errors={} dry_run={}",
+        items.len(),
+        out.already,
+        out.excluded,
+        out.blocked,
+        out.errors,
+        !args.apply
+    ));
+    Ok(if out.errors > 0 {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
 /// `run`: `trash` and `purge` when their rule is `scheduled`, then `compress`, each with the
-/// same `--apply` and `--config`. Exit 1 when any step failed.
+/// same `--apply` and `--config`, then `tm-exclude` when scheduled. Exit 1 when any step failed.
 fn cmd_run(args: &CleanArgs, home: &Path) -> ExitCode {
     let config_path = config_path(args.config.as_ref(), home);
     let cfg = match Config::load_or_create(&config_path, home) {
@@ -953,6 +1101,10 @@ fn cmd_run(args: &CleanArgs, home: &Path) -> ExitCode {
         ..CompressArgs::default()
     };
     failed |= cmd_compress(&compress, home) != ExitCode::SUCCESS;
+    if cfg.tm_exclude.scheduled && !cfg.tm_exclude.patterns.is_empty() {
+        println!("== tm-exclude ==");
+        failed |= cmd_tm_exclude(args, home) != ExitCode::SUCCESS;
+    }
     if failed {
         ExitCode::FAILURE
     } else {
@@ -1870,6 +2022,12 @@ mod tests {
         assert!(
             matches!(parse(&["run", "--config=/c.toml"]), Ok(Cli::Run(a)) if a.config.is_some())
         );
+        assert!(matches!(
+            parse(&["tm-exclude", "--apply", "--config", "/c.toml"]),
+            Ok(Cli::TmExclude(a)) if a.apply && a.config.is_some()
+        ));
+        assert!(matches!(parse(&["tm-exclude"]), Ok(Cli::TmExclude(a)) if !a.apply));
+        assert!(parse(&["tm-exclude", "x"]).is_err());
         assert!(parse(&["trash", "x"]).is_err());
         assert!(compress(&["compress", "--apply"]).apply);
         assert!(parse(&["--config"]).is_err());

@@ -208,6 +208,7 @@ auto-compress-apfs                         this help
 auto-compress-apfs compress [OPTIONS]      preview; with --apply: compress
 auto-compress-apfs trash [--apply] [--config PATH]
 auto-compress-apfs purge [--apply] [--config PATH]
+auto-compress-apfs tm-exclude [--apply] [--config PATH]
 auto-compress-apfs run [--apply] [--config PATH]
 auto-compress-apfs stat [--top N] [--all] [--config PATH]
 auto-compress-apfs quarantine list [--config PATH]
@@ -315,9 +316,28 @@ auto-compress-apfs -h|--help | -V|--version
   probe), anything inside or holding the log, state or cache directory of this tool or the Trash (and, for `trash`, anything already in the Trash), any item containing a flagged
   (`uchg`, `uappnd`, `schg`, `sappnd`, `restricted`) or dataless entry or an entry on another
   filesystem, and symlinks. Exit 1 when an item failed.
+- `tm-exclude` excludes the directories matched by the `[tm_exclude]` patterns of the config
+  from Time Machine backups: it creates the sticky exclusion attribute
+  `com.apple.metadata:com_apple_backup_excludeItem` with the value `tmutil addexclusion` writes
+  (`tmutil` itself is never executed). Matched files are ignored; a directory matched inside
+  another matched one is covered by it. An existing exclusion (any value) is never removed or
+  changed and counts as already excluded. Without `--apply` it lists each directory that would
+  be excluded and the refused ones with the reason, and changes nothing. With `--apply`, under
+  the run lock, each directory is reopened without following a symlink, must still be the same
+  directory (device, inode) without a protected flag, and gets the attribute, read back to
+  check. Refused as for `trash`/`purge` (location, own files, mount points, flagged or dataless
+  directories, symlinks), plus directories not owned by the user running it. Each one excluded
+  is an INFO line `excluded from Time Machine <path> (rule ...)`; the run ends with
+  `tm_exclude_summary matched= already= excluded= blocked= errors= dry_run=`. A directory gone,
+  replaced or not accessible since the walk is blocked, not an error. Exit 1 when a directory
+  had an error. Exclusions are never removed by the tool; undo one with
+  `tmutil removeexclusion <path>` or
+  `xattr -d com.apple.metadata:com_apple_backup_excludeItem <path>` (the excluded paths are the
+  INFO lines above in the log).
 - `run` is what the launchd agent starts: `trash` and `purge` when their rule has
-  `scheduled = true`, then `compress`, with the same `--apply` and `--config`. Without `--apply`
-  it previews the same steps. Exit 1 when a step failed.
+  `scheduled = true`, then `compress`, then `tm-exclude` when its rule is scheduled, with the
+  same `--apply` and `--config`. Without `--apply` it previews the same steps. Exit 1 when a step
+  failed.
 - `install-launchd` sets up the daily run for the current user (no `sudo`):
   - writes `run.sh` next to the config (mode 0755) with the absolute path of the binary it was
     started as (a symlink stays a symlink, so a rebuilt binary is picked up) and, for a
@@ -393,6 +413,11 @@ resolution), so `exclude = ["/private/var/**"]` does not exclude a walk started 
   the default routing; a top-level `backend` means that backend alone for
   `min_size`..536870912 (one INFO line per run says that other sizes are skipped). Neither may
   be combined with `backend_by_size`; a `min_size` above 536870912 is refused.
+- `[trash]`, `[purge]`, `[tm_exclude]`: `patterns`, `exclude`, `scheduled` for those commands
+  (empty by default). A `[tm_exclude]` exclude containing `/` must be literal up to its last
+  component, since an exclusion covers everything inside a matched directory. Install a binary
+  that knows `[tm_exclude]` before adding it to an existing config: older binaries reject the
+  unknown section.
 
 **Full Disk Access.** `~/Downloads` is a TCC-protected folder. A run that walks it needs Full Disk
 Access (or Downloads access) for the binary (System Settings > Privacy & Security); without it the

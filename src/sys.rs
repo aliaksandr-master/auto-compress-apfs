@@ -375,6 +375,29 @@ pub fn fset_xattr(f: &File, name: &CStr, value: &[u8], position: u32) -> io::Res
     })
 }
 
+/// Creates the xattr `name` of `f` with `value` (`XATTR_CREATE`); an existing value is never
+/// replaced: `Ok(false)` when the xattr is already set. No `XATTR_NOFOLLOW`: fsetxattr rejects
+/// it with `EINVAL` (an fd has no path to follow; open it with `O_NOFOLLOW` instead).
+pub fn fset_xattr_new(f: &File, name: &CStr, value: &[u8]) -> io::Result<bool> {
+    // SAFETY: the fd is open for the lifetime of `f`, `name` is NUL-terminated and `value` is
+    // valid for `value.len()` bytes; fsetxattr only reads them and retains no pointer.
+    let rc = unsafe {
+        libc::fsetxattr(
+            f.as_raw_fd(),
+            name.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+            libc::XATTR_CREATE,
+        )
+    };
+    match check(rc) {
+        Ok(()) => Ok(true),
+        Err(e) if e.raw_os_error() == Some(libc::EEXIST) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 /// Names of the xattrs of `f` as a plain listing shows them (no `XATTR_SHOWCOMPRESSION`: the
 /// decmpfs and resource fork xattrs of a compressed file are hidden).
 pub fn flist_xattr(f: &File) -> io::Result<Vec<CString>> {
@@ -561,6 +584,12 @@ mod tests {
         let fa = File::options().read(true).write(true).open(&a).unwrap();
         let fb = File::options().read(true).write(true).open(&b).unwrap();
         assert_eq!(fget_xattr(&fa, c"user.acz", false).unwrap(), None);
+        assert!(fset_xattr_new(&fa, c"user.acz-new", b"one").unwrap());
+        assert!(!fset_xattr_new(&fa, c"user.acz-new", b"two").unwrap());
+        assert_eq!(
+            fget_xattr(&fa, c"user.acz-new", false).unwrap().as_deref(),
+            Some(&b"one"[..])
+        );
         fset_xattr(&fa, c"user.acz", b"value", 0).unwrap();
         assert_eq!(
             fget_xattr(&fa, c"user.acz", false).unwrap().as_deref(),

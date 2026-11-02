@@ -8,6 +8,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `tm-exclude [--apply] [--config PATH]` and the `[tm_exclude]` config section (`patterns`,
+  `exclude`, `scheduled`). Install the new binary before adding `[tm_exclude]` to an existing
+  config: older binaries reject the unknown section. Matched directories get the sticky Time
+  Machine exclusion attribute `tmutil addexclusion` sets (tmutil is not executed); an existing
+  exclusion is never removed or changed. Preview by default; `run` does it after compress when
+  `scheduled = true`.
 - `[[backend_by_size]]` (config): routes files to a backend by size (`backend`, `min_size`,
   optional `max_size`, inclusive). Default: ditto for 16385..536870912 bytes, applesauce for
   larger files, which were skipped before. Overlapping ranges, `min_size > max_size` and a ditto

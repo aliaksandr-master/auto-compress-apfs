@@ -56,6 +56,8 @@ pub struct Config {
     pub trash: Rule,
     /// `purge`: matched files and directories are deleted for good.
     pub purge: Rule,
+    /// `tm-exclude`: matched directories get the Time Machine exclusion attribute.
+    pub tm_exclude: Rule,
 }
 
 /// The compressor that writes the staged copies.
@@ -184,8 +186,8 @@ fn check_routing(ranges: &[SizeRange]) -> Result<Vec<SizeRange>, String> {
     Ok(sorted)
 }
 
-/// Patterns and excludes of `trash` or `purge` (same syntax as the compress ones). A matched
-/// directory is acted on as a whole; `scheduled` puts the rule into `run`.
+/// Patterns and excludes of `trash`, `purge` or `tm_exclude` (same syntax as the compress
+/// ones). A matched directory is acted on as a whole; `scheduled` puts the rule into `run`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Rule {
@@ -226,6 +228,7 @@ impl Default for Config {
             log_keep: 1,
             trash: Rule::default(),
             purge: Rule::default(),
+            tm_exclude: Rule::default(),
         }
     }
 }
@@ -268,6 +271,8 @@ impl Config {
             .chain(cfg.trash.exclude.iter_mut())
             .chain(cfg.purge.patterns.iter_mut())
             .chain(cfg.purge.exclude.iter_mut())
+            .chain(cfg.tm_exclude.patterns.iter_mut())
+            .chain(cfg.tm_exclude.exclude.iter_mut())
         {
             *p = expand_tilde(p, home);
         }
@@ -318,13 +323,29 @@ impl Config {
             return Err(format!("pattern `{p}` is not absolute after `~` expansion"));
         }
         validate_excludes(&self.exclude)?;
-        for (name, rule) in [("trash", &self.trash), ("purge", &self.purge)] {
+        for (name, rule) in [
+            ("trash", &self.trash),
+            ("purge", &self.purge),
+            ("tm_exclude", &self.tm_exclude),
+        ] {
             if let Some(p) = rule.patterns.iter().find(|p| !p.starts_with('/')) {
                 return Err(format!(
                     "[{name}] pattern `{p}` is not absolute after `~` expansion"
                 ));
             }
             validate_excludes(&rule.exclude).map_err(|e| format!("[{name}] {e}"))?;
+        }
+        // An exclusion covers everything inside a matched directory, so an exclude can only
+        // keep a directory itself unexcluded: a wildcard above it would look like it protects
+        // entries deeper down that the exclusion still covers.
+        if let Some(e) = self.tm_exclude.exclude.iter().find(|e| {
+            e.rfind('/')
+                .is_some_and(|i| e[..i].contains(['*', '?', '[', '{']))
+        }) {
+            return Err(format!(
+                "[tm_exclude] exclude `{e}`: a path exclude must be literal up to its last \
+                 component (an exclusion covers everything inside a matched directory)"
+            ));
         }
         if let Some(v) = self.allow_volumes.iter().find(|v| !v.starts_with('/')) {
             return Err(format!(
@@ -601,6 +622,38 @@ mod tests {
         let ok = "exclude = [\"*.log\", \"**/x\", \"~/a/**\"]\nallow_volumes = [\"/Volumes/Fast\"]";
         let cfg = Config::parse(ok, &home()).unwrap();
         assert_eq!(cfg.exclude, ["*.log", "**/x", "/Users/u/a/**"]);
+    }
+
+    #[test]
+    fn tm_exclude_section() {
+        let cfg = Config::parse("", &home()).unwrap();
+        assert_eq!(cfg.tm_exclude, Rule::default());
+        let text = "[tm_exclude]\npatterns = [\"~/Work_*/**/target\"]\n\
+                    exclude = [\"keep\", \"~/Work_a/x/target\"]\nscheduled = true";
+        let cfg = Config::parse(text, &home()).unwrap();
+        assert_eq!(cfg.tm_exclude.patterns, ["/Users/u/Work_*/**/target"]);
+        assert_eq!(cfg.tm_exclude.exclude, ["keep", "/Users/u/Work_a/x/target"]);
+        assert!(cfg.tm_exclude.scheduled);
+        let err = Config::parse("[tm_exclude]\npatterns = [\"rel/**\"]", &home()).unwrap_err();
+        assert!(err.contains("[tm_exclude] pattern `rel/**`"), "{err}");
+        for e in [
+            "~/Work_*/x/target",
+            "/a/**/b",
+            "/a/b?/c",
+            "/a/[bc]/d",
+            "/a/{b,c}/d",
+        ] {
+            let text = format!("[tm_exclude]\nexclude = [\"{e}\"]");
+            let err = Config::parse(&text, &home()).unwrap_err();
+            assert!(
+                err.contains("must be literal up to its last component"),
+                "{err}"
+            );
+        }
+        // `**/x` has a wildcard before its last `/`: rejected too.
+        assert!(Config::parse("[tm_exclude]\nexclude = [\"**/x\"]", &home()).is_err());
+        let ok = "[tm_exclude]\nexclude = [\"/a/b/*.tmp\", \"n*\"]";
+        assert!(Config::parse(ok, &home()).is_ok());
     }
 
     #[test]

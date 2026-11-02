@@ -106,7 +106,7 @@ pub fn plan(
                 blocked: None,
             };
             item.blocked = refused(&item.path, guard, keep, action)
-                .or_else(|| foreign(&item, guard))
+                .or_else(|| foreign(&item.path, item.dev, guard))
                 .or_else(|| match (action, trash_dev) {
                     (Action::Trash, None) => Some(format!(
                         "the Trash {} does not exist",
@@ -134,9 +134,28 @@ pub fn plan(
         })
 }
 
-/// Lexical and on-disk refusals: `.`/`..`, outside the scope, protected locations and their
-/// ancestors, the tool's own directories, the Trash.
+/// Lexical and on-disk refusals: [`location_refused`], then the Trash.
 fn refused(path: &Path, guard: &Guard, keep: &Keep<'_>, action: Action) -> Option<String> {
+    if let Some(why) = location_refused(path, guard, keep) {
+        return Some(why);
+    }
+    let disk = disk_form(path);
+    let trash = disk_form(keep.trash_dir);
+    if action == Action::Trash && disk.starts_with(&trash) {
+        return Some("is already in the Trash".into());
+    }
+    if trash.starts_with(&disk) {
+        return Some(format!(
+            "is or contains the Trash {}",
+            keep.trash_dir.display()
+        ));
+    }
+    None
+}
+
+/// Lexical and on-disk refusals besides the Trash: `.`/`..`, outside the scope, protected
+/// locations and their ancestors, the tool's own directories.
+pub(crate) fn location_refused(path: &Path, guard: &Guard, keep: &Keep<'_>) -> Option<String> {
     use std::path::Component::{CurDir, ParentDir};
     if path.components().any(|c| matches!(c, CurDir | ParentDir)) {
         return Some("contains `.` or `..`".into());
@@ -164,31 +183,21 @@ fn refused(path: &Path, guard: &Guard, keep: &Keep<'_>, action: Action) -> Optio
             own.display()
         ));
     }
-    let trash = disk_form(keep.trash_dir);
-    if action == Action::Trash && disk.starts_with(&trash) {
-        return Some("is already in the Trash".into());
-    }
-    if trash.starts_with(&disk) {
-        return Some(format!(
-            "is or contains the Trash {}",
-            keep.trash_dir.display()
-        ));
-    }
     None
 }
 
-/// An item on another filesystem than its parent (a mount point), or on a filesystem the guard
-/// does not allow.
-fn foreign(item: &Item, guard: &Guard) -> Option<String> {
-    let parent = item.path.parent().unwrap_or(Path::new("/"));
+/// An item `path` on device `dev` (as walked) on another filesystem than its parent (a mount
+/// point), or on a filesystem the guard does not allow.
+pub(crate) fn foreign(path: &Path, dev: u64, guard: &Guard) -> Option<String> {
+    let parent = path.parent().unwrap_or(Path::new("/"));
     match fs::symlink_metadata(parent) {
-        Ok(pm) if pm.dev() != item.dev => {
+        Ok(pm) if pm.dev() != dev => {
             return Some("is on another filesystem than its parent (a mount point)".into());
         }
         Ok(_) => {}
         Err(e) => return Some(format!("cannot stat its parent: {e}")),
     }
-    guard.filesystem_allowed(&item.path).err()
+    guard.filesystem_allowed(path).err()
 }
 
 /// Sizes the item with `lstat` only (symlinks never followed) and returns why it is blocked:

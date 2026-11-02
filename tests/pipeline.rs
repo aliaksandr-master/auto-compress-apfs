@@ -667,6 +667,84 @@ fn trash_purge_and_run() {
 }
 
 #[test]
+fn tm_exclude_and_run() {
+    let env = Env::new("tmx", "");
+    let nm = env.home.join("Work_t/proj/node_modules");
+    fs::create_dir_all(nm.join("pkg")).unwrap();
+    let src = env.home.join("Work_t/proj/src");
+    fs::create_dir_all(&src).unwrap();
+    // A compress pattern too: its summary must stay the last `summary` line.
+    fs::create_dir_all(&env.venv).unwrap();
+    fs::write(env.venv.join("a.py"), compressible("a")).unwrap();
+    let body = fs::read_to_string(&env.config).unwrap().replace(
+        "\nthreads",
+        &format!("patterns = [\"{}\"]\nthreads", env.venv.display()),
+    );
+    let rules = format!(
+        "\n[tm_exclude]\npatterns = [\"{}/**/node_modules\"]\nscheduled = true\n",
+        env.home.join("Work_t").display()
+    );
+    fs::write(&env.config, format!("{body}{rules}")).unwrap();
+    let xattr = |p: &Path| {
+        Command::new("/usr/bin/xattr")
+            .args(["-px", "com.apple.metadata:com_apple_backup_excludeItem"])
+            .arg(p)
+            .output()
+            .unwrap()
+    };
+    // Preview: lists, writes nothing.
+    let out = env.exec(&["tm-exclude"], None);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{out:?}");
+    assert!(text.contains("would exclude from Time Machine: "), "{text}");
+    assert!(text.contains("node_modules"), "{text}");
+    assert!(!xattr(&nm).status.success());
+    // run --apply: compress first, then the scheduled tm-exclude.
+    let out = env.exec(&["run", "--apply"], None);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{out:?}");
+    let (c, t) = (
+        text.find("== compress ==").unwrap(),
+        text.find("== tm-exclude ==").unwrap(),
+    );
+    assert!(c < t, "{text}");
+    let log = env.log_text();
+    let line = log
+        .lines()
+        .rev()
+        .find(|l| l.contains("tm_exclude_summary"))
+        .unwrap();
+    assert!(
+        line.contains(" excluded=1 ") && line.contains("dry_run=false"),
+        "{line}"
+    );
+    let hex: String = String::from_utf8_lossy(&xattr(&nm).stdout)
+        .split_whitespace()
+        .collect();
+    assert_eq!(
+        hex,
+        "62706C69737430305F1011636F6D2E6170706C652E6261636B75706408000000000000010100000000000000010000000000000000000000000000001C"
+    );
+    assert!(!xattr(&src).status.success());
+    // The compress summary is still the one `summary_of` finds.
+    assert!(summary_of(&log).contains_key("compressed"), "{log}");
+    // A second run finds it already excluded.
+    let out = env.exec(&["run", "--apply"], None);
+    assert!(out.status.success(), "{out:?}");
+    let log = env.log_text();
+    let line = log
+        .lines()
+        .rev()
+        .find(|l| l.contains("tm_exclude_summary"))
+        .unwrap();
+    assert!(
+        line.contains(" already=1 ") && line.contains(" excluded=0 "),
+        "{line}"
+    );
+    force_remove(&env.base);
+}
+
+#[test]
 fn quarantine_after_three_run_days() {
     let env = Env::new("quar", "");
     let venv = env.base.join("tree/Work_q/.venv");
