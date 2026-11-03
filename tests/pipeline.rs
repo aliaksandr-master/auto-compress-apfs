@@ -1161,7 +1161,7 @@ fn clean_lists_and_removes_leftovers() {
         fs::write(p, data).unwrap();
     };
     put(&venv.join("a.txt"), compressible("a").as_bytes());
-    // Fresh staging dir holding a copy: possibly a running compress, never removed.
+    // Fresh staging dir holding a copy: possibly a running compress or dedup, never removed.
     let live = venv.join(".acz-staging-1-2");
     put(&live.join("a.txt"), compressible("a").as_bytes());
     // Old empty staging and rescue dirs: removed.
@@ -1220,7 +1220,7 @@ fn clean_lists_and_removes_leftovers() {
         &format!("    {}\n", rescue.join("kept.txt").display()),
         "  ditto partial  1, 7 B\n",
         "  BLOCKED        changed less than 6h ago (last change ",
-        "may belong to a running compress; never removed\n",
+        "may belong to a running compress or dedup; never removed\n",
         "flag uchg",
         "  created        ",
         "s ago)\n",
@@ -2222,4 +2222,81 @@ fn dedup_rewritten_reference_does_not_quarantine_the_target() {
     }
     assert!(!env.quarantine().exists());
     assert_eq!(fs::read(&b).unwrap(), data);
+}
+
+#[test]
+fn clean_finds_dedup_leftovers() {
+    let env = Env::new("clean-dd", "");
+    let (comp, dd) = (env.home.join("comp"), env.home.join("dd"));
+    let base = fs::read_to_string(&env.config).unwrap();
+    let both = format!(
+        "{base}patterns = [\"{}\"]\nexclude = [\".git\"]\n\n[dedup]\npatterns = [\"{}\"]\n\
+         exclude = [\"keepme\"]\n",
+        comp.display(),
+        dd.display()
+    );
+    fs::write(&env.config, &both).unwrap();
+    // Below `keepme`, which only [dedup].exclude names: a union of both scopes' excludes would
+    // hide it, the compress scope with its own excludes finds it.
+    let c_old = comp.join("a/keepme/.acz-staging-1-5");
+    let d_old = dd.join("b/.acz-staging-1-1048576");
+    let d_rescue = dd.join("c/.acz-rescue-1-1048577");
+    for p in [&c_old, &d_old, &d_rescue] {
+        fs::create_dir_all(p).unwrap();
+        backdate(p);
+    }
+    let out = env.exec(&["clean"], None);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{out:?}");
+    for p in [&c_old, &d_old, &d_rescue] {
+        assert!(
+            stdout.contains(&format!(
+                "~/{}   ",
+                p.strip_prefix(&env.home).unwrap().display()
+            )),
+            "{stdout}"
+        );
+    }
+    assert!(
+        stdout.contains("found 3 leftover dirs (2 staging, 1 rescue)"),
+        "{stdout}"
+    );
+    assert!(
+        env.log_text()
+            .contains("clean_summary found=3 removed=0 failed=0 blocked=0 "),
+        "{}",
+        env.log_text()
+    );
+    let out = env.exec(&["clean", "--apply"], None);
+    assert!(out.status.success(), "{out:?}");
+    for p in [&c_old, &d_old, &d_rescue] {
+        assert!(!p.exists(), "{}", p.display());
+    }
+    // Only dedup patterns: clean still runs.
+    fs::write(
+        &env.config,
+        format!("{base}\n[dedup]\npatterns = [\"{}\"]\n", dd.display()),
+    )
+    .unwrap();
+    fs::create_dir_all(&d_old).unwrap();
+    backdate(&d_old);
+    let out = env.exec(&["clean"], None);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        stdout.contains(&format!(
+            "~/{}   ",
+            d_old.strip_prefix(&env.home).unwrap().display()
+        )),
+        "{stdout}"
+    );
+    assert!(stdout.contains("found 1 leftover dirs"), "{stdout}");
+    // Neither: the hint names both.
+    fs::write(&env.config, &base).unwrap();
+    let out = env.exec(&["clean"], None);
+    assert!(
+        String::from_utf8_lossy(&out.stdout)
+            .contains("no search patterns: add `patterns` or `[dedup] patterns` to"),
+        "{out:?}"
+    );
 }

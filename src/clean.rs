@@ -4,8 +4,9 @@
 //! A leftover is deleted only when its name matches the exact staging/rescue regex, it is still
 //! the directory the scan saw (same dev and inode, not a symlink), it lies on its parent's
 //! filesystem, and the scan found no flagged, dataless or foreign-filesystem entry in it. A
-//! staging or rescue dir changed within [`LIVE_GUARD`] may belong to a running compress (the
-//! run lock is per `HOME`, and such a dir can hold the user's only original) and is kept.
+//! staging or rescue dir changed within [`LIVE_GUARD`] may belong to a running compress or
+//! dedup (the run lock is per `HOME`, and such a dir can hold the user's only original) and is
+//! kept.
 //! The file classification is informational: it never decides what is deleted.
 //!
 //! Residual window: between the re-check and `remove_dir_all` nothing stops another process of
@@ -31,7 +32,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-/// A leftover with a timestamp younger than this (seconds) may belong to a running compress.
+/// A leftover with a timestamp younger than this (seconds) may belong to a running compress or
+/// dedup.
 pub const LIVE_GUARD: i64 = 6 * 3600;
 /// Byte-compares tried per leftover file before it counts as having no copy.
 const MAX_COMPARES: usize = 8;
@@ -260,12 +262,23 @@ pub fn scan(path: &Path, kind: Kind, log: &Logger) -> Option<Leftover> {
 /// Classifies the regular files of every leftover: `.BC.T_*` is a ditto partial file; a file
 /// byte-identical to a same-named, same-sized candidate below the leftover's parent has a copy
 /// (at most [`MAX_COMPARES`] compares per file, the leftover's own directory first, and
-/// [`VERIFY_BUDGET`] bytes for the whole run, after which the rest stays unclassified and the
-/// leftover is marked incomplete). Leftovers already blocked by the scan are not read.
+/// [`VERIFY_BUDGET`] bytes per call, after which the rest stays unclassified and the leftover is
+/// marked incomplete). Files an earlier call classified are not compared again, and
+/// `incomplete` stays set once any call ran out of budget; `clean` calls it once per walk scope
+/// (compress and dedup), so up to twice the budget per run. Leftovers already blocked by the
+/// scan are not read.
 /// Correct because a staged copy keeps the original's basename and basenames are unique within
 /// a batch (see `Compressor::process` and `split_batches`).
 pub fn classify(leftovers: &mut [Leftover], candidates: &[Candidate]) {
     classify_with(leftovers, candidates, VERIFY_BUDGET);
+}
+
+/// Adds the leftovers of another walk scope to `into` and sorts by path; a dir already in
+/// `into` stays once, as first found (its classification kept).
+pub fn merge(into: &mut Vec<Leftover>, more: Vec<Leftover>) {
+    let seen: std::collections::HashSet<PathBuf> = into.iter().map(|l| l.path.clone()).collect();
+    into.extend(more.into_iter().filter(|l| !seen.contains(&l.path)));
+    into.sort_unstable_by(|a, b| a.path.cmp(&b.path));
 }
 
 /// [`classify`] with `budget` bytes to compare.
@@ -290,7 +303,12 @@ fn classify_with(leftovers: &mut [Leftover], candidates: &[Candidate], mut budge
     for lo in leftovers.iter_mut() {
         let parent = lo.path.parent().unwrap_or(Path::new("/")).to_path_buf();
         let compare = lo.blocked.is_none();
-        for item in lo.entries.iter_mut().filter(|i| i.is_file) {
+        // A file classified by an earlier pass (another walk scope) is not compared again.
+        for item in lo
+            .entries
+            .iter_mut()
+            .filter(|i| i.is_file && i.class == FileClass::NoCopy)
+        {
             let name = item.path.file_name().unwrap_or_default();
             if name.as_bytes().starts_with(DITTO_TEMP_PREFIX) {
                 item.class = FileClass::DittoTemp;
@@ -335,7 +353,7 @@ pub fn block_live(leftovers: &mut [Leftover], now: i64) {
             .unwrap_or(0);
         if now.saturating_sub(newest) < LIVE_GUARD {
             lo.block(format!(
-                "changed less than {}h ago (last change {}), may belong to a running compress",
+                "changed less than {}h ago (last change {}), may belong to a running compress or dedup",
                 LIVE_GUARD / 3600,
                 ago(now.saturating_sub(newest))
             ));
@@ -463,7 +481,8 @@ pub fn render(leftovers: &[Leftover], home: &Path, now: i64, apply_cmd: &str) ->
         if lo.keep_marker {
             let _ = writeln!(
                 out,
-                "  note           has {KEEP_MARKER}: holds a file compress could not swap back"
+                "  note           has {KEEP_MARKER}: holds a file compress or dedup could not swap back, \
+                 or the original of an interrupted swap"
             );
         }
         if let Some(why) = &lo.incomplete {
@@ -492,7 +511,7 @@ pub fn render(leftovers: &[Leftover], home: &Path, now: i64, apply_cmd: &str) ->
     );
     let _ = writeln!(
         out,
-        "A running compress has staging and rescue dirs of its own; a dir changed less than {}h \
+        "A running compress or dedup has staging and rescue dirs of its own; a dir changed less than {}h \
          ago is blocked.",
         LIVE_GUARD / 3600
     );
@@ -709,6 +728,58 @@ mod tests {
         assert_eq!(ago(3 * 86400 + 4 * 3600 + 59), "3d 4h ago");
         assert_eq!(ago(-300), "5m in the future");
         assert_eq!(ago(i64::MIN), "106751991167300d 15h in the future");
+    }
+
+    #[test]
+    fn merge_lists_a_dir_of_both_scopes_once_and_reclassify_keeps_a_found_copy() {
+        let t = Tmp::new("merge");
+        t.write("v/a.txt", b"original a");
+        t.write("v/b.txt", b"original b");
+        t.write("v/.acz-staging-1-2/a.txt", b"original a");
+        t.write("v/.acz-staging-1-2/b.txt", b"original b");
+        t.write("w/.acz-staging-1-9/x.txt", b"x");
+        let mut los = vec![t.scan("v/.acz-staging-1-2", Kind::Staging)];
+        // First scope: only a.txt has a copy among its candidates.
+        classify(&mut los, &[t.cand("v/a.txt")]);
+        let more = vec![
+            t.scan("w/.acz-staging-1-9", Kind::Staging),
+            t.scan("v/.acz-staging-1-2", Kind::Staging),
+        ];
+        merge(&mut los, more);
+        let paths: Vec<_> = los.iter().map(|l| l.path.clone()).collect();
+        assert_eq!(
+            paths,
+            [
+                t.dir.join("v/.acz-staging-1-2"),
+                t.dir.join("w/.acz-staging-1-9")
+            ]
+        );
+        // Second scope: a.txt's copy is gone from its candidates, b.txt's is there.
+        fs::remove_file(t.dir.join("v/a.txt")).unwrap();
+        classify(&mut los, &[t.cand("v/b.txt")]);
+        assert_eq!(
+            class_of(&los[0], "a.txt"),
+            &FileClass::HasCopy(t.dir.join("v/a.txt"))
+        );
+        assert_eq!(
+            class_of(&los[0], "b.txt"),
+            &FileClass::HasCopy(t.dir.join("v/b.txt"))
+        );
+    }
+
+    #[test]
+    fn second_classify_pass_skips_found_copy() {
+        let t = Tmp::new("second-pass");
+        t.write("v/a.txt", b"original a");
+        t.write("v/sub/a.txt", b"original a");
+        t.write("v/.acz-staging-1-2/a.txt", b"original a");
+        let mut los = vec![t.scan("v/.acz-staging-1-2", Kind::Staging)];
+        classify(&mut los, &[t.cand("v/a.txt")]);
+        classify(&mut los, &[t.cand("v/sub/a.txt")]);
+        assert_eq!(
+            class_of(&los[0], "a.txt"),
+            &FileClass::HasCopy(t.dir.join("v/a.txt"))
+        );
     }
 
     #[test]

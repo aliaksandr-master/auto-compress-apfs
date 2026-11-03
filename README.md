@@ -279,32 +279,34 @@ auto-compress-apfs -h|--help | -V|--version
 - `quarantine list` prints the quarantine; `quarantine clear <PATH>|--all` releases entries and
   resets their streak (takes the run lock; exits 1 while a run holds it).
 - `clean` lists the leftover `.acz-staging-<pid>-<n>` and `.acz-rescue-<pid>-<n>` directories the
-  walk of the config's patterns finds (same guard and excludes as `compress`): per directory its
+  walks of the config's compress patterns and `[dedup]` patterns find (each scope with its own
+  excludes, the same guard as `compress`; a directory both find is listed once): per directory its
   kind and pid, when it was created, last modified and last written (how long ago), the mtime range
   of its files (copies keep the original's mtime), file count, logical and on-disk size, and its
   regular files classified as ditto partial files (`.BC.T_*`), files with a same-named,
   byte-identical live file below the directory's parent (`has live copy`), and files with no copy
   found, which are listed by path; symlinks and special files are listed on a line of their own,
   directories are not counted. The classification is informational and compares at most 4 GiB of
-  leftover data per run (8 compares per file); past that a directory is marked `INCOMPLETE`. The
-  preview changes nothing (it takes no lock and writes only the log, and the config when missing)
-  and ends with the exact command:
-  `Nothing changed. Run 'auto-compress-apfs clean --apply' to delete these N dirs ...`.
-  `clean --apply` takes the run lock before the walk (exits 1 while a run holds it) and deletes
-  every listed directory that is not blocked, files without a copy included. A directory is
-  blocked (listed with the reason, never deleted) when anything in it carries `uchg`, `uappnd`,
-  `schg`, `sappnd`, `restricted` or is dataless, lies on another filesystem than its parent or
-  cannot be read, and when it or anything in it changed less than 6 hours ago, staging and rescue
-  dirs alike (it may belong to a `compress` run of another `HOME`, whose lock `clean` does not
-  see, and may hold the only copy of a file). Right before each delete the name must still match
-  the exact pattern and the path must still be the same directory (not a symlink, same device and
-  inode) on its parent's filesystem; a directory swapped in between that check and the delete
-  would be deleted instead (a symlink at the leftover's own path is never followed). Each
-  delete is an INFO line `clean: removed leftover dir ...`; the run ends with
-  `clean_summary found= removed= failed= blocked= freed_bytes= dry_run=`. Every directory left
-  in place is printed to stderr with its reason. Exit code of `clean --apply`: 1 when a directory
-  was blocked or could not be (fully) removed (stderr says when it is only because of blocked
-  ones), else 0.
+  leftover data per walk scope (8 compares per file); past that a directory is marked `INCOMPLETE`.
+  The preview changes nothing (it takes no lock and writes only the log, and the config when
+  missing) and ends with the exact command: `Nothing changed. Run 'auto-compress-apfs clean
+  --apply' to delete these N dirs ...`. `clean --apply` takes the run lock before the walk (exits 1
+  while a run holds it) and deletes every listed directory that is not blocked, files without a
+  copy included. A directory is blocked (listed with the reason, never deleted) when anything in it
+  carries `uchg`, `uappnd`, `schg`, `sappnd`, `restricted` or is dataless, lies on another
+  filesystem than its parent or cannot be read, and when it or anything in it changed less than 6
+  hours ago, staging and rescue dirs alike (it may belong to a `compress` or `dedup` run of another
+  `HOME`, whose lock `clean` does not see, and may hold the only copy of a file). A rescue dir
+  older than that is deleted like any other, also one from `dedup` (whose path may then hold a
+  wrong clone and the rescue dir the only original): inspect rescue dirs before the next `clean
+  --apply`. Right before each delete the name must still match the exact pattern and the path must
+  still be the same directory (not a symlink, same device and inode) on its parent's filesystem; a
+  directory swapped in between that check and the delete would be deleted instead (a symlink at the
+  leftover's own path is never followed). Each delete is an INFO line `clean: removed leftover dir
+  ...`; the run ends with `clean_summary found= removed= failed= blocked= freed_bytes= dry_run=`.
+  Every directory left in place is printed to stderr with its reason. Exit code of `clean --apply`:
+  1 when a directory was blocked or could not be (fully) removed (stderr says when it is only
+  because of blocked ones), else 0.
 
 - `trash` and `purge` act on the files and directories matched by the `[trash]` and `[purge]`
   patterns of the config (same glob and exclude syntax as for compress; an exclude wins, also

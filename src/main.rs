@@ -796,13 +796,13 @@ fn cmd_clean(args: &CleanArgs, home: &Path) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    // Leftovers are only looked for below the patterns.
-    if cfg.patterns.is_empty() {
+    // Leftovers are only looked for below the compress and dedup patterns.
+    if cfg.patterns.is_empty() && cfg.dedup.patterns.is_empty() {
         if created {
             println!("created {}", config_path.display());
         }
         println!(
-            "no search patterns: add `patterns` to {}",
+            "no search patterns: add `patterns` or `[dedup] patterns` to {}",
             config_path.display()
         );
         return ExitCode::SUCCESS;
@@ -1481,27 +1481,44 @@ fn run_clean(
         None
     };
     let guard = walk::Guard::new(home, &cfg.allow_volumes, log)?;
-    let matcher = walk::Matcher::new(&cfg.patterns, &cfg.exclude, None)?;
-    let walked = walk::walk(
-        &matcher,
-        &guard,
-        cfg.one_file_system,
-        cfg.worker_threads(),
-        log,
-        None,
-    );
-    let staging = walked
-        .stale_staging
-        .iter()
-        .map(|p| (p, clean::Kind::Staging));
-    let rescue = walked.rescue_dirs.iter().map(|p| (p, clean::Kind::Rescue));
-    let mut leftovers: Vec<clean::Leftover> = staging
-        .chain(rescue)
-        .filter_map(|(p, kind)| clean::scan(p, kind, log))
-        .collect();
-    leftovers.sort_unstable_by(|a, b| a.path.cmp(&b.path));
-    clean::classify(&mut leftovers, &walked.candidates);
-    drop(walked);
+    // Each scope with its own excludes (as compress and dedup walk them); a scope without
+    // patterns is not walked.
+    let mut leftovers: Vec<clean::Leftover> = Vec::new();
+    for (patterns, exclude) in [
+        (&cfg.patterns, &cfg.exclude),
+        (&cfg.dedup.patterns, &cfg.dedup.exclude),
+    ] {
+        if patterns.is_empty() {
+            continue;
+        }
+        let matcher = walk::Matcher::new(patterns, exclude, None)?;
+        let walked = walk::walk(
+            &matcher,
+            &guard,
+            cfg.one_file_system,
+            cfg.worker_threads(),
+            log,
+            None,
+        );
+        let staging = walked
+            .stale_staging
+            .iter()
+            .map(|p| (p, clean::Kind::Staging));
+        let rescue = walked.rescue_dirs.iter().map(|p| (p, clean::Kind::Rescue));
+        // A dir found by both scopes is scanned once, by the first; classify then compares this
+        // scope's files with every leftover, trying only the files an earlier pass left
+        // without a copy.
+        let known: HashSet<&Path> = leftovers.iter().map(|l| l.path.as_path()).collect();
+        let found: Vec<clean::Leftover> = staging
+            .chain(rescue)
+            .filter(|(p, _)| !known.contains(p.as_path()))
+            .filter_map(|(p, kind)| clean::scan(p, kind, log))
+            .collect();
+        clean::merge(&mut leftovers, found);
+        clean::classify(&mut leftovers, &walked.candidates);
+        // One scope's walk at a time: its candidates are dropped before the next walk starts.
+        drop(walked);
+    }
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64);

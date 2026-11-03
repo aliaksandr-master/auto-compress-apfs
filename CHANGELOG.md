@@ -20,6 +20,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   consecutive run days is added to `quarantine.txt` (stamp `<timestamp> dedup`). Streaks are kept
   in the new `dedup.tsv` in the state dir; `quarantine clear` resets them too. New counters
   `quarantined=` and `requarantined_new=` on stdout and in `dedup_summary`.
+- `clean` also walks the `[dedup]` patterns (with their own excludes), so leftover staging and
+  rescue dirs of `dedup` are found; it runs when either scope has patterns.
 - `run` key in `[trash]`, `[purge]`, `[compress]` (new section), `[dedup]` and `[tm_exclude]`:
   `true`, `false` or `"dry-run-only"` (a preview even under `run --apply`). Defaults keep the old
   behaviour (compress on, the rest off). Order of `run`: trash, purge, compress, dedup,
