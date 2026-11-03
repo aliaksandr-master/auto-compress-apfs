@@ -370,9 +370,20 @@ auto-compress-apfs -h|--help | -V|--version
   difference swaps it back (a file written to right after the swap is left as written). The
   staging dir carries the keep marker from the swap until the outcome is checked; when a swap
   back fails it is moved to `.acz-rescue-*` with the original inside. Each replacement is an INFO line `deduped <path> clone_of=<ref>
-  bytes=<size>`; the run ends with `dedup: deduped= freed≈ skipped= failed=` and the log line
-  `dedup_summary ... dry_run=`. Time Machine local snapshots may keep the freed blocks until
-  they expire. Exit 1 when a replacement failed.
+  bytes=<size>`; the run ends with `dedup: deduped= freed≈ skipped= failed= quarantined=
+  requarantined_new=` and the log line `dedup_summary ... failed= quarantined= requarantined_new=
+  dry_run=`. Time Machine local snapshots may keep the freed blocks until they expire. Exit 1
+  when a replacement failed, or when `quarantine.txt` cannot be read (preview too).
+  `verify` applies to dedup too: `false` and `true` compare the clone's bytes through the
+  kernel; with `"extended"` a compressed clone's decmpfs data is also decoded in-process in the
+  same pass, as in compress. So in extended mode the reference must be uncompressed or of a
+  decodable type (7, 8, 11, 12): a group of only zlib/lzbitmap-compressed (or otherwise
+  undecodable) files is skipped (`no file of the group can be verified independently`), and
+  when the reference is an uncompressed file, the group's undecodable compressed files are
+  skipped too (`would lose its compression`) rather than replaced by uncompressed clones. Files
+  listed in the quarantine are never replaced (`skip <path>: skipped: quarantined` in the
+  preview, counted as `quarantined`, not `skipped`); a listed file is the reference only when
+  every file of its group is listed. See Quarantine for files that keep being rewritten.
 - `run` is what the launchd agent starts: `trash`, `purge`, `compress`, `dedup`, `tm-exclude` in
   that order, each as the `run` key of its config section says: `false` skips it, `true` runs
   it with the same `--apply` and `--config`, `"dry-run-only"` runs it as a preview even under
@@ -504,6 +515,13 @@ ad-hoc signature changes with every rebuild, so macOS may ask again after a rebu
   change streaks. An existing `state.tsv` that cannot be read or has
   no `#v1` header stops an `--apply` run with an ERROR (exit 1) and is left untouched; a preview
   goes on without it.
+- `~/Library/Application Support/auto-compress-apfs/dedup.tsv`: every file `dedup` replaced
+  (path, dev, inode and ctime of the clone, time, streak, last day found rewritten), with its
+  own run days (header `#dedup-v1`). Written atomically at the end of every `dedup --apply`,
+  after `quarantine.txt`; only a run with the default config prunes rows (as for `state.tsv`),
+  counts as a run day and changes streaks. One that cannot be read or has another header stops
+  `dedup --apply` with an ERROR and is left untouched; a preview goes on without it. `stat`
+  does not read it.
 - `~/.config/auto-compress-apfs/quarantine.txt` (next to the config): see Quarantine.
 
 ## Quarantine
@@ -521,6 +539,16 @@ Release only by hand: delete the line, or run
 `auto-compress-apfs quarantine clear <path>` (or `--all`). Comments and lines you add are kept.
 By design, files rewritten every day (for example dumps or exports regenerated daily) reach the
 quarantine after three run days.
+
+`dedup` uses the same list. A file it replaced that is found as a target again (it no longer
+shares its data with the identical file, and the file itself was replaced or written: its
+inode or ctime differs from the clone's) on `quarantine_after` consecutive run days of
+`dedup` is appended with the stamp `<timestamp> dedup` and skipped from then on. A rewritten
+reference or an unreadable clone id does not count. A metadata-only change (an xattr, `chmod`,
+`chflags`) also changes the ctime, so it counts if the file also lost its sharing on those days.
+Only `dedup` runs with the default config count. An entry added by `dedup` also stops
+`compress` for that file, and the other way round; one `quarantine clear` releases it for
+both and resets both streaks.
 
 ## Risks and limits
 

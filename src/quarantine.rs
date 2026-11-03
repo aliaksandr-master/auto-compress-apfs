@@ -1,7 +1,8 @@
-//! `quarantine.txt` next to the config: files that kept being decompressed again and are never
-//! compressed until a human releases them. Lines `<timestamp>\t<absolute path>`; `#` comments
-//! and blank lines are kept verbatim on every rewrite. A line holding only an absolute path is
-//! accepted too (added by hand).
+//! `quarantine.txt` next to the config: files that kept being rewritten (found decompressed
+//! again after `compress`, or no longer sharing their data after `dedup`) and are never
+//! compressed or deduplicated until a human releases them. Lines `<timestamp>\t<absolute path>`
+//! (`dedup` writes the stamp as `<timestamp> dedup`); `#` comments and blank lines are kept
+//! verbatim on every rewrite. A line holding only an absolute path is accepted too (added by hand).
 
 use crate::cache::write_atomic;
 use std::collections::HashSet;
@@ -14,8 +15,9 @@ use std::path::{Path, PathBuf};
 pub const QUARANTINE_NAME: &str = "quarantine.txt";
 
 const HEADER: &str = "\
-# auto-compress-apfs quarantine: files found decompressed again (rewritten) on several
-# consecutive run days. Files listed here are never compressed again.
+# auto-compress-apfs quarantine: files that kept being rewritten on several consecutive run
+# days (found decompressed again after compress, or no longer sharing their data with
+# identical files after dedup). Files listed here are never compressed or deduplicated again.
 # Release a file by deleting its line, or run
 #   auto-compress-apfs quarantine clear <path>      (or: quarantine clear --all)
 # Format: <timestamp><TAB><absolute path>

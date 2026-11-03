@@ -25,7 +25,7 @@ use config::Config;
 use logger::{Level, Logger};
 use progress::{FileEvent, Progress, abbreviate_home, human};
 use quarantine::{Entry, Release};
-use state::{Day, Decision, Row, State};
+use state::{Day, Decision, DedupRow, DedupState, Row, State};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, TryLockError};
 use std::io::IsTerminal;
@@ -666,7 +666,7 @@ fn check_launchd(
 }
 
 /// `quarantine list` (read-only) and `quarantine clear` (under the run lock; also resets the
-/// streak in `state.tsv`).
+/// streaks in `state.tsv` and `dedup.tsv`).
 fn cmd_quarantine(
     config: Option<PathBuf>,
     cmd: &QuarantineCmd,
@@ -694,6 +694,13 @@ fn cmd_quarantine(
         eprintln!("{NAME}: a run is in progress, try again when it has finished");
         return Ok(ExitCode::FAILURE);
     };
+    // Both states are read first: a read failure releases nothing.
+    let state_path = dir.join(state::STATE_NAME);
+    let mut st = State::load(&state_path)
+        .map_err(|e| format!("cannot read {}: {e}", state_path.display()))?;
+    let dedup_path = dir.join(state::DEDUP_STATE_NAME);
+    let mut dst = DedupState::load(&dedup_path)
+        .map_err(|e| format!("cannot read {}: {e}", dedup_path.display()))?;
     let what = target.as_deref().map_or(Release::All, Release::Path);
     let released = quarantine::clear(&qfile, what).map_err(err)?;
     if released.is_empty() {
@@ -708,9 +715,6 @@ fn cmd_quarantine(
             }
         });
     }
-    let state_path = dir.join(state::STATE_NAME);
-    let mut st = State::load(&state_path)
-        .map_err(|e| format!("cannot read {}: {e}", state_path.display()))?;
     for p in &released {
         if let Some(r) = st.rows.get_mut(p) {
             r.streak = 0;
@@ -719,6 +723,17 @@ fn cmd_quarantine(
     }
     st.store(&state_path, None)
         .map_err(|e| format!("cannot write {}: {e}", state_path.display()))?;
+    let mut changed = false;
+    for p in &released {
+        if let Some(r) = dst.rows.get_mut(p).filter(|r| r.streak != 0) {
+            r.streak = 0;
+            changed = true;
+        }
+    }
+    if changed {
+        dst.store(&dedup_path, None)
+            .map_err(|e| format!("cannot write {}: {e}", dedup_path.display()))?;
+    }
     Ok(ExitCode::SUCCESS)
 }
 
@@ -1181,6 +1196,32 @@ fn run_dedup(
     } else {
         None
     };
+    let qfile = quarantine_file(config_path);
+    // Fail closed: without the list, quarantined files would be deduplicated again.
+    let quarantined = quarantine::load(&qfile)
+        .map(|q| quarantine::paths(&q))
+        .map_err(|e| format!("cannot read {}: {e}", qfile.display()))?;
+    let state_path = state_dir(home).join(state::DEDUP_STATE_NAME);
+    // As in compress: --apply never overwrites a dedup state it could not read.
+    let mut st = match DedupState::load(&state_path) {
+        Ok(st) => st,
+        Err(e) if args.apply => {
+            return Err(format!("cannot read {}: {e}", state_path.display()));
+        }
+        Err(e) => {
+            log.warn(format_args!("cannot read {}: {e}", state_path.display()));
+            DedupState::default()
+        }
+    };
+    // Only a run over the default config prunes rows, counts as a run day and moves streaks.
+    let unrestricted = args.config.is_none();
+    let prune = args.apply && unrestricted;
+    let track_dirs: Option<HashSet<PathBuf>> = prune.then(|| {
+        st.rows
+            .keys()
+            .filter_map(|p| p.parent().map(Path::to_path_buf))
+            .collect()
+    });
     let rule = &cfg.dedup;
     let guard = walk::Guard::new(home, &cfg.allow_volumes, log)?;
     let matcher = walk::Matcher::new(&rule.patterns, &rule.exclude, None)?;
@@ -1190,28 +1231,95 @@ fn run_dedup(
         cfg.one_file_system,
         cfg.worker_threads(),
         log,
-        None,
+        track_dirs.as_ref(),
     );
+    for c in &walked.candidates {
+        if let Some(r) = st.rows.get_mut(&c.path) {
+            r.seen = true;
+        }
+    }
     let found = walked.candidates.len() as u64;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64);
+    let today = today(now)?;
     let cands = dedup::eligible(
         walked.candidates,
         rule.min_size,
         sys::effective_uid(),
         now.saturating_sub_unsigned(cfg.min_age_secs),
     );
-    let plan = dedup::plan(cands, found, log);
+    let opts = dedup::PlanOptions {
+        verify: cfg.verify,
+        quarantined: &quarantined,
+    };
+    let mut plan = dedup::plan(cands, found, &opts, log);
+    let streaks = dedup::Streaks {
+        today,
+        prev: st.previous_run_day(today),
+        threshold: cfg.quarantine_after,
+        unrestricted,
+    };
+    let reason = format!(
+        "no longer shares its data with identical files on {} consecutive run days, \
+         quarantined (release: {NAME} quarantine clear <path>)",
+        cfg.quarantine_after
+    );
+    let new_quarantine = dedup::track(&mut plan, &mut st, &streaks, &reason);
+    let (quarantined_n, requarantined_new) = plan.quarantined();
     let targets: usize = plan.groups.iter().map(|g| g.targets.len()).sum();
     let out = if args.apply {
         let out = dedup::apply(&plan, log);
+        for (p, ident) in &out.deduped_paths {
+            if !st.record_deduped(p, DedupRow::new(*ident, now)) {
+                log.debug(format_args!(
+                    "{}: path contains TAB or LF, not recorded in state",
+                    p.display()
+                ));
+            }
+        }
+        // quarantine.txt first: a streak is reset only for files actually listed.
+        if !new_quarantine.is_empty() {
+            let stamp = format!("{} dedup", logger::timestamp(SystemTime::now()));
+            let entries: Vec<Entry> = new_quarantine
+                .iter()
+                .map(|p| Entry {
+                    stamp: stamp.clone(),
+                    path: p.clone(),
+                })
+                .collect();
+            match quarantine::append(&qfile, &entries) {
+                Ok(_) => {
+                    for p in &new_quarantine {
+                        if let Some(r) = st.rows.get_mut(p) {
+                            r.streak = 0;
+                        }
+                    }
+                }
+                Err(e) => log.error(format_args!(
+                    "cannot write {}: {e}; quarantine retried next run",
+                    qfile.display()
+                )),
+            }
+        }
+        let pruned = if prune {
+            st.mark_run(today);
+            Some(&walked.read_dirs)
+        } else {
+            None
+        };
+        if let Err(e) = st.store(&state_path, pruned) {
+            log.warn(format_args!("cannot write {}: {e}", state_path.display()));
+        }
         println!(
-            "dedup: deduped={} freed\u{2248}{} skipped={} failed={}\n{}",
+            "dedup: deduped={} freed\u{2248}{} skipped={} failed={} quarantined={} \
+             requarantined_new={}\n{}",
             out.deduped,
             human(out.freed),
             out.skipped,
             out.failed,
+            quarantined_n,
+            requarantined_new,
             dedup::SNAPSHOT_NOTE
         );
         out
@@ -1229,7 +1337,7 @@ fn run_dedup(
     };
     log.info(format_args!(
         "dedup_summary walked={} groups={} targets={} already_shared={} unreadable={} \
-         deduped={} freed={} skipped={} failed={} dry_run={}",
+         deduped={} freed={} skipped={} failed={} quarantined={} requarantined_new={} dry_run={}",
         plan.walked,
         plan.groups.len(),
         targets,
@@ -1239,6 +1347,8 @@ fn run_dedup(
         out.freed,
         out.skipped,
         out.failed,
+        quarantined_n,
+        requarantined_new,
         !args.apply
     ));
     Ok(if out.failed > 0 {

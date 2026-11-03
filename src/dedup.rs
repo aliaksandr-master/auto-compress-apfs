@@ -9,14 +9,23 @@
 //! `.acz-staging-<pid>-<n>` dir next to the target (so a crash leaves a leftover the walk and
 //! `clean` already know), byte-compared with the target, swapped in with `RENAME_SWAP` and
 //! compared once more after the swap; any failure leaves the target as it was. The reference
-//! is only read, never changed.
+//! is only read, never changed. With `verify = "extended"` a compressed clone's decmpfs data is
+//! also decoded in-process in the compare before the swap (as compress does), so the reference
+//! of a group must be uncompressed or of a decodable type.
+//!
+//! Files listed in the quarantine are never targets; [`track`] adds a deduplicated file that
+//! keeps being rewritten (a target again on consecutive run days) to it.
 
-use crate::compress::{KEEP_MARKER, Verify, mark_keep, read_full, same_bytes, system_time};
+use crate::compress::{
+    self, Buffers, KEEP_MARKER, Verify, mark_keep, read_full, same_bytes, same_decoded, system_time,
+};
+use crate::config::VerifyMode;
 use crate::logger::{Level, Logger};
 use crate::progress::{abbreviate_home, human};
+use crate::state::{self, Day, Decision, DedupState, Identity};
 use crate::sys::{self, O_NOFOLLOW, PROTECTED_FLAGS, SF_DATALESS, UF_COMPRESSED};
 use crate::walk::{Candidate, FileKey, RESCUE_PREFIX, STAGING_PREFIX};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString};
 use std::fs::{self, DirBuilder, File, FileTimes, Metadata};
 use std::hash::Hash;
@@ -50,6 +59,18 @@ pub struct Member {
     pub clone_id: Option<u64>,
 }
 
+impl Member {
+    /// The identity the scan saw (dev, inode, ctime).
+    pub fn identity(&self) -> Identity {
+        Identity {
+            dev: self.c.key.dev,
+            ino: self.c.key.ino,
+            ctime_sec: self.ctime.0,
+            ctime_nsec: self.ctime.1,
+        }
+    }
+}
+
 /// What happens to a target.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum State {
@@ -57,6 +78,9 @@ pub enum State {
     Pending,
     /// Never touched, with the reason.
     Skipped(String),
+    /// Listed in the quarantine: never touched. `None` when already listed, `Some(reason)` when
+    /// this run quarantines it.
+    Quarantined(Option<String>),
 }
 
 /// Files with identical content: one reference, the rest targets.
@@ -76,9 +100,26 @@ pub struct Plan {
     pub already_shared: u64,
     /// Files that changed during the scan or could not be read.
     pub unreadable: u64,
+    /// The verify mode the plan was made for (and [`apply`] compares with).
+    pub verify: VerifyMode,
+    /// Unlisted files that share a clone id with another scanned file.
+    pub shared: HashSet<PathBuf>,
 }
 
 impl Plan {
+    /// Targets already listed in the quarantine, and those this run quarantines.
+    pub fn quarantined(&self) -> (u64, u64) {
+        let mut n = (0, 0);
+        for (_, s) in self.groups.iter().flat_map(|g| &g.targets) {
+            match s {
+                State::Quarantined(None) => n.0 += 1,
+                State::Quarantined(Some(_)) => n.1 += 1,
+                _ => {}
+            }
+        }
+        n
+    }
+
     fn pending(&self) -> impl Iterator<Item = (&Member, &Member)> {
         self.groups.iter().flat_map(|g| {
             g.targets
@@ -139,22 +180,165 @@ fn reference_order(m: &Member) -> (bool, i64, i64, &Path) {
     )
 }
 
-/// Index of the reference of `members` (see [`reference_order`]).
-pub fn pick_reference(members: &[Member]) -> usize {
-    (0..members.len())
-        .min_by(|&a, &b| reference_order(&members[a]).cmp(&reference_order(&members[b])))
-        .unwrap_or(0)
-}
-
 /// Funnel step 3: of files with the same clone id only the first in reference order stays;
-/// returns the kept members (in reference order) and how many were left out.
-pub fn collapse_clones(mut members: Vec<Member>) -> (Vec<Member>, u64) {
+/// returns the kept members (in reference order), how many were left out and the paths of
+/// every member (kept or not) whose clone id another member shares.
+pub fn collapse_clones(mut members: Vec<Member>) -> (Vec<Member>, u64, Vec<PathBuf>) {
     members.sort_by(|a, b| reference_order(a).cmp(&reference_order(b)));
+    let mut ids: HashMap<u64, usize> = HashMap::new();
+    for id in members.iter().filter_map(|m| m.clone_id) {
+        *ids.entry(id).or_default() += 1;
+    }
+    let shared = members
+        .iter()
+        .filter(|m| m.clone_id.is_some_and(|id| ids[&id] >= 2))
+        .map(|m| m.c.path.clone())
+        .collect();
     let before = members.len();
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
     members.retain(|m| m.clone_id.is_none_or(|id| seen.insert(id)));
     let dropped = (before - members.len()) as u64;
-    (members, dropped)
+    (members, dropped, shared)
+}
+
+/// Indices of the members that may be the reference, in reference order: the unlisted ones,
+/// or all when every member is listed in the quarantine.
+fn reference_pool(members: &[Member], listed: impl Fn(&Member) -> bool) -> Vec<usize> {
+    let mut pool: Vec<usize> = (0..members.len())
+        .filter(|&i| !listed(&members[i]))
+        .collect();
+    if pool.is_empty() {
+        pool = (0..members.len()).collect();
+    }
+    pool.sort_by(|&a, &b| reference_order(&members[a]).cmp(&reference_order(&members[b])));
+    pool
+}
+
+/// The first of `pool` (indices into `members`, in reference order) whose clone can be verified
+/// independently: uncompressed, or compressed with a decmpfs type the decoder reads. `type_of`
+/// reads a member's decmpfs type; an error (or a member changed since the scan) means not
+/// verifiable.
+fn verifiable_reference(
+    members: &[Member],
+    pool: &[usize],
+    type_of: impl Fn(&Member) -> io::Result<u32>,
+) -> Option<usize> {
+    pool.iter().copied().find(|&i| {
+        let m = &members[i];
+        m.c.flags & UF_COMPRESSED == 0 || type_of(m).is_ok_and(compress::is_decodable)
+    })
+}
+
+/// The decmpfs type of the member's file, an error when it changed since the scan.
+fn scanned_type(m: &Member) -> io::Result<u32> {
+    match open_unchanged(m)? {
+        Some(f) => compress::decmpfs_type(&f),
+        None => Err(io::Error::other("changed since scan")),
+    }
+}
+
+fn type_text(t: Option<u32>) -> String {
+    t.map_or_else(
+        || "an unreadable decmpfs type".to_owned(),
+        |t| format!("decmpfs type {t}"),
+    )
+}
+
+/// What [`plan`] needs besides the candidates.
+pub struct PlanOptions<'a> {
+    pub verify: VerifyMode,
+    /// Paths listed in the quarantine: never targets.
+    pub quarantined: &'a HashSet<PathBuf>,
+}
+
+/// A skip of `verify = "extended"` for the targets of a group.
+enum VerifySkip {
+    None,
+    /// No member can be verified: every target, with the reason.
+    Group(String),
+    /// The reference is uncompressed: every compressed target.
+    Compressed,
+}
+
+/// Splits one group of identical files into the reference and the targets with their states.
+/// Precedence: quarantined, then a verify skip of `verify = "extended"`, then the metadata gate.
+fn split_group(
+    mut members: Vec<Member>,
+    opts: &PlanOptions,
+    type_of: impl Fn(&Member) -> io::Result<u32>,
+    gate: impl Fn(&Member, &Member) -> io::Result<Option<String>>,
+) -> Group {
+    let listed = |m: &Member| opts.quarantined.contains(&m.c.path);
+    let pool = reference_pool(&members, listed);
+    // Extended only: the decmpfs types of the compressed members (`None`: unreadable).
+    let mut types: HashMap<PathBuf, Option<u32>> = HashMap::new();
+    let mut skip = VerifySkip::None;
+    let at = if opts.verify == VerifyMode::Extended {
+        types = members
+            .iter()
+            .filter(|m| m.c.flags & UF_COMPRESSED != 0)
+            .map(|m| (m.c.path.clone(), type_of(m).ok()))
+            .collect();
+        let known = |m: &Member| types.get(&m.c.path).copied().flatten();
+        let first = pool.iter().find_map(|&i| known(&members[i]));
+        let chosen = verifiable_reference(&members, &pool, |m| {
+            known(m).ok_or_else(|| io::Error::other("unreadable decmpfs type"))
+        });
+        match chosen {
+            // Every compressed member before it is undecodable: never trade away compression.
+            Some(i) if members[i].c.flags & UF_COMPRESSED == 0 => {
+                skip = VerifySkip::Compressed;
+                i
+            }
+            Some(i) => i,
+            None => {
+                skip = VerifySkip::Group(format!(
+                    "no file of the group can be verified independently (compressed with {}; \
+                     verify = \"extended\")",
+                    type_text(first)
+                ));
+                pool[0]
+            }
+        }
+    } else {
+        pool[0]
+    };
+    let verify_skip = |t: &Member| match &skip {
+        VerifySkip::None => None,
+        VerifySkip::Group(why) => Some(why.clone()),
+        VerifySkip::Compressed => (t.c.flags & UF_COMPRESSED != 0).then(|| {
+            match types.get(&t.c.path).copied().flatten() {
+                Some(n) => format!(
+                    "would lose its compression: the compressed files of the group use {}, \
+                     which cannot be verified independently (verify = \"extended\")",
+                    type_text(Some(n))
+                ),
+                None => "would lose its compression: its decmpfs type cannot be read \
+                         (verify = \"extended\")"
+                    .to_owned(),
+            }
+        }),
+    };
+    let reference = members.swap_remove(at);
+    members.sort_by(|a, b| a.c.path.cmp(&b.c.path));
+    let targets = members
+        .into_iter()
+        .map(|t| {
+            let state = if listed(&t) {
+                State::Quarantined(None)
+            } else if let Some(why) = verify_skip(&t) {
+                State::Skipped(why)
+            } else {
+                match gate(&reference, &t) {
+                    Ok(None) => State::Pending,
+                    Ok(Some(why)) => State::Skipped(why),
+                    Err(e) => State::Skipped(format!("cannot read metadata: {e}")),
+                }
+            };
+            (t, state)
+        })
+        .collect();
+    Group { reference, targets }
 }
 
 /// True when `m` (an `fstat`/`lstat` of the member's path) is still the version the scan saw:
@@ -280,9 +464,10 @@ fn gate(r: &Member, t: &Member) -> io::Result<Option<String>> {
 }
 
 /// Funnel steps 2 to 6 on the walked candidates (see the module doc).
-pub fn plan(cands: Vec<Candidate>, walked: u64, log: &Logger) -> Plan {
+pub fn plan(cands: Vec<Candidate>, walked: u64, opts: &PlanOptions, log: &Logger) -> Plan {
     let mut out = Plan {
         walked,
+        verify: opts.verify,
         ..Plan::default()
     };
     let mut buf = vec![0u8; BUF];
@@ -302,8 +487,10 @@ pub fn plan(cands: Vec<Candidate>, walked: u64, log: &Logger) -> Plan {
                 }
             })
             .collect();
-        let (members, shared) = collapse_clones(members);
-        out.already_shared += shared;
+        let (members, dropped, shared) = collapse_clones(members);
+        out.already_shared += dropped;
+        out.shared
+            .extend(shared.into_iter().filter(|p| !opts.quarantined.contains(p)));
         if members.len() < 2 {
             continue;
         }
@@ -312,21 +499,9 @@ pub fn plan(cands: Vec<Candidate>, walked: u64, log: &Logger) -> Plan {
             let members = part.into_iter().map(|(m, _)| m).collect();
             let hashed = hash_all(members, &mut buf, full_hash, &mut out, log);
             for same in regroup(hashed, |(_, h)| *h) {
-                let mut members: Vec<Member> = same.into_iter().map(|(m, _)| m).collect();
-                let reference = members.swap_remove(pick_reference(&members));
-                members.sort_by(|a, b| a.c.path.cmp(&b.c.path));
-                let targets = members
-                    .into_iter()
-                    .map(|t| {
-                        let state = match gate(&reference, &t) {
-                            Ok(None) => State::Pending,
-                            Ok(Some(why)) => State::Skipped(why),
-                            Err(e) => State::Skipped(format!("cannot read metadata: {e}")),
-                        };
-                        (t, state)
-                    })
-                    .collect();
-                out.groups.push(Group { reference, targets });
+                let members: Vec<Member> = same.into_iter().map(|(m, _)| m).collect();
+                out.groups
+                    .push(split_group(members, opts, scanned_type, gate));
             }
         }
     }
@@ -392,6 +567,59 @@ fn scan(c: Candidate) -> Result<Option<Member>, (PathBuf, io::Error)> {
     }))
 }
 
+/// The run days and threshold of the dedup quarantine streak.
+pub struct Streaks {
+    pub today: Day,
+    pub prev: Option<Day>,
+    /// `quarantine_after`; 0 disables.
+    pub threshold: u32,
+    /// A run over the default config: only it moves streaks (a narrowed run sees only part of
+    /// the files).
+    pub unrestricted: bool,
+}
+
+/// The quarantine streak pass, before [`apply`]: a pending target with a row in `st` (one this
+/// tool deduplicated before) that changed since counts a run day ([`state::on_unshared`]); at
+/// the threshold it becomes [`State::Quarantined`] with `reason`. A narrowed run moves no
+/// streak and quarantines only a row already at the threshold whose streak is current
+/// ([`state::streak_current`]). A shared file with a row ends
+/// its streak. Returns the paths quarantined by this run.
+pub fn track(plan: &mut Plan, st: &mut DedupState, s: &Streaks, reason: &str) -> Vec<PathBuf> {
+    let mut new = Vec::new();
+    let mut pending = HashSet::new();
+    for (t, state) in plan.groups.iter_mut().flat_map(|g| &mut g.targets) {
+        if *state != State::Pending {
+            continue;
+        }
+        pending.insert(t.c.path.clone());
+        let Some(row) = st.rows.get_mut(&t.c.path) else {
+            continue;
+        };
+        let decision = if s.unrestricted {
+            state::on_unshared(row, t.identity(), s.today, s.prev, s.threshold)
+        } else if s.threshold > 0
+            && row.streak >= s.threshold
+            && state::streak_current(row, s.today, s.prev)
+        {
+            Decision::Quarantine
+        } else {
+            Decision::Compress
+        };
+        if decision == Decision::Quarantine {
+            *state = State::Quarantined(Some(reason.to_owned()));
+            new.push(t.c.path.clone());
+        }
+    }
+    if s.unrestricted {
+        for p in plan.shared.iter().filter(|p| !pending.contains(*p)) {
+            if let Some(row) = st.rows.get_mut(p) {
+                state::on_shared(row, s.today);
+            }
+        }
+    }
+    new
+}
+
 /// The preview: every group with its reference and targets (skipped ones with the reason),
 /// the totals and the command that would do it.
 pub fn render(plan: &Plan, home: &Path, apply_cmd: &str) -> String {
@@ -411,8 +639,11 @@ pub fn render(plan: &Plan, home: &Path, apply_cmd: &str) -> String {
                 State::Pending => {
                     let _ = writeln!(s, "  clone {}", path(t));
                 }
-                State::Skipped(why) => {
+                State::Skipped(why) | State::Quarantined(Some(why)) => {
                     let _ = writeln!(s, "  skip  {}: skipped: {why}", path(t));
+                }
+                State::Quarantined(None) => {
+                    let _ = writeln!(s, "  skip  {}: skipped: quarantined", path(t));
                 }
             }
         }
@@ -443,6 +674,8 @@ pub const SNAPSHOT_NOTE: &str =
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Outcome {
     pub deduped: u64,
+    /// Every deduplicated path with the identity of the clone now at it.
+    pub deduped_paths: Vec<(PathBuf, Identity)>,
     /// Allocated bytes of the replaced targets (approximately what is freed).
     pub freed: u64,
     pub skipped: u64,
@@ -458,21 +691,33 @@ enum Miss {
     Kept(String),
 }
 
-/// Replaces every pending target by a clone of its reference (see [`replace`]).
+/// Replaces every pending target by a clone of its reference (see [`replace`]). Quarantined
+/// targets are not counted as skipped; only those quarantined by this run are logged.
 pub fn apply(plan: &Plan, log: &Logger) -> Outcome {
     let mut out = Outcome::default();
-    let mut bufs = (vec![0u8; BUF], vec![0u8; BUF]);
+    let mut bufs = Buffers::default();
     for g in &plan.groups {
         for (t, state) in &g.targets {
-            if let State::Skipped(why) = state {
-                log.info(format_args!(
-                    "dedup: {}: skipped: {why}",
-                    t.c.path.display()
-                ));
-                out.skipped += 1;
-                continue;
+            match state {
+                State::Pending => {}
+                State::Skipped(why) => {
+                    log.info(format_args!(
+                        "dedup: {}: skipped: {why}",
+                        t.c.path.display()
+                    ));
+                    out.skipped += 1;
+                    continue;
+                }
+                State::Quarantined(Some(why)) => {
+                    log.info(format_args!(
+                        "dedup: {}: skipped: {why}",
+                        t.c.path.display()
+                    ));
+                    continue;
+                }
+                State::Quarantined(None) => continue,
             }
-            match replace(&g.reference, t, &mut bufs, &sys::rename_swap) {
+            match replace(&g.reference, t, &mut bufs, plan.verify, &sys::rename_swap) {
                 Ok(Done::NotRechecked(level, why)) => {
                     log.log(
                         level,
@@ -483,7 +728,8 @@ pub fn apply(plan: &Plan, log: &Logger) -> Outcome {
                     );
                     out.skipped += 1;
                 }
-                Ok(Done::Deduped) => {
+                Ok(Done::Deduped(ident)) => {
+                    out.deduped_paths.push((t.c.path.clone(), ident));
                     log.info(format_args!(
                         "deduped {} clone_of={} bytes={}",
                         t.c.path.display(),
@@ -526,12 +772,14 @@ fn make_staging(dir: &Path) -> io::Result<PathBuf> {
 /// versions; the clone (in a staging dir next to `t`) gets `t`'s times, must have `t`'s
 /// metadata and bytes, and is swapped in only while `t` is unchanged; after the swap the file
 /// at the path is compared with the old `t` again (a difference swaps back). On every miss
-/// `t` stays as it was and the clone is removed; `r` is only read. `swap` is
-/// [`sys::rename_swap`] in production; tests inject writes through it.
+/// `t` stays as it was and the clone is removed; `r` is only read. With
+/// [`VerifyMode::Extended`] a compressed clone is also decoded in-process in the compare before
+/// the swap. `swap` is [`sys::rename_swap`] in production; tests inject writes through it.
 fn replace(
     r: &Member,
     t: &Member,
-    bufs: &mut (Vec<u8>, Vec<u8>),
+    bufs: &mut Buffers,
+    verify: VerifyMode,
     swap: &dyn Fn(&Path, &Path) -> io::Result<()>,
 ) -> Result<Done, Miss> {
     let changed = || Miss::Skip("changed since scan".into());
@@ -549,7 +797,7 @@ fn replace(
     let clone = staging.join(name);
     let made = File::open(&staging).and_then(|d| sys::fclone_at(&fr, &d, &cname));
     let result = match made {
-        Ok(()) => swap_in(t, &ft, &clone, bufs, swap),
+        Ok(()) => swap_in(t, &ft, &clone, bufs, verify, swap),
         Err(e) => Err(io_fail("cannot clone the reference", e)),
     };
     // Only after a verified outcome: the replaced original, or the clone after a checked
@@ -570,7 +818,8 @@ fn swap_in(
     t: &Member,
     ft: &File,
     clone: &Path,
-    bufs: &mut (Vec<u8>, Vec<u8>),
+    bufs: &mut Buffers,
+    verify: VerifyMode,
     swap: &dyn Fn(&Path, &Path) -> io::Result<()>,
 ) -> Result<Done, Miss> {
     let io_fail = |what: &str, e: io::Error| Miss::Fail(format!("{what}: {e}"));
@@ -621,11 +870,18 @@ fn swap_in(
         Ok(Some(w)) => return Err(Miss::Fail(format!("the clone's metadata differs ({w})"))),
         Err(e) => return Err(io_fail("cannot read the clone's metadata", e)),
     }
-    let (a, b) = (&mut bufs.0[..], &mut bufs.1[..]);
+    // A compressed clone (of a compressed reference) is also decoded independently of the
+    // kernel; a type the decoder does not read is an error (fail closed).
+    let decode = verify == VerifyMode::Extended && cm.st_flags() & UF_COMPRESSED != 0;
     let compared = (|| {
         let mut f = ft;
         f.seek(SeekFrom::Start(0))?;
-        same_bytes(ft, &fc, a, b)
+        if decode {
+            same_decoded(ft, &fc, t.c.size(), bufs)
+        } else {
+            let (a, b) = bufs.get();
+            same_bytes(ft, &fc, a, b)
+        }
     })();
     // A write during the compare shows as a changed target, not as a mismatch.
     let tm = ft.metadata().map_err(|e| io_fail("cannot stat", e))?;
@@ -647,7 +903,7 @@ fn swap_in(
     swap(clone, &t.c.path).map_err(|e| io_fail("cannot swap in the clone", e))?;
     // The old file is at `clone` now, the clone at the path.
     let what = match recheck(t, ft, &cm, clone, bufs) {
-        Recheck::Same => return Ok(Done::Deduped),
+        Recheck::Same(ident) => return Ok(Done::Deduped(ident)),
         Recheck::Replaced(level, why) => return Ok(Done::NotRechecked(level, why)),
         Recheck::Back(what) => what,
     };
@@ -681,7 +937,8 @@ fn swap_in(
 
 /// A replacement that went through.
 enum Done {
-    Deduped,
+    /// With the identity of the clone at the path.
+    Deduped(Identity),
     /// Swapped in, but the path changed right after the swap (a user's write or rename): left
     /// as it is, with the log level and the reason.
     NotRechecked(Level, String),
@@ -689,7 +946,8 @@ enum Done {
 
 /// What the compare after the swap found.
 enum Recheck {
-    Same,
+    /// With the identity of the clone at the path, from its open fd.
+    Same(Identity),
     /// The path no longer holds the untouched clone (a write or a rename by someone else):
     /// that version stays, nothing is swapped back.
     Replaced(Level, String),
@@ -701,13 +959,7 @@ enum Recheck {
 /// unchanged original `ft`; the clone's cached pages are dropped and its bytes compared with
 /// the original's. A change of the file at the path during the compare (its ctime) means a
 /// user wrote to it: [`Recheck::Replaced`].
-fn recheck(
-    t: &Member,
-    ft: &File,
-    cm: &Metadata,
-    old: &Path,
-    bufs: &mut (Vec<u8>, Vec<u8>),
-) -> Recheck {
+fn recheck(t: &Member, ft: &File, cm: &Metadata, old: &Path, bufs: &mut Buffers) -> Recheck {
     let is_clone = |m: &Metadata| {
         m.is_file()
             && m.ino() == cm.ino()
@@ -741,19 +993,23 @@ fn recheck(
         sys::evict_cached(&cur, t.c.size())?;
         let mut f = ft;
         f.seek(SeekFrom::Start(0))?;
-        same_bytes(ft, &cur, &mut bufs.0, &mut bufs.1)
+        let (a, b) = bufs.get();
+        same_bytes(ft, &cur, a, b)
     })();
-    let still = cur.metadata().is_ok_and(|m| {
-        is_clone(&m) && (m.ctime(), m.ctime_nsec()) == (now.ctime(), now.ctime_nsec())
-    }) && fs::symlink_metadata(&t.c.path).is_ok_and(|m| m.ino() == cm.ino());
-    if !still {
+    let still = cur
+        .metadata()
+        .ok()
+        .filter(|m| is_clone(m) && (m.ctime(), m.ctime_nsec()) == (now.ctime(), now.ctime_nsec()));
+    let Some(still) =
+        still.filter(|_| fs::symlink_metadata(&t.c.path).is_ok_and(|m| m.ino() == cm.ino()))
+    else {
         return replaced();
-    }
+    };
     if !original_kept() {
         return Recheck::Back("the original changed right after the swap".into());
     }
     match compared {
-        Ok(Verify::Same) => Recheck::Same,
+        Ok(Verify::Same) => Recheck::Same(Identity::of(&still)),
         Ok(_) => Recheck::Back("the file at the path differs from the original".into()),
         Err(e) => Recheck::Back(format!("cannot re-check after the swap: {e}")),
     }
@@ -859,17 +1115,18 @@ mod tests {
             member("/r/a", 2, 9, 5, 0, None),
             member("/r/c", 3, 9, 4, 0, None),
         ];
-        assert_eq!(ms[pick_reference(&ms)].c.path, Path::new("/r/c"));
+        let pick = |ms: &[Member]| reference_pool(ms, |_| false)[0];
+        assert_eq!(ms[pick(&ms)].c.path, Path::new("/r/c"));
         let ms = vec![
             member("/r/b", 1, 9, 5, 0, None),
             member("/r/a", 2, 9, 5, 0, None),
         ];
-        assert_eq!(ms[pick_reference(&ms)].c.path, Path::new("/r/a"));
+        assert_eq!(ms[pick(&ms)].c.path, Path::new("/r/a"));
         let ms = vec![
             member("/r/c", 3, 9, 4, 0, None),
             member("/r/z", 4, 9, 9, UF_COMPRESSED, None),
         ];
-        assert_eq!(ms[pick_reference(&ms)].c.path, Path::new("/r/z"));
+        assert_eq!(ms[pick(&ms)].c.path, Path::new("/r/z"));
     }
 
     #[test]
@@ -881,7 +1138,7 @@ mod tests {
             member("/r/d", 4, 9, 6, 0, None),
             member("/r/e", 5, 9, 6, 0, Some(8)),
         ];
-        let (kept, dropped) = collapse_clones(ms);
+        let (kept, dropped, _) = collapse_clones(ms);
         assert_eq!(dropped, 1);
         let paths: Vec<_> = kept.iter().map(|m| m.c.path.to_str().unwrap()).collect();
         assert_eq!(paths, ["/r/a", "/r/c", "/r/d", "/r/e"]);
@@ -981,6 +1238,448 @@ mod tests {
             .collect()
     }
 
+    /// `data` stored as decmpfs type 1 (uncompressed, inline in the header) at `path`: a
+    /// compressed file the independent decoder cannot read.
+    fn undecodable_compressed(path: &Path, data: &[u8]) {
+        let f = File::create(path).unwrap();
+        let mut header = b"fpmc".to_vec();
+        header.extend_from_slice(&1u32.to_le_bytes());
+        header.extend_from_slice(&(data.len() as u64).to_le_bytes());
+        header.extend_from_slice(data);
+        sys::fset_xattr(&f, sys::DECMPFS, &header, 0).unwrap();
+        sys::fchflags(&f, UF_COMPRESSED).unwrap();
+    }
+
+    fn temp(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("acz-dedup-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn snap(dir: &Path, p: &Path) -> Member {
+        let m = fs::symlink_metadata(p).unwrap();
+        scan(Candidate::new(p.to_path_buf(), Arc::from(dir), &m))
+            .unwrap()
+            .unwrap()
+    }
+
+    fn some_bytes(n: u32) -> Vec<u8> {
+        (0..n).map(|i| (i % 251) as u8).collect()
+    }
+
+    #[test]
+    fn extended_replace_refuses_an_undecodable_clone() {
+        let dir = temp("undecodable");
+        let data = some_bytes(3000);
+        let (rp, tp) = (dir.join("r"), dir.join("t"));
+        undecodable_compressed(&rp, &data);
+        fs::write(&tp, &data).unwrap();
+        assert_eq!(fs::read(&rp).unwrap(), data, "the kernel reads type 1");
+        let (r, t) = (snap(&dir, &rp), snap(&dir, &tp));
+        let mut bufs = Buffers::default();
+        match replace(&r, &t, &mut bufs, VerifyMode::Extended, &sys::rename_swap) {
+            Err(Miss::Fail(why)) => {
+                assert!(why.starts_with("cannot compare with the clone: "), "{why}");
+                assert!(why.contains("cannot be decoded independently"), "{why}");
+            }
+            _ => panic!("not a failure"),
+        }
+        assert_eq!(fs::symlink_metadata(&tp).unwrap().ino(), t.c.key.ino);
+        assert!(staging_in(&dir).is_empty(), "{:?}", staging_in(&dir));
+        // The kernel compare alone accepts the clone.
+        assert!(matches!(
+            replace(&r, &t, &mut bufs, VerifyMode::Compare, &sys::rename_swap),
+            Ok(Done::Deduped(_))
+        ));
+        let m = fs::symlink_metadata(&tp).unwrap();
+        assert!(m.st_flags() & UF_COMPRESSED != 0);
+        assert_eq!(fs::read(&tp).unwrap(), data);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn extended_replace_decodes_a_ditto_compressed_reference() {
+        let dir = temp("ditto-ref");
+        let probe_dir = dir.join("probe");
+        fs::create_dir(&probe_dir).unwrap();
+        let args = compress::probe(&probe_dir).unwrap();
+        let data = b"dedup: a ditto-compressed reference, decoded independently\n".repeat(4096);
+        let (src, out) = (dir.join("src"), dir.join("out"));
+        fs::write(&src, &data).unwrap();
+        fs::create_dir(&out).unwrap();
+        let ok = std::process::Command::new("/usr/bin/ditto")
+            .args(args)
+            .arg(&src)
+            .arg(out.join("r"))
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+        let (rp, tp) = (out.join("r"), out.join("t"));
+        assert!(fs::symlink_metadata(&rp).unwrap().st_flags() & UF_COMPRESSED != 0);
+        let t_type = compress::decmpfs_type(&File::open(&rp).unwrap()).unwrap();
+        assert!(compress::is_decodable(t_type), "{t_type}");
+        fs::write(&tp, &data).unwrap();
+        let (r, t) = (snap(&out, &rp), snap(&out, &tp));
+        let mut bufs = Buffers::default();
+        let ident = match replace(&r, &t, &mut bufs, VerifyMode::Extended, &sys::rename_swap) {
+            Ok(Done::Deduped(ident)) => ident,
+            _ => panic!("not deduped"),
+        };
+        let m = fs::symlink_metadata(&tp).unwrap();
+        assert_eq!(ident, Identity::of(&m));
+        assert_ne!(m.ino(), t.c.key.ino);
+        assert!(m.st_flags() & UF_COMPRESSED != 0);
+        assert_eq!(fs::read(&tp).unwrap(), data);
+        // same_decoded compares from the current offsets: swap_in seeks the target to 0 first.
+        let (mut ft, fc) = (File::open(&src).unwrap(), File::open(&tp).unwrap());
+        io::Read::read_to_end(&mut ft, &mut Vec::new()).unwrap();
+        let n = data.len() as u64;
+        assert!(!matches!(
+            same_decoded(&ft, &fc, n, &mut bufs),
+            Ok(Verify::Same)
+        ));
+        let (mut ft, fc) = (File::open(&src).unwrap(), File::open(&tp).unwrap());
+        io::Read::read_to_end(&mut ft, &mut Vec::new()).unwrap();
+        ft.seek(SeekFrom::Start(0)).unwrap();
+        assert!(matches!(
+            same_decoded(&ft, &fc, n, &mut bufs),
+            Ok(Verify::Same)
+        ));
+        assert!(staging_in(&out).is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Splits `members` with the decmpfs types of `types` (by path; missing = an error) and a
+    /// gate that lets everything through but records whom it saw.
+    fn split(
+        members: Vec<Member>,
+        verify: VerifyMode,
+        quarantined: &[&str],
+        types: &[(&str, u32)],
+    ) -> (Group, Vec<PathBuf>) {
+        let q: HashSet<PathBuf> = quarantined.iter().map(PathBuf::from).collect();
+        let opts = PlanOptions {
+            verify,
+            quarantined: &q,
+        };
+        let gated = std::cell::RefCell::new(Vec::new());
+        let type_of = |m: &Member| {
+            types
+                .iter()
+                .find(|(p, _)| Path::new(p) == m.c.path)
+                .map(|(_, t)| *t)
+                .ok_or_else(|| io::Error::other("injected"))
+        };
+        let g = split_group(members, &opts, type_of, |_, t| {
+            gated.borrow_mut().push(t.c.path.clone());
+            Ok(None)
+        });
+        (g, gated.into_inner())
+    }
+
+    fn states(g: &Group) -> Vec<(&str, &State)> {
+        g.targets
+            .iter()
+            .map(|(m, s)| (m.c.path.to_str().unwrap(), s))
+            .collect()
+    }
+
+    #[test]
+    fn extended_plan_prefers_a_verifiable_reference() {
+        let c = UF_COMPRESSED;
+        let lose = |n: u32| {
+            State::Skipped(format!(
+                "would lose its compression: the compressed files of the group use decmpfs type \
+                 {n}, which cannot be verified independently (verify = \"extended\")"
+            ))
+        };
+        // Type 4 (zlib) and an uncompressed file: the uncompressed one, the zlib one is kept.
+        let ms = vec![
+            member("/r/a", 1, 9, 1, c, None),
+            member("/r/b", 2, 9, 2, 0, None),
+        ];
+        let (g, _) = split(ms.clone(), VerifyMode::Extended, &[], &[("/r/a", 4)]);
+        assert_eq!(g.reference.c.path, Path::new("/r/b"));
+        assert_eq!(states(&g), [("/r/a", &lose(4))]);
+        // Compare mode keeps today's choice.
+        let (g, _) = split(ms, VerifyMode::Compare, &[], &[]);
+        assert_eq!(g.reference.c.path, Path::new("/r/a"));
+        assert_eq!(states(&g), [("/r/b", &State::Pending)]);
+        // Types 4, 8 and uncompressed: the LZVN file; both others are cloned from it.
+        let ms = vec![
+            member("/r/a", 1, 9, 1, c, None),
+            member("/r/c", 3, 9, 2, c, None),
+            member("/r/b", 2, 9, 3, 0, None),
+        ];
+        let (g, _) = split(ms, VerifyMode::Extended, &[], &[("/r/a", 4), ("/r/c", 8)]);
+        assert_eq!(g.reference.c.path, Path::new("/r/c"));
+        assert_eq!(
+            states(&g),
+            [("/r/a", &State::Pending), ("/r/b", &State::Pending)]
+        );
+        // A type that cannot be read is not verifiable: the next one is taken.
+        let ms = vec![
+            member("/r/a", 1, 9, 1, c, None),
+            member("/r/b", 2, 9, 2, c, None),
+        ];
+        let (g, _) = split(ms, VerifyMode::Extended, &[], &[("/r/b", 12)]);
+        assert_eq!(g.reference.c.path, Path::new("/r/b"));
+        assert_eq!(states(&g), [("/r/a", &State::Pending)]);
+    }
+
+    #[test]
+    fn extended_plan_reads_the_types_of_real_files() {
+        let dir = temp("plan-types");
+        let data = some_bytes(3000);
+        let (rp, tp) = (dir.join("a"), dir.join("b"));
+        undecodable_compressed(&rp, &data);
+        fs::write(&tp, &data).unwrap();
+        let cand = |p: &Path| {
+            let m = fs::symlink_metadata(p).unwrap();
+            Candidate::new(p.to_path_buf(), Arc::from(dir.as_path()), &m)
+        };
+        let logs = temp("plan-types-log");
+        let log = Logger::open(&logs, 1 << 20, 1, false).unwrap();
+        let q = HashSet::new();
+        let run = |verify| {
+            let opts = PlanOptions {
+                verify,
+                quarantined: &q,
+            };
+            plan(vec![cand(&rp), cand(&tp)], 2, &opts, &log)
+        };
+        let p = run(VerifyMode::Extended);
+        assert_eq!(p.groups.len(), 1);
+        let g = &p.groups[0];
+        assert_eq!(g.reference.c.path, tp);
+        match &g.targets[..] {
+            [(m, State::Skipped(why))] => {
+                assert_eq!(m.c.path, rp);
+                assert!(why.starts_with("would lose its compression"), "{why}");
+                assert!(why.contains("decmpfs type 1,"), "{why}");
+            }
+            other => panic!("{other:?}"),
+        }
+        let p = run(VerifyMode::Compare);
+        assert_eq!(p.groups[0].reference.c.path, rp);
+        assert_eq!(p.groups[0].targets[0].1, State::Pending);
+        fs::remove_dir_all(&dir).unwrap();
+        fs::remove_dir_all(&logs).unwrap();
+    }
+
+    #[test]
+    fn extended_plan_skips_a_group_without_verifiable_reference() {
+        let c = UF_COMPRESSED;
+        let ms = vec![
+            member("/r/a", 1, 9, 1, c, None),
+            member("/r/b", 2, 9, 2, c, None),
+            member("/r/d", 3, 9, 3, c, None),
+        ];
+        let types = [("/r/a", 4), ("/r/b", 3)];
+        let (g, gated) = split(ms.clone(), VerifyMode::Extended, &[], &types);
+        assert_eq!(g.reference.c.path, Path::new("/r/a"));
+        let why = State::Skipped(
+            "no file of the group can be verified independently (compressed with decmpfs type \
+             4; verify = \"extended\")"
+                .into(),
+        );
+        assert_eq!(states(&g), [("/r/b", &why), ("/r/d", &why)]);
+        assert!(gated.is_empty(), "{gated:?}");
+        let (g, _) = split(ms, VerifyMode::Compare, &[], &types);
+        assert_eq!(
+            states(&g),
+            [("/r/b", &State::Pending), ("/r/d", &State::Pending)]
+        );
+    }
+
+    #[test]
+    fn plan_marks_quarantined_targets_and_keeps_a_quarantined_reference() {
+        let ms = vec![
+            member("/r/a", 1, 9, 1, 0, None),
+            member("/r/b", 2, 9, 2, 0, None),
+            member("/r/c", 3, 9, 3, 0, None),
+        ];
+        // A listed file is not the reference while an unlisted one is there, and never gated.
+        let (g, gated) = split(ms.clone(), VerifyMode::Compare, &["/r/a"], &[]);
+        assert_eq!(g.reference.c.path, Path::new("/r/b"));
+        assert_eq!(
+            states(&g),
+            [
+                ("/r/a", &State::Quarantined(None)),
+                ("/r/c", &State::Pending)
+            ]
+        );
+        assert_eq!(gated, [PathBuf::from("/r/c")]);
+        // Quarantined goes before a verify skip.
+        let c = UF_COMPRESSED;
+        let cs = vec![
+            member("/r/a", 1, 9, 1, c, None),
+            member("/r/b", 2, 9, 2, c, None),
+        ];
+        let (g, _) = split(cs, VerifyMode::Extended, &["/r/b"], &[]);
+        assert_eq!(states(&g), [("/r/b", &State::Quarantined(None))]);
+        // All listed: the usual reference stays.
+        let (g, gated) = split(ms.clone(), VerifyMode::Off, &["/r/a", "/r/b", "/r/c"], &[]);
+        assert_eq!(g.reference.c.path, Path::new("/r/a"));
+        assert!(gated.is_empty());
+        // Nothing listed: today's plan.
+        let (g, _) = split(ms, VerifyMode::Off, &[], &[]);
+        assert_eq!(g.reference.c.path, Path::new("/r/a"));
+        assert_eq!(
+            states(&g),
+            [("/r/b", &State::Pending), ("/r/c", &State::Pending)]
+        );
+    }
+
+    #[test]
+    fn collapse_reports_every_member_of_a_shared_clone_id() {
+        let ms = vec![
+            member("/r/b", 1, 9, 5, 0, Some(7)),
+            member("/r/a", 2, 9, 5, 0, Some(7)),
+            member("/r/c", 3, 9, 6, 0, None),
+            member("/r/e", 5, 9, 6, 0, Some(8)),
+        ];
+        let (kept, _, mut shared) = collapse_clones(ms);
+        shared.sort();
+        assert_eq!(shared, ["/r/a", "/r/b"].map(PathBuf::from));
+        assert_eq!(kept.len(), 3);
+    }
+
+    fn day(s: &str) -> Day {
+        Day::parse(s).unwrap()
+    }
+
+    /// A plan with one group: reference `/r/a`, the given targets.
+    fn one_group(targets: Vec<(Member, State)>) -> Plan {
+        Plan {
+            groups: vec![Group {
+                reference: member("/r/a", 1, 9, 1, 0, None),
+                targets,
+            }],
+            ..Plan::default()
+        }
+    }
+
+    fn row(m: &Member, streak: u32, last: Option<Day>) -> state::DedupRow {
+        let mut r = state::DedupRow::new(m.identity(), 0);
+        r.streak = streak;
+        r.last_found_day = last;
+        r
+    }
+
+    #[test]
+    fn track_counts_only_rewritten_targets_and_quarantines_at_the_threshold() {
+        let (d1, d2) = (day("2026-11-01"), day("2026-11-02"));
+        let s = |unrestricted, threshold| Streaks {
+            today: d2,
+            prev: Some(d1),
+            threshold,
+            unrestricted,
+        };
+        let t = member("/r/t", 2, 9, 2, 0, None);
+        let rewritten = member("/r/t", 9, 9, 2, 0, None);
+        let state_with = |r: state::DedupRow| {
+            let mut st = DedupState::default();
+            st.rows.insert(PathBuf::from("/r/t"), r);
+            st
+        };
+        // Target identity unchanged (the reference was rewritten, or no clone id): no move.
+        let mut st = state_with(row(&t, 1, Some(d1)));
+        let mut p = one_group(vec![(t.clone(), State::Pending)]);
+        assert!(track(&mut p, &mut st, &s(true, 2), "why").is_empty());
+        assert_eq!(st.rows[Path::new("/r/t")].streak, 1);
+        // Rewritten on the next run day: counted, at the threshold quarantined.
+        let mut p = one_group(vec![(rewritten.clone(), State::Pending)]);
+        assert_eq!(
+            track(&mut p, &mut st, &s(true, 2), "why"),
+            [PathBuf::from("/r/t")]
+        );
+        assert_eq!(
+            p.groups[0].targets[0].1,
+            State::Quarantined(Some("why".into()))
+        );
+        assert_eq!(p.quarantined(), (0, 1));
+        assert_eq!(st.rows[Path::new("/r/t")].ident, rewritten.identity());
+        // Below the threshold: counted, still pending.
+        let mut st = state_with(row(&t, 1, Some(d1)));
+        let mut p = one_group(vec![(rewritten.clone(), State::Pending)]);
+        assert!(track(&mut p, &mut st, &s(true, 3), "why").is_empty());
+        assert_eq!(st.rows[Path::new("/r/t")].streak, 2);
+        assert_eq!(p.groups[0].targets[0].1, State::Pending);
+        // Threshold 0 never quarantines.
+        let mut st = state_with(row(&t, 5, Some(d1)));
+        let mut p = one_group(vec![(rewritten.clone(), State::Pending)]);
+        assert!(track(&mut p, &mut st, &s(true, 0), "why").is_empty());
+        // A narrowed run moves nothing and quarantines only at the threshold.
+        let mut st = state_with(row(&t, 1, Some(d1)));
+        let mut p = one_group(vec![(rewritten.clone(), State::Pending)]);
+        assert!(track(&mut p, &mut st, &s(false, 2), "why").is_empty());
+        assert_eq!(st.rows[Path::new("/r/t")], row(&t, 1, Some(d1)));
+        let mut st = state_with(row(&t, 2, Some(d1)));
+        let mut p = one_group(vec![(rewritten.clone(), State::Pending)]);
+        assert_eq!(track(&mut p, &mut st, &s(false, 2), "why").len(), 1);
+        // An already listed target: no move.
+        let mut st = state_with(row(&t, 1, Some(d1)));
+        let mut p = one_group(vec![(rewritten.clone(), State::Quarantined(None))]);
+        assert!(track(&mut p, &mut st, &s(true, 2), "why").is_empty());
+        assert_eq!(st.rows[Path::new("/r/t")].streak, 1);
+        assert_eq!(p.quarantined(), (1, 0));
+        // No row (never deduplicated by this tool): nothing.
+        let mut st = DedupState::default();
+        assert!(track(&mut p, &mut st, &s(true, 1), "why").is_empty());
+    }
+
+    #[test]
+    fn track_narrowed_ignores_a_stale_streak() {
+        let t = member("/r/t", 2, 9, 2, 0, None);
+        let mut st = DedupState::default();
+        st.rows
+            .insert(PathBuf::from("/r/t"), row(&t, 2, Some(day("2026-10-01"))));
+        let mut p = one_group(vec![(t, State::Pending)]);
+        let s = Streaks {
+            today: day("2026-11-02"),
+            prev: Some(day("2026-11-01")),
+            threshold: 2,
+            unrestricted: false,
+        };
+        assert!(track(&mut p, &mut st, &s, "why").is_empty());
+        assert_eq!(p.groups[0].targets[0].1, State::Pending);
+    }
+
+    #[test]
+    fn track_ends_the_streak_of_a_shared_file_and_counts_one_rewrite_once() {
+        let (d1, d2, d3) = (day("2026-11-01"), day("2026-11-02"), day("2026-11-03"));
+        let t = member("/r/t", 2, 9, 2, 0, None);
+        let mut st = DedupState::default();
+        st.rows.insert(PathBuf::from("/r/t"), row(&t, 2, Some(d1)));
+        let mut p = one_group(Vec::new());
+        p.shared.insert(PathBuf::from("/r/t"));
+        let s = |today, prev| Streaks {
+            today,
+            prev: Some(prev),
+            threshold: 3,
+            unrestricted: true,
+        };
+        // A narrowed run leaves it.
+        let narrowed = Streaks {
+            unrestricted: false,
+            ..s(d2, d1)
+        };
+        track(&mut p, &mut st, &narrowed, "why");
+        assert_eq!(st.rows[Path::new("/r/t")].streak, 2);
+        track(&mut p, &mut st, &s(d2, d1), "why");
+        assert_eq!(st.rows[Path::new("/r/t")].streak, 0);
+        // Rewritten once, then the re-dedup fails on two more run days: counted once.
+        let rewritten = member("/r/t", 9, 9, 2, 0, None);
+        for (today, prev) in [(d3, d2), (day("2026-11-04"), d3), (day("2026-11-05"), d3)] {
+            let mut p = one_group(vec![(rewritten.clone(), State::Pending)]);
+            track(&mut p, &mut st, &s(today, prev), "why");
+        }
+        assert_eq!(st.rows[Path::new("/r/t")].streak, 1);
+    }
+
     #[test]
     fn write_right_after_the_swap_is_kept_without_swap_back() {
         let (dir, r, t) = pair("after-write");
@@ -991,9 +1690,9 @@ mod tests {
             fs::write(b, "user wrote this").unwrap();
             Ok(())
         };
-        let mut bufs = (vec![0u8; BUF], vec![0u8; BUF]);
+        let mut bufs = Buffers::default();
         assert!(matches!(
-            replace(&r, &t, &mut bufs, &swap),
+            replace(&r, &t, &mut bufs, VerifyMode::Compare, &swap),
             Ok(Done::NotRechecked(Level::Debug, _))
         ));
         assert_eq!(calls.get(), 1, "swapped back");
@@ -1020,8 +1719,8 @@ mod tests {
             }
             Ok(())
         };
-        let mut bufs = (vec![0u8; BUF], vec![0u8; BUF]);
-        match replace(&r, &t, &mut bufs, &swap) {
+        let mut bufs = Buffers::default();
+        match replace(&r, &t, &mut bufs, VerifyMode::Compare, &swap) {
             Err(Miss::Fail(why)) => assert!(why.ends_with("original restored"), "{why}"),
             _ => panic!("not a failure"),
         }
@@ -1037,10 +1736,10 @@ mod tests {
     fn replace_keeps_times_and_shares_the_clone_id() {
         let (dir, r, t) = pair("ok");
         let before = fs::symlink_metadata(&t.c.path).unwrap();
-        let mut bufs = (vec![0u8; BUF], vec![0u8; BUF]);
+        let mut bufs = Buffers::default();
         assert!(matches!(
-            replace(&r, &t, &mut bufs, &sys::rename_swap),
-            Ok(Done::Deduped)
+            replace(&r, &t, &mut bufs, VerifyMode::Compare, &sys::rename_swap),
+            Ok(Done::Deduped(_))
         ));
         let after = fs::symlink_metadata(&t.c.path).unwrap();
         assert_ne!(after.ino(), before.ino());
@@ -1071,8 +1770,8 @@ mod tests {
             std::io::Write::write_all(&mut &f, b"x").unwrap();
             Ok(())
         };
-        let mut bufs = (vec![0u8; BUF], vec![0u8; BUF]);
-        let why = match replace(&r, &t, &mut bufs, &swap) {
+        let mut bufs = Buffers::default();
+        let why = match replace(&r, &t, &mut bufs, VerifyMode::Compare, &swap) {
             Err(Miss::Kept(why)) => why,
             _ => panic!("not kept"),
         };

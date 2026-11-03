@@ -170,7 +170,7 @@ struct Decode {
 }
 
 impl Buffers {
-    fn get(&mut self) -> (&mut [u8], &mut [u8]) {
+    pub(crate) fn get(&mut self) -> (&mut [u8], &mut [u8]) {
         if self.a.is_empty() {
             self.a = vec![0; VERIFY_BUF];
             self.b = vec![0; VERIFY_BUF];
@@ -1745,6 +1745,20 @@ pub(crate) fn same_bytes(
 /// decmpfs types the independent decoder reads: LZVN and LZFSE, inline or in the resource fork.
 const DECODABLE_TYPES: [u32; 4] = [7, 8, 11, 12];
 
+/// Whether the independent decoder reads decmpfs type `t`.
+pub(crate) fn is_decodable(t: u32) -> bool {
+    DECODABLE_TYPES.contains(&t)
+}
+
+/// The decmpfs compression type of `f` (an error when it has no decmpfs xattr).
+pub(crate) fn decmpfs_type(f: &File) -> io::Result<u32> {
+    let header = sys::fget_xattr(f, sys::DECMPFS, true)?
+        .ok_or_else(|| invalid("no decmpfs xattr".to_owned()))?;
+    Ok(decmpfs::Value::from_data(&header)?
+        .compression_type
+        .raw_type())
+}
+
 fn invalid(msg: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg)
 }
@@ -1875,12 +1889,24 @@ fn verify_extended(c: &Candidate, staged: &Path, bufs: &mut Buffers) -> io::Resu
         return Ok(Verify::Changed);
     }
     let copy = File::open(staged)?;
-    let mut stored = StoredData::open(&copy, c.size())?;
+    same_decoded(&orig, &copy, c.size(), bufs)
+}
+
+/// In one pass from their current offsets, every chunk of `orig` must equal both the kernel's
+/// read of `copy` and `copy`'s decmpfs data (uncompressed size `size`) decoded in-process.
+/// Stored data that cannot be decoded is an error.
+pub(crate) fn same_decoded(
+    orig: &File,
+    copy: &File,
+    size: u64,
+    bufs: &mut Buffers,
+) -> io::Result<Verify> {
+    let mut stored = StoredData::open(copy, size)?;
     let (a, b, d) = bufs.get_extended();
     let mut chunk = std::mem::take(&mut d.chunk);
     let r = (|| loop {
-        let na = read_full(&orig, a)?;
-        let nb = read_full(&copy, b)?;
+        let na = read_full(orig, a)?;
+        let nb = read_full(copy, b)?;
         if na != nb || a[..na] != b[..nb] {
             return Ok(Verify::Mismatch);
         }

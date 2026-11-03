@@ -13,6 +13,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   them (found by size, clone id, then BLAKE3 of head and tail and of all bytes). Only files
   whose owner, group, mode, flags and xattrs equal the kept file's and that have no ACL are
   replaced; the clone is byte-compared before and after the `RENAME_SWAP`. Preview by default.
+  `dedup` honours `verify`: with `"extended"` a compressed clone is also decoded in-process
+  before the swap, and groups or files that cannot be verified that way are skipped with the
+  reason (never replaced by an uncompressed clone). Files listed in `quarantine.txt` are never
+  replaced; a file `dedup` replaced that is rewritten and found unshared on `quarantine_after`
+  consecutive run days is added to `quarantine.txt` (stamp `<timestamp> dedup`). Streaks are kept
+  in the new `dedup.tsv` in the state dir; `quarantine clear` resets them too. New counters
+  `quarantined=` and `requarantined_new=` on stdout and in `dedup_summary`.
 - `run` key in `[trash]`, `[purge]`, `[compress]` (new section), `[dedup]` and `[tm_exclude]`:
   `true`, `false` or `"dry-run-only"` (a preview even under `run --apply`). Defaults keep the old
   behaviour (compress on, the rest off). Order of `run`: trash, purge, compress, dedup,

@@ -1979,3 +1979,247 @@ fn dedup_preview_run_modes_and_apply() {
         "{out:?}"
     );
 }
+
+/// The key/values of the last dedup_summary line.
+fn dedup_kv(log: &str) -> HashMap<String, String> {
+    dedup_summary(log)
+        .split(' ')
+        .filter_map(|kv| kv.split_once('='))
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+impl Env {
+    fn dedup_state(&self) -> PathBuf {
+        self.state().with_file_name("dedup.tsv")
+    }
+
+    /// The streak column of `path`'s row in dedup.tsv.
+    fn dedup_streak(&self, path: &Path) -> Option<u32> {
+        let text = fs::read_to_string(self.dedup_state()).ok()?;
+        let prefix = format!("{}\t", path.display());
+        let line = text.lines().find(|l| l.starts_with(&prefix))?;
+        line.split('\t').nth(6)?.parse().ok()
+    }
+
+    /// A config with `[dedup]` over `dir`.
+    fn dedup_config(&self, dir: &Path) {
+        let base = fs::read_to_string(&self.config).unwrap();
+        fs::write(
+            &self.config,
+            format!("{base}\n[dedup]\npatterns = [\"{}\"]\n", dir.display()),
+        )
+        .unwrap();
+    }
+}
+
+/// Replaces `p` by a new file (new inode, so no longer a clone) with the same bytes.
+fn replace_by_rename(p: &Path) {
+    let bytes = fs::read(p).unwrap();
+    let tmp = p.with_file_name("rewrite.tmp");
+    fs::write(&tmp, bytes).unwrap();
+    fs::rename(&tmp, p).unwrap();
+}
+
+#[test]
+fn dedup_quarantine_after_three_run_days() {
+    let env = Env::new("dedup-q", "quarantine_after = 3");
+    let dir = env.base.join("tree/dq");
+    fs::create_dir_all(&dir).unwrap();
+    env.dedup_config(&dir);
+    let data = random_bytes(1_100_000);
+    let (a, b) = (dir.join("a"), dir.join("b"));
+    fs::write(&a, &data).unwrap();
+    fs::write(&b, &data).unwrap();
+    backdate(&a);
+    let dedup = |args: &[&str], day: &str| {
+        let out = env.exec(args, Some(day));
+        assert!(out.status.success(), "{args:?} {day}: {out:?}");
+        (
+            dedup_kv(&env.log_text()),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        )
+    };
+    let apply = |day: &str| dedup(&["dedup", "--apply"], day);
+    let (s, _) = apply("2026-10-01");
+    assert_eq!(s["deduped"], "1", "{s:?}");
+    assert_eq!(env.dedup_streak(&b), Some(0));
+    // Still a clone of `a` on the next run day: nothing to do, the streak stays 0.
+    let (s, _) = apply("2026-10-02");
+    assert_eq!(
+        (s["deduped"].as_str(), s["already_shared"].as_str()),
+        ("0", "1"),
+        "{s:?}"
+    );
+    assert_eq!(env.dedup_streak(&b), Some(0));
+    // Rewritten (a new inode) on three consecutive run days: deduped on two, then quarantined.
+    for (day, streak) in [("2026-10-03", 1), ("2026-10-04", 2)] {
+        replace_by_rename(&b);
+        let (s, _) = apply(day);
+        assert_eq!(s["deduped"], "1", "{day} {s:?}");
+        assert_eq!(env.dedup_streak(&b), Some(streak), "{day}");
+    }
+    replace_by_rename(&b);
+    let rewritten = lstat(&b).ino();
+    // quarantine.txt cannot be written: not deduped, the streak stays, the next run retries.
+    let qdir = env.config.parent().unwrap().to_path_buf();
+    fs::set_permissions(&qdir, fs::Permissions::from_mode(0o555)).unwrap();
+    let (s, out) = apply("2026-10-05");
+    fs::set_permissions(&qdir, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        (s["deduped"].as_str(), s["requarantined_new"].as_str()),
+        ("0", "1"),
+        "{s:?}"
+    );
+    assert!(out.contains(" requarantined_new=1"), "{out}");
+    assert!(!env.quarantine().exists());
+    assert!(env.log_text().contains("quarantine retried next run"));
+    assert_eq!(env.dedup_streak(&b), Some(3));
+    let (s, _) = apply("2026-10-05");
+    assert_eq!(
+        (
+            s["deduped"].as_str(),
+            s["requarantined_new"].as_str(),
+            s["skipped"].as_str()
+        ),
+        ("0", "1", "0"),
+        "{s:?}"
+    );
+    assert_eq!(lstat(&b).ino(), rewritten, "deduped while quarantined");
+    assert_eq!(env.dedup_streak(&b), Some(0));
+    let q = fs::read_to_string(env.quarantine()).unwrap();
+    assert!(q.starts_with("# auto-compress-apfs quarantine"), "{q}");
+    assert!(q.contains(&format!(" dedup\t{}\n", b.display())), "{q}");
+    assert!(
+        env.log_text().contains(&format!(
+            "dedup: {}: skipped: no longer shares its data with identical files on 3 \
+             consecutive run days, quarantined (release: auto-compress-apfs quarantine clear",
+            b.display()
+        )),
+        "{}",
+        env.log_text()
+    );
+    // Listed: skipped silently, counted only as quarantined.
+    let lines = env.log_text().lines().count();
+    let (s, out) = apply("2026-10-06");
+    assert_eq!(
+        (
+            s["deduped"].as_str(),
+            s["quarantined"].as_str(),
+            s["requarantined_new"].as_str(),
+            s["skipped"].as_str()
+        ),
+        ("0", "1", "0", "0"),
+        "{s:?}"
+    );
+    assert!(out.contains(" quarantined=1 requarantined_new=0"), "{out}");
+    let new_lines: Vec<String> = env
+        .log_text()
+        .lines()
+        .skip(lines)
+        .map(String::from)
+        .collect();
+    assert!(
+        !new_lines
+            .iter()
+            .any(|l| l.contains(&format!("{}:", b.display()))),
+        "{new_lines:?}"
+    );
+    let (_, out) = dedup(&["dedup"], "2026-10-06");
+    assert!(out.contains("/dq/b: skipped: quarantined"), "{out}");
+    let s = dedup_kv(&env.log_text());
+    assert_eq!(
+        (s["quarantined"].as_str(), s["skipped"].as_str()),
+        ("1", "0"),
+        "{s:?}"
+    );
+    // `quarantine clear` resets the dedup streak too (set by hand here) and releases it.
+    let text = fs::read_to_string(env.dedup_state()).unwrap();
+    let prefix = format!("{}\t", b.display());
+    let edited: String = text
+        .lines()
+        .map(|l| {
+            if l.starts_with(&prefix) {
+                let mut f: Vec<&str> = l.split('\t').collect();
+                f[6] = "2";
+                f.join("\t") + "\n"
+            } else {
+                format!("{l}\n")
+            }
+        })
+        .collect();
+    fs::write(env.dedup_state(), edited).unwrap();
+    assert_eq!(env.dedup_streak(&b), Some(2));
+    let b_arg = b.display().to_string();
+    let out = env.exec(&["quarantine", "clear", &b_arg], None);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(env.dedup_streak(&b), Some(0));
+    let (s, _) = apply("2026-10-07");
+    assert_eq!(
+        (s["deduped"].as_str(), s["quarantined"].as_str()),
+        ("1", "0"),
+        "{s:?}"
+    );
+    assert_ne!(lstat(&b).ino(), rewritten);
+    assert_eq!(fs::read(&b).unwrap(), data);
+}
+
+#[test]
+fn dedup_fails_closed_on_unreadable_quarantine() {
+    let env = Env::new("dedup-qfail", "");
+    let dir = env.base.join("tree/dqf");
+    fs::create_dir_all(&dir).unwrap();
+    env.dedup_config(&dir);
+    let data = random_bytes(1_100_000);
+    fs::write(dir.join("a"), &data).unwrap();
+    fs::write(dir.join("b"), &data).unwrap();
+    backdate(&dir.join("a"));
+    fs::write(env.quarantine(), "# nothing\n").unwrap();
+    fs::set_permissions(env.quarantine(), fs::Permissions::from_mode(0o000)).unwrap();
+    let before = file_states(&dir);
+    for args in [&["dedup"][..], &["dedup", "--apply"]] {
+        let out = env.exec(args, None);
+        assert_eq!(out.status.code(), Some(1), "{args:?} {out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("quarantine.txt"),
+            "{out:?}"
+        );
+        assert_eq!(file_states(&dir), before, "{args:?}");
+    }
+    fs::set_permissions(env.quarantine(), fs::Permissions::from_mode(0o644)).unwrap();
+}
+
+#[test]
+fn dedup_rewritten_reference_does_not_quarantine_the_target() {
+    let env = Env::new("dedup-ref", "quarantine_after = 3");
+    let dir = env.base.join("tree/dr");
+    fs::create_dir_all(&dir).unwrap();
+    env.dedup_config(&dir);
+    let data = random_bytes(1_100_000);
+    let (a, b) = (dir.join("a"), dir.join("b"));
+    fs::write(&a, &data).unwrap();
+    fs::write(&b, &data).unwrap();
+    backdate(&a);
+    let apply = |day: &str| {
+        let out = env.exec(&["dedup", "--apply"], Some(day));
+        assert!(out.status.success(), "{day}: {out:?}");
+        dedup_kv(&env.log_text())
+    };
+    assert_eq!(apply("2026-10-01")["deduped"], "1");
+    for day in ["2026-10-02", "2026-10-03", "2026-10-04"] {
+        // The reference is replaced (new inode), keeping an older mtime: it stays reference.
+        replace_by_rename(&a);
+        backdate(&a);
+        let before = lstat(&b).ino();
+        let s = apply(day);
+        assert_eq!(
+            (s["deduped"].as_str(), s["requarantined_new"].as_str()),
+            ("1", "0"),
+            "{day} {s:?}"
+        );
+        assert_ne!(lstat(&b).ino(), before, "{day}");
+        assert_eq!(env.dedup_streak(&b), Some(0), "{day}");
+    }
+    assert!(!env.quarantine().exists());
+    assert_eq!(fs::read(&b).unwrap(), data);
+}
