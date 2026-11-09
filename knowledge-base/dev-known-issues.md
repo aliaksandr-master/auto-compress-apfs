@@ -39,7 +39,11 @@ Privacy & Security > Files and Folders was seen while `ls ~/Downloads` in that a
 terminal in Full Disk Access (or `tccutil reset SystemPolicyDownloadsFolder com.apple.Terminal`
 and allow the prompt), then quit and reopen the terminal. The scheduled run needs Full Disk Access
 for the release binary separately. Hypothesis: a new ad-hoc signature after a rebuild may need the
-grant again.
+grant again. Fact (2026-11-03): the first scheduled run after `make install` moved the symlink to
+`release/installed/auto-compress-apfs` logged `no access to ~/Downloads` for that path, so a new
+binary path needs its own grant. That run also logged nothing from 09:00:08 to 09:28:32, and the
+`no access` line came first after the gap (hypothesis: the run waited on a TCC prompt nobody
+answered; tccd logs did not confirm it).
 **Diag**: terminal runs and the scheduled run write to the same `auto-compress-apfs.log`, so the
 latest `no access` lines may come from a terminal run only. To judge the scheduled run, read the
 lines stamped at its start time (`grep 'T09:0'`): `compressed .../Downloads/...` there means the
@@ -60,6 +64,12 @@ Compressing only the venv un-shares its blocks from the cache.
 hypothesis: some unpacked wheels); the swap needs write access to the parent dir and the tool never
 chmods.
 **Action**: expected; drop such patterns from the config if the lines are unwanted.
+**Seen (2026-11-03)**: 72 `parent dir not writable (rename failed: Operation not permitted)` lines,
+all inside an app bundle staged by an updater
+(`~/Library/Caches/com.openai.codex/org.sparkle-project.Sparkle/Installation/.../ChatGPT.app`).
+Hypothesis: macOS app-bundle protection refuses the rename. The name pattern
+`org.sparkle-project.Sparkle` in `exclude` skips such staging dirs in every cache (preview: 72
+files before, 0 after).
 
 ## ditto on macOS 27 clones instead of compressing
 
