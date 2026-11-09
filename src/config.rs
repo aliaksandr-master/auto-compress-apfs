@@ -57,6 +57,8 @@ pub struct Config {
     pub trash: Rule,
     /// `purge`: matched files and directories are deleted for good.
     pub purge: Rule,
+    /// `cargo-clean`: stale build units of matched Cargo target directories are deleted.
+    pub cargo_clean: CargoCleanRule,
     /// `compress` as a step of `run`.
     pub compress: CompressRule,
     /// `dedup`: identical files are replaced by APFS clones of one of them.
@@ -323,6 +325,28 @@ impl Default for CompressRule {
     }
 }
 
+/// `[cargo_clean]`: the Cargo projects found below `roots` lose the build units of their target
+/// and build directories not used for `max_age_secs` (>= 1).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CargoCleanRule {
+    pub roots: Vec<String>,
+    pub exclude: Vec<String>,
+    pub max_age_secs: u64,
+    pub run: RunMode,
+}
+
+impl Default for CargoCleanRule {
+    fn default() -> Self {
+        Self {
+            roots: Vec::new(),
+            exclude: Vec::new(),
+            max_age_secs: 30 * 86_400,
+            run: RunMode::Off,
+        }
+    }
+}
+
 /// `[dedup]`: files below the patterns of at least `min_size` bytes are compared; identical
 /// ones are replaced by APFS clones of one of them.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -379,6 +403,7 @@ impl Default for Config {
             log_keep: 1,
             trash: Rule::default(),
             purge: Rule::default(),
+            cargo_clean: CargoCleanRule::default(),
             compress: CompressRule::default(),
             dedup: DedupRule::default(),
             tm_exclude: Rule::default(),
@@ -424,6 +449,8 @@ impl Config {
             .chain(cfg.trash.exclude.iter_mut())
             .chain(cfg.purge.patterns.iter_mut())
             .chain(cfg.purge.exclude.iter_mut())
+            .chain(cfg.cargo_clean.roots.iter_mut())
+            .chain(cfg.cargo_clean.exclude.iter_mut())
             .chain(cfg.dedup.patterns.iter_mut())
             .chain(cfg.dedup.exclude.iter_mut())
             .chain(cfg.tm_exclude.patterns.iter_mut())
@@ -481,6 +508,11 @@ impl Config {
         for (name, patterns, exclude) in [
             ("trash", &self.trash.patterns, &self.trash.exclude),
             ("purge", &self.purge.patterns, &self.purge.exclude),
+            (
+                "cargo_clean",
+                &self.cargo_clean.roots,
+                &self.cargo_clean.exclude,
+            ),
             ("dedup", &self.dedup.patterns, &self.dedup.exclude),
             (
                 "tm_exclude",
@@ -494,6 +526,9 @@ impl Config {
                 ));
             }
             validate_excludes(exclude).map_err(|e| format!("[{name}] {e}"))?;
+        }
+        if self.cargo_clean.max_age_secs < 1 {
+            return Err("[cargo_clean] `max_age_secs` must be >= 1".into());
         }
         if self.dedup.min_size < 1 {
             return Err("[dedup] `min_size` must be >= 1".into());

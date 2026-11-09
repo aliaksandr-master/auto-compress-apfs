@@ -220,6 +220,7 @@ auto-compress-apfs                         this help
 auto-compress-apfs compress [OPTIONS]      preview; with --apply: compress
 auto-compress-apfs trash [--apply] [--config PATH]
 auto-compress-apfs purge [--apply] [--config PATH]
+auto-compress-apfs cargo-clean [--apply] [--config PATH]
 auto-compress-apfs tm-exclude [--apply] [--config PATH]
 auto-compress-apfs dedup [--apply] [--config PATH] [-v]
 auto-compress-apfs run [--apply] [--config PATH]
@@ -331,6 +332,37 @@ auto-compress-apfs -h|--help | -V|--version
   probe), anything inside or holding the log, state or cache directory of this tool or the Trash (and, for `trash`, anything already in the Trash), any item containing a flagged
   (`uchg`, `uappnd`, `schg`, `sappnd`, `restricted`) or dataless entry or an entry on another
   filesystem, and symlinks. Exit 1 when an item failed.
+- `cargo-clean` deletes what Cargo builds no longer use, not a whole `target`, so the next build
+  only rebuilds what went. Cargo projects are found by their `Cargo.toml` below the
+  `[cargo_clean]` `roots` (`target`, `.git` and `node_modules` are not entered); each manifest is
+  read: a `[workspace]` manifest at or above it gives the workspace root and `<workspace>/target`,
+  unless `build.target-dir` of the nearest `.cargo/config.toml` (or `.cargo/config`, then
+  `~/.cargo/config.toml`) names another directory, relative to the directory holding `.cargo`;
+  `build.build-dir` is cleaned too (a value with a `{...}` template is not resolved, and
+  `CARGO_TARGET_DIR` is not read). Such a configured directory is cleaned even when it lies
+  outside the roots. Only directories with the `CACHEDIR.TAG` Cargo writes are touched. In
+  every profile directory (`debug`, `release`, `<triple>/<profile>`, recognised by its
+  `.fingerprint`) a build unit is `.fingerprint/<name>-<hash>` plus `build/<name>-<hash>` and
+  every `deps` entry with `-<hash>` in its name. A unit is fresh when one of these (or their
+  direct children) was modified, or a file read, within `max_age_secs` (default 2592000, 30
+  days; this tool's own reads of `.fingerprint` files do not count); a unit a fresh unit of any
+  profile of the same target was built against (named in its `.fingerprint` JSON) is kept too,
+  transitively, so the dependencies of a crate rebuilt within the window stay however old their
+  files are. In practice age means "not rebuilt for `max_age_secs`": APFS moves a file's access
+  time only once after each write, so a project only run or no-op-built for the whole window
+  loses its units and is rebuilt in full. Every other unit is deleted. When the JSON of a kept
+  unit cannot be read, nothing of that target is deleted. A `deps` entry whose
+  unit is gone and an `incremental/<name>-<hash>` directory are aged by themselves (and their
+  direct children). The final binaries at the top of a profile are never touched, and a
+  symlinked `deps`, `build` or `incremental` is never entered. A whole target is skipped when
+  another process holds a lock file of one of its profiles (`.cargo-lock`, `.cargo-build-lock`,
+  `.cargo-artifact-lock`: a build in progress) or a profile has none; the locks taken are held until the
+  deletes are done, so a build started meanwhile waits. `exclude` keeps every entry it or one of
+  its directories below the target matches (`exclude = ["release"]` keeps that profile, and its
+  dependencies); an exclude matching the target dir or one of its parents keeps the target.
+  Preview, `--apply`, refusals and the `removed.tsv` journal (action `cargo-clean`, the workspace
+  manifest as the rule) are those of `purge`. Directory access times are not used (listing a
+  directory moves them).
 - `tm-exclude` excludes the directories matched by the `[tm_exclude]` patterns of the config
   from Time Machine backups: it creates the sticky exclusion attribute
   `com.apple.metadata:com_apple_backup_excludeItem` with the value `tmutil addexclusion` writes
@@ -386,7 +418,7 @@ auto-compress-apfs -h|--help | -V|--version
   listed in the quarantine are never replaced (`skip <path>: skipped: quarantined` in the
   preview, counted as `quarantined`, not `skipped`); a listed file is the reference only when
   every file of its group is listed. See Quarantine for files that keep being rewritten.
-- `run` is what the launchd agent starts: `trash`, `purge`, `compress`, `dedup`, `tm-exclude` in
+- `run` is what the launchd agent starts: `trash`, `purge`, `cargo-clean`, `compress`, `dedup`, `tm-exclude` in
   that order, each as the `run` key of its config section says: `false` skips it, `true` runs
   it with the same `--apply` and `--config`, `"dry-run-only"` runs it as a preview even under
   `run --apply` (logged as `run step <name> mode=dry-run-only`). Compress is on by default, the
@@ -471,6 +503,9 @@ resolution), so `exclude = ["/private/var/**"]` does not exclude a walk started 
   (`false` by default) for those commands. The old `scheduled = true|false` is still read as
   `run = true|false`; a section with both is refused. Any other `run` value than `true`,
   `false` or `"dry-run-only"` is refused.
+- `[cargo_clean]`: `roots` (absolute directories or globs, empty by default), `exclude` (empty
+  by default), `max_age_secs` (default 2592000, at least 1) and `run` (`false` by default), as
+  above.
 - `[compress]`: only `run` (`true` by default), for the compress step of `run`.
 - `[dedup]`: `patterns` (empty by default), `exclude` (default `[".git", "target",
   "node_modules"]`), `min_size` (bytes, default 1048576, at least 1) and `run` (`false` by

@@ -3,6 +3,7 @@
 
 mod applesauce;
 mod cache;
+mod cargo_clean;
 mod classify;
 mod clean;
 mod compress;
@@ -51,6 +52,7 @@ Usage:
                                              without a command also mean compress)
   auto-compress-apfs trash [--apply] [--config PATH]
   auto-compress-apfs purge [--apply] [--config PATH]
+  auto-compress-apfs cargo-clean [--apply] [--config PATH]
   auto-compress-apfs tm-exclude [--apply] [--config PATH]
   auto-compress-apfs dedup [--apply] [--config PATH] [-v]
   auto-compress-apfs run [--apply] [--config PATH]
@@ -93,12 +95,17 @@ clean options:
 trash / purge: files and directories matched by the [trash] / [purge] patterns of the config
 (a directory as a whole) are listed; with --apply moved to ~/.Trash / deleted for good, each
 written to <log_dir>/removed.tsv. Protected locations and the tool's own dirs are refused.
+cargo-clean: Cargo projects are found by their Cargo.toml below the [cargo_clean] roots; in
+their target and build dirs (workspace root, build.target-dir / build.build-dir of
+.cargo/config.toml, only with Cargo's CACHEDIR.TAG) the build units (.fingerprint, build,
+deps, incremental entries) not used for max_age_secs are listed; with --apply deleted for
+good, the rest stays. A profile whose .cargo-lock a build holds is skipped.
 tm-exclude: directories matched by the [tm_exclude] patterns are listed; with --apply excluded
 from Time Machine (the sticky attribute `tmutil addexclusion` sets; tmutil is not run). An
 existing exclusion is never removed or changed.
 dedup: identical files below the [dedup] patterns are listed by group; with --apply each
 duplicate whose metadata equals the kept file's is replaced by an APFS clone of it.
-run: trash, purge, compress, dedup, tm-exclude, each as its section's `run` says (true, false
+run: trash, purge, cargo-clean, compress, dedup, tm-exclude, each as its section's `run` says (true, false
 or dry-run-only; compress is on by default, the others off); what launchd runs.
 
 install-launchd: writes run.sh next to the config and a per-user launchd agent that starts it
@@ -417,12 +424,13 @@ fn parse_args(it: impl Iterator<Item = String>) -> Result<Cli, String> {
             println!("{USAGE}");
             Ok(Cli::Exit(ExitCode::SUCCESS))
         }
-        Some(c @ ("trash" | "purge" | "tm-exclude" | "run")) => {
+        Some(c @ ("trash" | "purge" | "cargo-clean" | "tm-exclude" | "run")) => {
             let c = c.to_owned();
             match parse_clean(it.skip(1))? {
                 Cli::Clean(a) => Ok(match c.as_str() {
                     "trash" => Cli::Remove(a, remove::Action::Trash),
                     "purge" => Cli::Remove(a, remove::Action::Purge),
+                    "cargo-clean" => Cli::Remove(a, remove::Action::CargoClean),
                     "tm-exclude" => Cli::TmExclude(a),
                     _ => Cli::Run(a),
                 }),
@@ -841,14 +849,14 @@ fn cmd_remove(args: &CleanArgs, action: remove::Action, home: &Path) -> ExitCode
     if created {
         println!("created {}", config_path.display());
     }
-    let rule = match action {
-        remove::Action::Trash => &cfg.trash,
-        remove::Action::Purge => &cfg.purge,
-    };
-    if rule.patterns.is_empty() {
+    let (patterns, _) = remove_rule(&cfg, action);
+    if patterns.is_empty() {
+        let (section, key) = match action {
+            remove::Action::CargoClean => ("cargo_clean", "roots"),
+            _ => (action.name(), "patterns"),
+        };
         println!(
-            "no [{}] patterns: add them to {}",
-            action.name(),
+            "no [{section}] {key}: add them to {}",
             config_path.display()
         );
         return ExitCode::SUCCESS;
@@ -905,14 +913,23 @@ fn run_remove(
     } else {
         None
     };
-    let rule = match action {
-        remove::Action::Trash => &cfg.trash,
-        remove::Action::Purge => &cfg.purge,
-    };
+    let (patterns, exclude) = remove_rule(cfg, action);
     let guard = walk::Guard::new(home, &cfg.allow_volumes, log)?;
-    let matcher = walk::Matcher::new(&rule.patterns, &rule.exclude, None)?;
+    let matcher = walk::Matcher::new(patterns, exclude, None)?;
+    // cargo-clean walks its roots for `Cargo.toml`, never into build output, VCS or JS deps.
+    let manifest_matcher = if action == remove::Action::CargoClean {
+        let globs: Vec<String> = patterns
+            .iter()
+            .map(|r| format!("{}/**/Cargo.toml", r.trim_end_matches('/')))
+            .collect();
+        let mut skip = exclude.to_vec();
+        skip.extend(["target", ".git", "node_modules"].map(String::from));
+        Some(walk::Matcher::new(&globs, &skip, None)?)
+    } else {
+        None
+    };
     let walked = walk::walk_entries(
-        &matcher,
+        manifest_matcher.as_ref().unwrap_or(&matcher),
         &guard,
         cfg.one_file_system,
         cfg.worker_threads(),
@@ -927,7 +944,41 @@ fn run_remove(
         own: &own,
         trash_dir: &trash_dir,
     };
-    let items = remove::plan(walked.matched, &matcher, &guard, &keep, action);
+    // cargo-clean: the walk finds target directories; their stale entries are the items. The
+    // targets hold the profile locks until the deletes are done.
+    let (matched, targets) = if action == remove::Action::CargoClean {
+        let manifests: Vec<PathBuf> = walked
+            .matched
+            .into_iter()
+            .filter(|m| !m.is_dir)
+            .map(|m| m.path)
+            .collect();
+        let found = cargo_clean::target_dirs(&manifests, home);
+        log.info(format_args!(
+            "{name}: {} manifests, {} target dirs",
+            manifests.len(),
+            found.len()
+        ));
+        let targets = cargo_clean::collect(found, &matcher, cfg.cargo_clean.max_age_secs);
+        let mut matched = Vec::new();
+        for t in &targets {
+            for (profile, why) in &t.skipped {
+                log.info(format_args!("{name}: skipped {}: {why}", profile.display()));
+                println!("SKIPPED {}: {why}", abbreviate_home(profile, Some(home)));
+            }
+            matched.extend(t.entries.iter().cloned().filter_map(cargo_clean::matched));
+        }
+        matched.sort_by(|a, b| a.path.cmp(&b.path));
+        (matched, targets)
+    } else {
+        (walked.matched, Vec::new())
+    };
+    let mut items = remove::plan(matched, &matcher, &guard, &keep, action);
+    for i in &mut items {
+        if let Some(t) = targets.iter().find(|t| i.path.starts_with(&t.root)) {
+            i.rule.clone_from(&t.rule);
+        }
+    }
     let blocked = items.iter().filter(|i| i.blocked.is_some()).count() as u64;
     let out = if args.apply {
         let journal = cfg.log_dir().join(remove::JOURNAL_NAME);
@@ -961,6 +1012,7 @@ fn run_remove(
             ..Default::default()
         }
     };
+    drop(targets);
     log.info(format_args!(
         "{name}_summary found={} done={} failed={} blocked={} bytes={} dry_run={}",
         items.len(),
@@ -975,6 +1027,15 @@ fn run_remove(
     } else {
         ExitCode::SUCCESS
     })
+}
+
+/// Patterns (for `cargo-clean` its roots) and excludes of the section of an action.
+fn remove_rule(cfg: &Config, action: remove::Action) -> (&[String], &[String]) {
+    match action {
+        remove::Action::Trash => (&cfg.trash.patterns, &cfg.trash.exclude),
+        remove::Action::Purge => (&cfg.purge.patterns, &cfg.purge.exclude),
+        remove::Action::CargoClean => (&cfg.cargo_clean.roots, &cfg.cargo_clean.exclude),
+    }
 }
 
 /// The tool's own files next to the config (not that whole directory: it may be HOME), its log,
@@ -1358,7 +1419,7 @@ fn run_dedup(
     })
 }
 
-/// `run`: trash, purge, compress, dedup and tm-exclude in that order, each as its section's
+/// `run`: trash, purge, cargo-clean, compress, dedup and tm-exclude in that order, each as its section's
 /// `run` says: `false` skips it, `true` runs it with the same `--apply` and `--config`,
 /// `"dry-run-only"` runs it as a preview even under `--apply`. A section without patterns is
 /// skipped (compress prints its own hint). Exit 1 when any step failed.
@@ -1375,6 +1436,11 @@ fn cmd_run(args: &CleanArgs, home: &Path) -> ExitCode {
     let steps = [
         ("trash", cfg.trash.run, !cfg.trash.patterns.is_empty()),
         ("purge", cfg.purge.run, !cfg.purge.patterns.is_empty()),
+        (
+            "cargo-clean",
+            cfg.cargo_clean.run,
+            !cfg.cargo_clean.roots.is_empty(),
+        ),
         ("compress", cfg.compress.run, true),
         ("dedup", cfg.dedup.run, !cfg.dedup.patterns.is_empty()),
         (
@@ -1401,6 +1467,7 @@ fn cmd_run(args: &CleanArgs, home: &Path) -> ExitCode {
         let code = match name {
             "trash" => cmd_remove(&step, remove::Action::Trash, home),
             "purge" => cmd_remove(&step, remove::Action::Purge, home),
+            "cargo-clean" => cmd_remove(&step, remove::Action::CargoClean, home),
             "compress" => cmd_compress(
                 &CompressArgs {
                     config: step.config,

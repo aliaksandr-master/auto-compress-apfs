@@ -23,6 +23,8 @@ pub const JOURNAL_NAME: &str = "removed.tsv";
 pub enum Action {
     Trash,
     Purge,
+    /// Stale build units of Cargo target directories, deleted for good.
+    CargoClean,
 }
 
 impl Action {
@@ -30,13 +32,14 @@ impl Action {
         match self {
             Action::Trash => "trash",
             Action::Purge => "purge",
+            Action::CargoClean => "cargo-clean",
         }
     }
 
     fn done(self) -> &'static str {
         match self {
             Action::Trash => "moved to the Trash",
-            Action::Purge => "deleted",
+            Action::Purge | Action::CargoClean => "deleted",
         }
     }
 }
@@ -459,8 +462,10 @@ pub fn apply(
         let result = match &real {
             None => Err(io::Error::other("changed since it was checked")),
             Some(r) => match action {
-                Action::Purge if i.is_dir => fs::remove_dir_all(r).map(|()| None),
-                Action::Purge => fs::remove_file(r).map(|()| None),
+                Action::Purge | Action::CargoClean if i.is_dir => {
+                    fs::remove_dir_all(r).map(|()| None)
+                }
+                Action::Purge | Action::CargoClean => fs::remove_file(r).map(|()| None),
                 Action::Trash => move_to_trash(r, &trash_real).map(Some),
             },
         };

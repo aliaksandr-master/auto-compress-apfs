@@ -667,6 +667,102 @@ fn trash_purge_and_run() {
 }
 
 #[test]
+fn cargo_clean_keeps_fresh_and_locked_units() {
+    let env = Env::new("cargo", "");
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(100 * 86400);
+    let set_old = |p: &Path| {
+        fs::File::open(p)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(old).set_accessed(old))
+            .unwrap();
+    };
+    // Two target dirs: `a` free, `b` with its profile lock held (a build in progress).
+    let mut paths = Vec::new();
+    for name in ["a", "b"] {
+        let proj = env.home.join("src").join(name);
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(
+            proj.join("Cargo.toml"),
+            format!("[package]\nname = \"{name}\"\n"),
+        )
+        .unwrap();
+        let t = proj.join("target");
+        let p = t.join("debug");
+        for f in [
+            ".fingerprint/old-0123456789abcdef/lib-old",
+            "deps/libold-0123456789abcdef.rlib",
+            ".fingerprint/new-fedcba9876543210/lib-new",
+            "deps/libnew-fedcba9876543210.rlib",
+            "app",
+            ".cargo-lock",
+        ] {
+            fs::create_dir_all(p.join(f).parent().unwrap()).unwrap();
+            fs::write(p.join(f), "x").unwrap();
+        }
+        fs::write(
+            t.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55\n# created by cargo.\n",
+        )
+        .unwrap();
+        for f in [
+            ".fingerprint/old-0123456789abcdef/lib-old",
+            ".fingerprint/old-0123456789abcdef",
+            "deps/libold-0123456789abcdef.rlib",
+            "app",
+        ] {
+            set_old(&p.join(f));
+        }
+        paths.push(p);
+    }
+    let held = fs::File::open(paths[1].join(".cargo-lock")).unwrap();
+    held.lock().unwrap();
+    let body = fs::read_to_string(&env.config).unwrap();
+    fs::write(
+        &env.config,
+        format!(
+            "{body}\n[cargo_clean]\nroots = [\"{}/src\"]\nmax_age_secs = 2592000\n",
+            env.home.display()
+        ),
+    )
+    .unwrap();
+    let journal = env.log.with_file_name("removed.tsv");
+    // Preview: lists the old unit of `a`, skips `b`, changes nothing.
+    let out = env.exec(&["cargo-clean"], None);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        text.contains("old-0123456789abcdef") && !text.contains("new-fedcba9876543210"),
+        "{text}"
+    );
+    assert!(
+        text.contains("SKIPPED") && text.contains("cargo-lock"),
+        "{text}"
+    );
+    assert!(paths[0].join("deps/libold-0123456789abcdef.rlib").exists());
+    assert!(!journal.exists());
+    // --apply: only the old unit of the unlocked target goes.
+    let out = env.exec(&["cargo-clean", "--apply"], None);
+    assert!(out.status.success(), "{out:?}");
+    let a = &paths[0];
+    assert!(!a.join(".fingerprint/old-0123456789abcdef").exists());
+    assert!(!a.join("deps/libold-0123456789abcdef.rlib").exists());
+    assert!(a.join(".fingerprint/new-fedcba9876543210/lib-new").exists());
+    assert!(a.join("deps/libnew-fedcba9876543210.rlib").exists());
+    assert!(a.join("app").exists());
+    let b = &paths[1];
+    assert!(b.join(".fingerprint/old-0123456789abcdef/lib-old").exists());
+    assert!(b.join("deps/libold-0123456789abcdef.rlib").exists());
+    let j = fs::read_to_string(&journal).unwrap();
+    assert_eq!(
+        j.lines().filter(|l| l.contains("\tcargo-clean\t")).count(),
+        2,
+        "{j}"
+    );
+    drop(held);
+    force_remove(&env.base);
+}
+
+#[test]
 fn tm_exclude_and_run() {
     let env = Env::new("tmx", "");
     let nm = env.home.join("Work_t/proj/node_modules");
