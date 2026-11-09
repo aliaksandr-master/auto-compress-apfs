@@ -167,3 +167,16 @@ Already-cloned files (equal `ATTR_CMNEXT_CLONEID`) are counted as `already_share
 earliest lines (fact, observed 2026-11-02 on a run of 2578 replacements).
 **Action**: raise `log_keep` before a first large dedup run if the per-file lines matter; the
 `dedup_summary` line is always written last.
+
+## `dedup` streak: only the target's own rewrite counts
+
+**Symptom**: a deduped file loses its clone sharing every day, yet it never reaches the quarantine;
+or the opposite worry, a file quarantined although nothing rewrote it.
+**Cause**: the streak in `dedup.tsv` grows only when the target's own identity (dev, ino, ctime of
+the clone taken from the open fd at swap time) changed since the last run day. A rewritten
+*reference* also breaks the sharing, but the target is innocent there, so it must not count
+(`dedup_rewritten_reference_does_not_quarantine_the_target`). Only unrestricted `dedup --apply`
+runs (no `--config`) move run days, prune rows or touch streaks, and a streak is current only when
+the row was last found rewritten today or on the previous run day (`state::streak_current`).
+**Action**: to see why a file is or is not quarantined, compare its `dedup.tsv` identity with
+`stat -f '%d %i %c'` of the file; a narrowed run never explains a streak change.
