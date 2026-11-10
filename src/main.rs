@@ -1524,6 +1524,7 @@ fn run_dedup(
 /// `"dry-run-only"` runs it as a preview even under `--apply`. A section without patterns is
 /// skipped (compress prints its own hint). Exit 1 when any step failed.
 fn cmd_run(args: &CleanArgs, home: &Path) -> ExitCode {
+    println!("{NAME} {VERSION}");
     let config_path = config_path(args.config.as_ref(), home);
     let cfg = match Config::load_or_create(&config_path, home) {
         Ok((c, _)) => c,

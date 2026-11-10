@@ -288,7 +288,12 @@ fn pipeline() {
     assert!(String::from_utf8_lossy(&out.stdout).starts_with("Usage:"));
     // `run` without --apply is the same preview (no trash/purge rule is scheduled).
     let (s, stdout) = env.run_day(&["run"], None);
-    assert!(stdout.starts_with("== compress =="), "{stdout}");
+    let (first, rest) = stdout.split_once('\n').unwrap();
+    assert_eq!(
+        first,
+        concat!("auto-compress-apfs ", env!("CARGO_PKG_VERSION"))
+    );
+    assert!(rest.starts_with("== compress =="), "{stdout}");
     assert_eq!(
         (s["dry_run"].as_str(), s["to_compress"].as_str()),
         ("true", "5")
