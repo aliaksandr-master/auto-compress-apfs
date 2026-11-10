@@ -6,7 +6,23 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-10
+
 ### Added
+
+- `cargo-clean [--apply] [--config PATH] [-v]` and the `[cargo_clean]` config section
+  (`roots`, `exclude`, `max_age_secs`, `keep_final_debug`, `keep_final_release`,
+  `exclude_time_machine`, `run`): Cargo projects are found by their `Cargo.toml` below `roots`;
+  in their target and build dirs (workspace root, `build.target-dir` / `build.build-dir`, only
+  with Cargo's `CACHEDIR.TAG`) the build units not rebuilt for `max_age_secs` are deleted for
+  good, except those a fresh unit was built against. The final debug / release artifacts stay
+  unless `keep_final_debug` / `keep_final_release` is `false`. A target with a profile a build
+  holds locked is skipped. With `exclude_time_machine = true` every target and build dir found
+  is also excluded from Time Machine. `run` runs it after purge.
+- `run` ends with a total of what each step did (or would do in a preview) and the space freed,
+  and starts with the binary version.
+- Colors on a terminal for step headers, totals, warnings and hints (`NO_COLOR` turns them off).
+- A progress line in `dedup` and `tm-exclude` too; the scan line counts the directories read.
 
 - `dedup [--apply] [--config PATH] [-v]` and the `[dedup]` config section (`patterns`,
   `exclude`, `min_size`, `run`): identical regular files are replaced by APFS clones of one of
@@ -52,6 +68,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Without `-v`, `trash`, `purge`, `cargo-clean`, `compress` (preview) and `dedup` (preview) show
+  a progress line and the totals only; `-v` lists every item as before. Skips and per-file
+  results go to the log; errors are still shown.
+- A file that vanishes during the scan is logged as INFO instead of WARN.
+- `trash`, `purge` and `cargo-clean` check their items once per directory instead of once per
+  item, and the covered-item check is linear (a preview of 10^6 items took minutes).
 - `scheduled` in `[trash]`, `[purge]` and `[tm_exclude]` is now an alias of `run = true|false`;
   giving both in one section is a config error.
 
@@ -153,6 +175,7 @@ First public release.
 - Archives and other already-compressed formats are excluded by default.
 - Example configs in `examples/`.
 
-[Unreleased]: https://github.com/aliaksandr-master/auto-compress-apfs/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/aliaksandr-master/auto-compress-apfs/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/aliaksandr-master/auto-compress-apfs/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/aliaksandr-master/auto-compress-apfs/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/aliaksandr-master/auto-compress-apfs/releases/tag/v0.2.0
