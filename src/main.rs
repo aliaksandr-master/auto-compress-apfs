@@ -1030,7 +1030,7 @@ fn run_remove(
         dry_run: !args.apply,
         what: match action {
             remove::Action::Trash => "items",
-            _ => "items deleted",
+            _ => "items",
         },
         count,
         freed: if action == remove::Action::Trash {
@@ -1207,7 +1207,11 @@ fn run_tm_exclude(
     record_total(StepTotal {
         name: "tm-exclude",
         dry_run: !args.apply,
-        what: "dirs excluded from Time Machine",
+        what: if args.apply {
+            "dirs excluded from Time Machine"
+        } else {
+            "dirs to exclude from Time Machine"
+        },
         count: if args.apply {
             out.excluded
         } else {
@@ -1450,7 +1454,11 @@ fn run_dedup(
     record_total(StepTotal {
         name: "dedup",
         dry_run: !args.apply,
-        what: "files replaced by clones",
+        what: if args.apply {
+            "files cloned"
+        } else {
+            "files to clone"
+        },
         count,
         freed,
         failed: out.failed,
@@ -2258,7 +2266,7 @@ fn run(
     record_total(StepTotal {
         name: "compress",
         dry_run: !apply,
-        what: "files compressed",
+        what: "files",
         count: if apply { out.compressed } else { todo_count },
         freed: out.bytes_before.saturating_sub(out.bytes_after),
         to_compress: if apply { 0 } else { todo_bytes },
