@@ -1013,6 +1013,39 @@ fn run_remove(
         }
     };
     drop(targets);
+    let (count, bytes) = if args.apply {
+        (out.done, out.bytes)
+    } else {
+        items
+            .iter()
+            .filter(|i| i.blocked.is_none())
+            .fold((0, 0), |(n, b), i| (n + 1, b + i.bytes))
+    };
+    record_total(StepTotal {
+        name: match action {
+            remove::Action::Trash => "trash",
+            remove::Action::Purge => "purge",
+            remove::Action::CargoClean => "cargo-clean",
+        },
+        dry_run: !args.apply,
+        what: match action {
+            remove::Action::Trash => "items",
+            _ => "items deleted",
+        },
+        count,
+        freed: if action == remove::Action::Trash {
+            0
+        } else {
+            bytes
+        },
+        trashed: if action == remove::Action::Trash {
+            bytes
+        } else {
+            0
+        },
+        failed: out.failed,
+        ..StepTotal::default()
+    });
     log.info(format_args!(
         "{name}_summary found={} done={} failed={} blocked={} bytes={} dry_run={}",
         items.len(),
@@ -1171,6 +1204,18 @@ fn run_tm_exclude(
         );
         tm_exclude::tally(&items)
     };
+    record_total(StepTotal {
+        name: "tm-exclude",
+        dry_run: !args.apply,
+        what: "dirs excluded from Time Machine",
+        count: if args.apply {
+            out.excluded
+        } else {
+            items.len() as u64 - out.already - out.blocked - out.errors
+        },
+        failed: out.errors,
+        ..StepTotal::default()
+    });
     log.info(format_args!(
         "tm_exclude_summary matched={} already={} excluded={} blocked={} errors={} dry_run={}",
         items.len(),
@@ -1396,6 +1441,21 @@ fn run_dedup(
         );
         dedup::Outcome::default()
     };
+    let (count, freed) = if args.apply {
+        (out.deduped, out.freed)
+    } else {
+        plan.pending()
+            .fold((0, 0), |(n, b), (_, t)| (n + 1, b + t.c.allocated()))
+    };
+    record_total(StepTotal {
+        name: "dedup",
+        dry_run: !args.apply,
+        what: "files replaced by clones",
+        count,
+        freed,
+        failed: out.failed,
+        ..StepTotal::default()
+    });
     log.info(format_args!(
         "dedup_summary walked={} groups={} targets={} already_shared={} unreadable={} \
          deduped={} freed={} skipped={} failed={} quarantined={} requarantined_new={} dry_run={}",
@@ -1487,11 +1547,105 @@ fn cmd_run(args: &CleanArgs, home: &Path) -> ExitCode {
         };
         failed |= code != ExitCode::SUCCESS;
     }
+    let totals = STEP_TOTALS.lock().map(|v| v.clone()).unwrap_or_default();
+    if !totals.is_empty() {
+        let text = render_totals(&totals);
+        print!("{text}");
+        if let Ok(log) = Logger::open(&cfg.log_dir(), cfg.log_max_bytes, cfg.log_keep, false) {
+            for line in text
+                .lines()
+                .filter(|l| !l.is_empty() && !l.starts_with("=="))
+            {
+                log.info(format_args!("run total: {line}"));
+            }
+            log.flush();
+        }
+    }
     if failed {
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// What one command did (with `--apply`) or would do (a preview), for the closing total of
+/// `run`. `freed` is space given back to the volume; `trashed` only moves to the Trash.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct StepTotal {
+    name: &'static str,
+    dry_run: bool,
+    /// What the count is of, e.g. "items deleted".
+    what: &'static str,
+    count: u64,
+    freed: u64,
+    trashed: u64,
+    /// Bytes a preview of compress would compress (the saving is not known before).
+    to_compress: u64,
+    failed: u64,
+}
+
+/// Totals of the commands run in this process; `run` prints them at the end.
+static STEP_TOTALS: std::sync::Mutex<Vec<StepTotal>> = std::sync::Mutex::new(Vec::new());
+
+fn record_total(t: StepTotal) {
+    if let Ok(mut v) = STEP_TOTALS.lock() {
+        v.push(t);
+    }
+}
+
+/// The closing total of `run`: one line per step, then the space freed (or that would be).
+fn render_totals(totals: &[StepTotal]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::from("\n== total ==\n");
+    for t in totals {
+        let mode = if t.dry_run { "preview" } else { "applied" };
+        let mut line = format!("{:<12} {mode:<8} {} {}", t.name, t.count, t.what);
+        if t.freed > 0 {
+            let _ = write!(
+                line,
+                ", {} {}",
+                if t.dry_run { "would free" } else { "freed" },
+                human(t.freed)
+            );
+        }
+        if t.trashed > 0 {
+            let _ = write!(line, ", {} to the Trash", human(t.trashed));
+        }
+        if t.to_compress > 0 {
+            let _ = write!(line, ", {} to compress", human(t.to_compress));
+        }
+        if t.failed > 0 {
+            let _ = write!(line, ", {} failed", t.failed);
+        }
+        let _ = writeln!(s, "{line}");
+    }
+    let sum = |dry: bool| -> (u64, u64) {
+        totals
+            .iter()
+            .filter(|t| t.dry_run == dry)
+            .fold((0, 0), |(f, tr), t| (f + t.freed, tr + t.trashed))
+    };
+    let (freed, trashed) = sum(false);
+    if totals.iter().any(|t| !t.dry_run) {
+        let _ = write!(s, "freed: about {}", human(freed));
+        if trashed > 0 {
+            let _ = write!(
+                s,
+                " (plus {} moved to the Trash, freed when it is emptied)",
+                human(trashed)
+            );
+        }
+        let _ = writeln!(s);
+    }
+    let (freed, trashed) = sum(true);
+    if totals.iter().any(|t| t.dry_run) {
+        let _ = write!(s, "would free: about {}", human(freed));
+        if trashed > 0 {
+            let _ = write!(s, " (plus {} to the Trash)", human(trashed));
+        }
+        let _ = writeln!(s, "; compress savings are not estimated");
+    }
+    s
 }
 
 /// Logs that `run` executes the step `name` as a preview only (`run = "dry-run-only"`).
@@ -2034,9 +2188,11 @@ fn run(
         }
     }
 
+    let todo_count = todo.len() as u64;
+    let todo_bytes: u64 = todo.iter().map(|c| c.size()).sum();
     let out = if apply {
         compress::remove_stale(&walked.stale_staging, log);
-        log.start_compress(todo.len() as u64, todo.iter().map(|c| c.size()).sum());
+        log.start_compress(todo_count, todo_bytes);
         let out = Compressor::new(log, cfg.verify, cfg.batch_size, threads, cfg.min_free_bytes)
             .run_routed(
                 todo.into_iter()
@@ -2099,6 +2255,16 @@ fn run(
         Outcome::default()
     };
 
+    record_total(StepTotal {
+        name: "compress",
+        dry_run: !apply,
+        what: "files compressed",
+        count: if apply { out.compressed } else { todo_count },
+        freed: out.bytes_before.saturating_sub(out.bytes_after),
+        to_compress: if apply { 0 } else { todo_bytes },
+        failed: out.errors,
+        ..StepTotal::default()
+    });
     let elapsed = started.elapsed().as_secs_f64();
     log.info(format_args!(
         "summary found={} already_compressed={} to_compress={} compressed={} incompressible={} \
@@ -2364,6 +2530,42 @@ fn acquire_lock(state_dir: &Path) -> Result<Option<File>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn totals_split_applied_and_preview() {
+        let t = |name, dry_run, freed, trashed| StepTotal {
+            name,
+            dry_run,
+            what: "items",
+            count: 2,
+            freed,
+            trashed,
+            ..StepTotal::default()
+        };
+        let text = render_totals(&[
+            t("trash", false, 0, 2048),
+            t("purge", false, 1 << 20, 0),
+            t("cargo-clean", true, 3 << 30, 0),
+        ]);
+        assert!(
+            text.contains("purge        applied  2 items, freed 1.0 MiB"),
+            "{text}"
+        );
+        assert!(
+            text.contains("cargo-clean  preview  2 items, would free 3.0 GiB"),
+            "{text}"
+        );
+        assert!(
+            text.contains("freed: about 1.0 MiB (plus 2.0 KiB moved to the Trash"),
+            "{text}"
+        );
+        assert!(text.contains("would free: about 3.0 GiB"), "{text}");
+        let only_preview = render_totals(&[t("purge", true, 5, 0)]);
+        assert!(
+            !only_preview.contains("\nfreed: ") && !only_preview.contains("plus"),
+            "{only_preview}"
+        );
+    }
 
     #[test]
     fn preview_lines_align_on_tty_and_stay_whole_when_piped() {

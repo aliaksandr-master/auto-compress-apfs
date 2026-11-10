@@ -642,6 +642,19 @@ fn trash_purge_and_run() {
         "{text}"
     );
     assert!(text.contains("== compress =="), "{text}");
+    // The closing total: what each step did, then the space freed and moved to the Trash.
+    let total = &text[text.find("== total ==").expect("total")..];
+    assert!(
+        total.contains("trash") && total.contains("applied") && total.contains("to the Trash"),
+        "{total}"
+    );
+    // compress has no patterns here: it prints its hint and no total line.
+    assert!(
+        total.contains("2 items, 8.0 KiB to the Trash")
+            && total.contains("freed: about 0 B")
+            && !total.contains("compress"),
+        "{total}"
+    );
     assert!(!dl.join("old").exists() && !dl.join("x.dmg").exists());
     assert!(dl.join("keep.log").exists() && env.home.exists());
     assert!(trash.join("old/sub/a.txt").exists() && trash.join("x.dmg").exists());

@@ -120,7 +120,7 @@ impl Plan {
         n
     }
 
-    fn pending(&self) -> impl Iterator<Item = (&Member, &Member)> {
+    pub fn pending(&self) -> impl Iterator<Item = (&Member, &Member)> {
         self.groups.iter().flat_map(|g| {
             g.targets
                 .iter()

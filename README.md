@@ -424,6 +424,13 @@ auto-compress-apfs -h|--help | -V|--version
   `run --apply` (logged as `run step <name> mode=dry-run-only`). Compress is on by default, the
   others off; a section without patterns is skipped. Without `--apply` every step is a preview.
   Exit 1 when a step failed.
+  At the end `run` prints `== total ==`: one line per step that ran (`applied` or `preview`,
+  the count and the bytes), then `freed: about ...` for what the applied steps gave back (allocated
+  blocks of what went: an upper bound, a hardlink, clone or snapshot may keep them) (`trash`
+  moves to the Trash: listed apart, freed only when the Trash is emptied; compress counts
+  original minus compressed blocks) and `would free: about ...` for the previews (compress
+  lists the bytes it would compress, its saving is not known before). The same lines go to the
+  log as `run total: ...`.
 - `install-launchd` sets up the daily run for the current user (no `sudo`):
   - writes `run.sh` next to the config (mode 0755) with the absolute path of the binary it was
     started as (a symlink stays a symlink, so a rebuilt binary is picked up) and, for a
