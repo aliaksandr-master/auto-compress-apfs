@@ -357,7 +357,9 @@ auto-compress-apfs -h|--help | -V|--version
   loses its units and is rebuilt in full. Every other unit is deleted. When the JSON of a kept
   unit cannot be read, nothing of that target is deleted. A `deps` entry whose
   unit is gone and an `incremental/<name>-<hash>` directory are aged by themselves (and their
-  direct children). The final binaries at the top of a profile are never touched, and a
+  direct children). The final artifacts at the top of a profile (and of its `examples`) stay,
+  except those of `debug` with `keep_final_debug = false` and of `release` with
+  `keep_final_release = false`: those go once not modified or read within `max_age_secs`. A
   symlinked `deps`, `build` or `incremental` is never entered. A whole target is skipped when
   another process holds a lock file of one of its profiles (`.cargo-lock`, `.cargo-build-lock`,
   `.cargo-artifact-lock`: a build in progress) or a profile has none; the locks taken are held until the
@@ -515,8 +517,8 @@ resolution), so `exclude = ["/private/var/**"]` does not exclude a walk started 
   `run = true|false`; a section with both is refused. Any other `run` value than `true`,
   `false` or `"dry-run-only"` is refused.
 - `[cargo_clean]`: `roots` (absolute directories or globs, empty by default), `exclude` (empty
-  by default), `max_age_secs` (default 2592000, at least 1) and `run` (`false` by default), as
-  above.
+  by default), `max_age_secs` (default 2592000, at least 1), `keep_final_debug` and `keep_final_release`
+  (`true` by default) and `run` (`false` by default), as above.
 - `[compress]`: only `run` (`true` by default), for the compress step of `run`.
 - `[dedup]`: `patterns` (empty by default), `exclude` (default `[".git", "target",
   "node_modules"]`), `min_size` (bytes, default 1048576, at least 1) and `run` (`false` by

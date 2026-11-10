@@ -333,6 +333,10 @@ pub struct CargoCleanRule {
     pub roots: Vec<String>,
     pub exclude: Vec<String>,
     pub max_age_secs: u64,
+    /// The final artifacts of `debug` / `release` (binaries, libraries, examples) stay
+    /// whatever their age; `false`: they go once not used for `max_age_secs`.
+    pub keep_final_debug: bool,
+    pub keep_final_release: bool,
     pub run: RunMode,
 }
 
@@ -342,6 +346,8 @@ impl Default for CargoCleanRule {
             roots: Vec::new(),
             exclude: Vec::new(),
             max_age_secs: 30 * 86_400,
+            keep_final_debug: true,
+            keep_final_release: true,
             run: RunMode::Off,
         }
     }

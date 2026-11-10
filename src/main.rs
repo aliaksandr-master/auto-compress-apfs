@@ -98,8 +98,9 @@ written to <log_dir>/removed.tsv. Protected locations and the tool's own dirs ar
 cargo-clean: Cargo projects are found by their Cargo.toml below the [cargo_clean] roots; in
 their target and build dirs (workspace root, build.target-dir / build.build-dir of
 .cargo/config.toml, only with Cargo's CACHEDIR.TAG) the build units (.fingerprint, build,
-deps, incremental entries) not used for max_age_secs are listed; with --apply deleted for
-good, the rest stays. A profile whose .cargo-lock a build holds is skipped.
+deps, incremental entries) not used for max_age_secs are listed, plus the final debug /
+release artifacts when keep_final_debug / keep_final_release is false; with --apply deleted
+for good, the rest stays. A profile whose .cargo-lock a build holds is skipped.
 trash / purge / cargo-clean show a progress line on a terminal and the totals; -v lists
 every item (and why one is blocked) and mirrors the log to stderr; run -v passes it on.
 tm-exclude: directories matched by the [tm_exclude] patterns are listed; with --apply excluded
@@ -980,7 +981,12 @@ fn run_remove(
             manifests.len(),
             found.len()
         ));
-        let targets = cargo_clean::collect(found, &matcher, cfg.cargo_clean.max_age_secs);
+        let keep_final = cargo_clean::KeepFinal {
+            debug: cfg.cargo_clean.keep_final_debug,
+            release: cfg.cargo_clean.keep_final_release,
+        };
+        let targets =
+            cargo_clean::collect(found, &matcher, cfg.cargo_clean.max_age_secs, keep_final);
         let mut matched = Vec::new();
         for t in &targets {
             for (profile, why) in &t.skipped {

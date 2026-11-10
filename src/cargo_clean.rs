@@ -299,15 +299,57 @@ fn profile_units(
     deps
 }
 
+/// Which final artifacts `cargo-clean` keeps whatever their age: those of the `debug` (dev)
+/// and the `release` profile. Other profiles' final artifacts always stay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeepFinal {
+    pub debug: bool,
+    pub release: bool,
+}
+
+impl KeepFinal {
+    /// Whether the final artifacts of `profile` stay.
+    fn keeps(self, profile: &Path) -> bool {
+        match profile.file_name().and_then(|n| n.to_str()) {
+            Some("debug") => self.debug,
+            Some("release") => self.release,
+            _ => true,
+        }
+    }
+}
+
+/// The regular files at the top of `profile` and of its `examples` (not Cargo's dotfiles,
+/// such as its locks) not used since `cutoff`.
+fn stale_finals(profile: &Path, cutoff: SystemTime) -> Vec<PathBuf> {
+    let examples = profile.join("examples");
+    let mut dirs = vec![profile.to_path_buf()];
+    if is_real_dir(&examples) {
+        dirs.push(examples);
+    }
+    dirs.iter()
+        .flat_map(|d| names(d))
+        .filter(|(n, p)| {
+            !n.starts_with('.')
+                && fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_file())
+                && newest_use(p, true) < cutoff
+        })
+        .map(|(_, p)| p)
+        .collect()
+}
+
 /// The stale entries of the profiles of one target, sorted: the dependency graph spans them
 /// all (a cross build uses the build scripts and proc-macros of the host profile). A unit is
 /// kept when one of its entries was used since `cutoff`, it is in a profile marked `true`
 /// (excluded: everything there stays), or a kept unit was built against it (its fingerprint
 /// JSON names it), so a dependency of a crate rebuilt recently stays however old its files are.
+/// The final artifacts of a profile (its top-level files and those of `examples`, hard links
+/// of `deps` entries) stay unless `keep` allows them to go; those not used since `cutoff` are
+/// then listed too.
 /// `Err` when a kept unit's dependencies cannot be read: then nothing is listed.
 pub fn stale_entries(
     profiles: &[(PathBuf, bool)],
     cutoff: SystemTime,
+    keep: KeepFinal,
 ) -> Result<Vec<PathBuf>, String> {
     let mut units = Vec::new();
     let mut out = Vec::new();
@@ -324,6 +366,9 @@ pub fn stale_entries(
                 if name.contains('-') && is_real_dir(&p) && newest_use(&p, true) < cutoff {
                     out.push(p);
                 }
+            }
+            if !keep.keeps(profile) {
+                out.extend(stale_finals(profile, cutoff));
             }
         }
     }
@@ -483,6 +528,7 @@ pub fn collect(
     targets: Vec<(PathBuf, String)>,
     matcher: &Matcher,
     max_age_secs: u64,
+    keep: KeepFinal,
 ) -> Vec<Target> {
     let cutoff = SystemTime::now()
         .checked_sub(Duration::from_secs(max_age_secs))
@@ -522,7 +568,7 @@ pub fn collect(
             out.push(t);
             continue;
         }
-        match stale_entries(&profiles, cutoff) {
+        match stale_entries(&profiles, cutoff, keep) {
             Err(why) => t.skipped.push((t.root.clone(), why)),
             Ok(entries) => t.entries.extend(entries.into_iter().filter(|p| {
                 // An excluded entry or ancestor stays, and nothing outside the target goes
@@ -542,6 +588,11 @@ pub fn collect(
 mod tests {
     use super::*;
     use std::fs::FileTimes;
+
+    const KEEP: KeepFinal = KeepFinal {
+        debug: true,
+        release: true,
+    };
 
     struct Tmp(PathBuf);
     impl Drop for Tmp {
@@ -618,6 +669,44 @@ mod tests {
     }
 
     #[test]
+    fn final_artifacts_go_only_when_allowed() {
+        let d = tmp("finals");
+        let t = target(&d.0);
+        let p = t.join("debug");
+        for n in ["app", "app.d", "examples/demo", "new", "examples/.x"] {
+            file(&p.join(n));
+        }
+        for n in ["app", "app.d", "examples/demo", "examples/.x"] {
+            old(&p.join(n));
+        }
+        old(&p.join(".cargo-lock"));
+        let finals = |keep| {
+            stale_entries(&[(p.clone(), false)], cutoff(), keep)
+                .unwrap()
+                .into_iter()
+                .filter_map(|e| e.strip_prefix(&p).ok().map(|r| r.display().to_string()))
+                .filter(|r| {
+                    !r.starts_with("deps")
+                        && !r.starts_with(".fingerprint")
+                        && !r.starts_with("build")
+                        && !r.starts_with("incremental")
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(finals(KEEP).is_empty());
+        let rel = KeepFinal {
+            debug: true,
+            release: false,
+        };
+        assert!(finals(rel).is_empty());
+        let dbg = KeepFinal {
+            debug: false,
+            release: true,
+        };
+        assert_eq!(finals(dbg), ["app", "app.d", "examples/demo"]);
+    }
+
+    #[test]
     fn hashes() {
         assert_eq!(
             unit_hash("blake3-4705c8f789ee46af"),
@@ -642,7 +731,7 @@ mod tests {
         let p = t.join("debug");
         assert_eq!(profile_dirs(&t), vec![p.clone()]);
         let cutoff = SystemTime::now() - Duration::from_secs(30 * 86_400);
-        let got: Vec<String> = stale_entries(&[(p.clone(), false)], cutoff)
+        let got: Vec<String> = stale_entries(&[(p.clone(), false)], cutoff, KEEP)
             .unwrap()
             .iter()
             .map(|x| x.strip_prefix(&p).unwrap().to_string_lossy().into_owned())
@@ -667,7 +756,7 @@ mod tests {
         // Used now: the whole unit `a` stays.
         file(&p.join("deps/liba-0123456789abcdef.rmeta"));
         let cutoff = SystemTime::now() - Duration::from_secs(30 * 86_400);
-        let got = stale_entries(&[(p.clone(), false)], cutoff).unwrap();
+        let got = stale_entries(&[(p.clone(), false)], cutoff, KEEP).unwrap();
         assert!(
             !got.iter()
                 .any(|x| x.to_string_lossy().contains("0123456789abcdef"))
@@ -682,19 +771,19 @@ mod tests {
         let held = File::open(t.join("debug/.cargo-lock")).unwrap();
         held.lock().unwrap();
         let m = Matcher::new(&[format!("{}/target", d.0.display())], &[], None).unwrap();
-        let got = collect(vec![(t.clone(), "r".into())], &m, 30 * 86_400);
+        let got = collect(vec![(t.clone(), "r".into())], &m, 30 * 86_400, KEEP);
         assert_eq!(got.len(), 1);
         assert!(got[0].entries.is_empty());
         assert_eq!(got[0].skipped.len(), 1);
         drop(held);
         // A child another test forks (ditto) shares the descriptor until its exec: retry.
-        let mut got = collect(vec![(t.clone(), "r".into())], &m, 30 * 86_400);
+        let mut got = collect(vec![(t.clone(), "r".into())], &m, 30 * 86_400, KEEP);
         for _ in 0..100 {
             if got[0].skipped.is_empty() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
-            got = collect(vec![(t.clone(), "r".into())], &m, 30 * 86_400);
+            got = collect(vec![(t.clone(), "r".into())], &m, 30 * 86_400, KEEP);
         }
         assert_eq!(got[0].entries.len(), 5, "{:?}", got[0].skipped);
         assert_eq!(got[0].locks.len(), 1);
@@ -705,7 +794,7 @@ mod tests {
         let d = tmp("exc");
         let t = target(&d.0);
         let m = Matcher::new(&[], &["a-0abc".to_owned()], None).unwrap();
-        let got = collect(vec![(t, "r".into())], &m, 30 * 86_400);
+        let got = collect(vec![(t, "r".into())], &m, 30 * 86_400, KEEP);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].entries.len(), 4);
     }
@@ -798,7 +887,7 @@ mod tests {
             format!(r#"{{"deps":[[1,"a",false,{n}]]}}"#),
         )
         .unwrap();
-        let got = stale_entries(&[(p.clone(), false)], cutoff()).unwrap();
+        let got = stale_entries(&[(p.clone(), false)], cutoff(), KEEP).unwrap();
         assert!(
             !got.iter()
                 .any(|x| x.to_string_lossy().contains("0123456789abcdef")),
@@ -806,7 +895,7 @@ mod tests {
         );
         // An unparseable JSON of a fresh unit: nothing of the profile is listed.
         fs::write(p.join(".fingerprint/b-fedcba9876543210/lib-b.json"), "{").unwrap();
-        assert!(stale_entries(&[(p.clone(), false)], cutoff()).is_err());
+        assert!(stale_entries(&[(p.clone(), false)], cutoff(), KEEP).is_err());
     }
 
     #[test]
@@ -824,7 +913,7 @@ mod tests {
         std::os::unix::fs::symlink(&outside, p.join("incremental")).unwrap();
         fs::remove_dir_all(p.join("deps")).unwrap();
         std::os::unix::fs::symlink(&outside, p.join("deps")).unwrap();
-        let got = stale_entries(&[(p.clone(), false)], cutoff()).unwrap();
+        let got = stale_entries(&[(p.clone(), false)], cutoff(), KEEP).unwrap();
         assert!(
             got.iter()
                 .all(|x| !x.starts_with(p.join("incremental")) && !x.starts_with(p.join("deps"))),
@@ -841,7 +930,7 @@ mod tests {
         let d = tmp("exprof");
         let t = target(&d.0);
         let m = Matcher::new(&[], &["debug".to_owned()], None).unwrap();
-        let got = collect(vec![(t, "r".into())], &m, CUTOFF);
+        let got = collect(vec![(t, "r".into())], &m, CUTOFF, KEEP);
         assert!(got[0].entries.is_empty() && got[0].skipped.is_empty());
     }
 
@@ -882,7 +971,7 @@ mod tests {
         .unwrap();
         file(&x.join(".cargo-lock"));
         let m = Matcher::new(&[], &[], None).unwrap();
-        let got = collect(vec![(t.clone(), "r".into())], &m, CUTOFF);
+        let got = collect(vec![(t.clone(), "r".into())], &m, CUTOFF, KEEP);
         assert!(got[0].skipped.is_empty(), "{:?}", got[0].skipped);
         assert!(
             !got[0]
@@ -900,7 +989,7 @@ mod tests {
         drop(got);
         let held = File::open(x.join(".cargo-lock")).unwrap();
         held.lock().unwrap();
-        let got = collect(vec![(t, "r".into())], &m, CUTOFF);
+        let got = collect(vec![(t, "r".into())], &m, CUTOFF, KEEP);
         assert!(got[0].entries.is_empty() && got[0].locks.is_empty());
     }
 }

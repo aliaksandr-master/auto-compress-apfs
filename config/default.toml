@@ -127,13 +127,17 @@ run = false
 # (debug, release, <triple>/<profile>) a build unit, `.fingerprint/<name>-<hash>` with
 # `build/<name>-<hash>` and the `deps` entries of that hash, is deleted when none of them was
 # modified (or a file read) for max_age_secs and no fresh unit was built against it (its
-# .fingerprint JSON); `incremental` dirs by their own age. Final binaries stay. A profile
+# .fingerprint JSON); `incremental` dirs by their own age. The final artifacts at the top of
+# debug / release (and their examples) stay while keep_final_debug / keep_final_release are
+# true; with false they go too once not used (modified or run) for max_age_secs. A profile
 # whose Cargo lock a build holds is skipped; `exclude` also keeps whole profiles ("release"). Refusals, preview,
 # `--apply` and the journal as for [purge]; `run` as for [trash].
 [cargo_clean]
 roots = []
 exclude = []
 max_age_secs = 2592000
+keep_final_debug = true
+keep_final_release = true
 run = false
 
 # What `run` does with compress (the top-level patterns above); `run` as for [trash].
