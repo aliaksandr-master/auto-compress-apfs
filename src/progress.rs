@@ -35,6 +35,7 @@ pub enum FileEvent<'a> {
 enum Phase {
     Scan {
         found: u64,
+        dirs: u64,
     },
     Compress {
         total_files: u64,
@@ -64,7 +65,7 @@ impl Progress {
             width: width.max(40),
             color,
             home: home.map(Box::from),
-            phase: Phase::Scan { found: 0 },
+            phase: Phase::Scan { found: 0, dirs: 0 },
             last_draw: None,
             shown: false,
             stale: false,
@@ -88,7 +89,7 @@ impl Progress {
         }
         self.stale = false;
         let line = match &self.phase {
-            Phase::Scan { found } => scan_line(*found),
+            Phase::Scan { found, dirs } => scan_line(*found, *dirs),
             Phase::Compress {
                 total_files,
                 total_bytes,
@@ -110,8 +111,14 @@ impl Progress {
     }
 
     pub fn scan_found(&mut self, n: u64) {
-        if let Phase::Scan { found } = &mut self.phase {
+        self.scan_progress(1, n);
+    }
+
+    /// One more directory read by the walk, `n` more items found in it.
+    pub fn scan_progress(&mut self, read: u64, n: u64) {
+        if let Phase::Scan { found, dirs } = &mut self.phase {
             *found += n;
+            *dirs += read;
         }
     }
 
@@ -215,8 +222,8 @@ pub fn duration_text(secs: u64) -> String {
     }
 }
 
-pub fn scan_line(found: u64) -> String {
-    format!("scanning... {found} files found")
+pub fn scan_line(found: u64, dirs: u64) -> String {
+    format!("scanning... {dirs} dirs read, {found} found")
 }
 
 /// Partial cells of the filled bar part, by eighths: index `n` is `n/8` of a cell.
@@ -454,7 +461,7 @@ mod tests {
         p.draw(&mut out, false);
         let text = String::from_utf8(out.clone()).unwrap();
         assert_eq!(
-            text.matches("scanning... 7 files found").count(),
+            text.matches("scanning... 1 dirs read, 7 found").count(),
             1,
             "{text:?}"
         );
@@ -463,7 +470,10 @@ mod tests {
         let text = String::from_utf8(out).unwrap();
         assert!(text.starts_with(CLEAR), "{text:?}");
         assert!(text.contains("SKIP(owner): owned\n"), "{text:?}");
-        assert!(text.ends_with("scanning... 7 files found"), "{text:?}");
+        assert!(
+            text.ends_with("scanning... 1 dirs read, 7 found"),
+            "{text:?}"
+        );
 
         // Compress phase: the count advanced right after an event is drawn at once.
         let mut out = Vec::new();

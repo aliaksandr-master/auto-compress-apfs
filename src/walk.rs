@@ -791,9 +791,7 @@ impl Walker<'_> {
         if complete && self.track_dirs.is_some_and(|t| t.contains(&job.dir)) {
             out.read_dirs.insert(job.dir.clone());
         }
-        if found > 0 {
-            self.log.scan_found(found);
-        }
+        self.log.scan_found(found);
     }
 
     /// Queues a subdirectory unless the guard blocks it, it carries a protected flag, it is
