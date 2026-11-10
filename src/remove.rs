@@ -85,7 +85,8 @@ fn disk_form(p: &Path) -> PathBuf {
     PathBuf::from(real.to_string_lossy().to_lowercase())
 }
 
-/// Checks every matched item; nothing is changed.
+/// Checks every matched item (sorted by path, as the walk and cargo-clean give them); nothing
+/// is changed.
 pub fn plan(
     matched: Vec<Matched>,
     matcher: &Matcher,
@@ -94,7 +95,7 @@ pub fn plan(
     action: Action,
 ) -> Vec<Item> {
     let trash_dev = fs::metadata(keep.trash_dir).ok().map(|m| m.dev());
-    matched
+    let items = matched
         .into_iter()
         .map(|m| {
             let rule = matcher.matching_pattern(&m.path).unwrap_or("?").to_owned();
@@ -123,18 +124,28 @@ pub fn plan(
                 .or_else(|| measure(&mut item, matcher));
             item
         })
-        .collect::<Vec<Item>>()
-        .into_iter()
-        .fold(Vec::new(), |mut kept: Vec<Item>, item| {
-            // Sorted by path: an item inside an earlier one that will be acted on goes with it.
-            let covered = kept
-                .iter()
-                .any(|k| k.is_dir && k.blocked.is_none() && item.path.starts_with(&k.path));
-            if !covered {
-                kept.push(item);
-            }
-            kept
-        })
+        .collect::<Vec<Item>>();
+    drop_covered(items)
+}
+
+/// Drops every item inside an earlier directory item that will be acted on (it goes with that
+/// directory). `items` must be sorted by path: everything below a directory then directly
+/// follows it, so only the last such directory is compared. Linear, where comparing with every
+/// kept item was quadratic (minutes for 10^5 items).
+fn drop_covered(items: Vec<Item>) -> Vec<Item> {
+    debug_assert!(items.windows(2).all(|w| w[0].path <= w[1].path));
+    let mut kept = Vec::with_capacity(items.len());
+    let mut cover: Option<PathBuf> = None;
+    for item in items {
+        if cover.as_ref().is_some_and(|c| item.path.starts_with(c)) {
+            continue;
+        }
+        if item.is_dir && item.blocked.is_none() {
+            cover = Some(item.path.clone());
+        }
+        kept.push(item);
+    }
+    kept
 }
 
 /// Lexical and on-disk refusals: [`location_refused`], then the Trash.
@@ -524,6 +535,52 @@ pub fn apply(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drop_covered_keeps_only_outermost_actionable() {
+        let it = |p: &str, is_dir: bool, blocked: bool| Item {
+            path: PathBuf::from(p),
+            is_dir,
+            dev: 0,
+            ino: 0,
+            bytes: 0,
+            files: 0,
+            rule: String::new(),
+            blocked: blocked.then(|| "x".to_owned()),
+        };
+        let mut items = vec![
+            it("/d/a", true, false),
+            it("/d/a/x", false, false),
+            it("/d/a-b", true, false),
+            it("/d/a-b/y", false, false),
+            it("/d/b", true, true),
+            it("/d/b/z", true, false),
+            it("/d/b/z/w", false, false),
+            it("/d/c", false, false),
+        ];
+        items.sort_by(|a, b| a.path.cmp(&b.path));
+        // The quadratic reference: covered by any earlier kept actionable directory.
+        let reference: Vec<PathBuf> = items
+            .iter()
+            .fold(Vec::<&Item>::new(), |mut kept, i| {
+                if !kept
+                    .iter()
+                    .any(|k| k.is_dir && k.blocked.is_none() && i.path.starts_with(&k.path))
+                {
+                    kept.push(i);
+                }
+                kept
+            })
+            .iter()
+            .map(|i| i.path.clone())
+            .collect();
+        let got: Vec<PathBuf> = drop_covered(items).into_iter().map(|i| i.path).collect();
+        assert_eq!(got, reference);
+        assert_eq!(
+            got,
+            ["/d/a", "/d/a-b", "/d/b", "/d/b/z", "/d/c"].map(PathBuf::from)
+        );
+    }
     use crate::walk::{self, Matcher};
 
     struct Tmp {
