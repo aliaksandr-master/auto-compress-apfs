@@ -93,6 +93,7 @@ pub fn plan(
     guard: &Guard,
     keep: &Keep<'_>,
     action: Action,
+    on_item: &dyn Fn(),
 ) -> Vec<Item> {
     let trash_dev = fs::metadata(keep.trash_dir).ok().map(|m| m.dev());
     let items = matched
@@ -122,6 +123,7 @@ pub fn plan(
                     _ => None,
                 })
                 .or_else(|| measure(&mut item, matcher));
+            on_item();
             item
         })
         .collect::<Vec<Item>>();
@@ -303,12 +305,19 @@ fn measure(item: &mut Item, matcher: &Matcher) -> Option<String> {
 
 /// The preview: every item with its size, blocked ones with the reason, totals and the command
 /// that would do it.
-pub fn render(items: &[Item], home: &Path, action: Action, apply_cmd: &str) -> String {
+/// Without `verbose` only the totals (and how to list the items).
+pub fn render(
+    items: &[Item],
+    home: &Path,
+    action: Action,
+    apply_cmd: &str,
+    verbose: bool,
+) -> String {
     use std::fmt::Write as _;
     let mut s = String::new();
     let (ready, blocked): (Vec<&Item>, Vec<&Item>) =
         items.iter().partition(|i| i.blocked.is_none());
-    for i in &ready {
+    for i in ready.iter().filter(|_| verbose) {
         let kind = if i.is_dir { "dir " } else { "file" };
         let _ = writeln!(
             s,
@@ -319,7 +328,7 @@ pub fn render(items: &[Item], home: &Path, action: Action, apply_cmd: &str) -> S
             i.rule
         );
     }
-    for i in &blocked {
+    for i in blocked.iter().filter(|_| verbose) {
         let _ = writeln!(
             s,
             "BLOCKED {}: {}",
@@ -336,6 +345,9 @@ pub fn render(items: &[Item], home: &Path, action: Action, apply_cmd: &str) -> S
         human(total),
         blocked.len()
     );
+    if !verbose && !items.is_empty() {
+        let _ = writeln!(s, "Add -v to list every item (and why one is blocked).");
+    }
     if !ready.is_empty() {
         let _ = writeln!(s, "Nothing changed. Run '{apply_cmd}' to do it.");
     }
@@ -447,6 +459,8 @@ pub fn apply(
     };
     let trash_real = fs::canonicalize(trash_dir).unwrap_or_else(|_| trash_dir.to_path_buf());
     let mut out = Outcome::default();
+    let ready = items.iter().filter(|i| i.blocked.is_none());
+    log.start_compress(ready.clone().count() as u64, ready.map(|i| i.bytes).sum());
     for i in items {
         if let Some(why) = &i.blocked {
             out.blocked += 1;
@@ -466,6 +480,7 @@ pub fn apply(
                     && flag_reason(r, &m).is_none()
             })
         });
+        log.advance(i.bytes);
         let before = match &real {
             Some(r) if i.is_dir => count_entries(r),
             _ => 0,
@@ -630,7 +645,7 @@ mod tests {
                 own,
                 trash_dir: &trash,
             };
-            plan(w.matched, &m, &guard, &keep, action)
+            plan(w.matched, &m, &guard, &keep, action, &|| {})
         }
     }
 

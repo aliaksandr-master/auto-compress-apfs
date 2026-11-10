@@ -50,12 +50,12 @@ Usage:
   auto-compress-apfs                         this help
   auto-compress-apfs compress [OPTIONS]      preview; with --apply: compress (options
                                              without a command also mean compress)
-  auto-compress-apfs trash [--apply] [--config PATH]
-  auto-compress-apfs purge [--apply] [--config PATH]
-  auto-compress-apfs cargo-clean [--apply] [--config PATH]
+  auto-compress-apfs trash [--apply] [--config PATH] [-v]
+  auto-compress-apfs purge [--apply] [--config PATH] [-v]
+  auto-compress-apfs cargo-clean [--apply] [--config PATH] [-v]
   auto-compress-apfs tm-exclude [--apply] [--config PATH]
   auto-compress-apfs dedup [--apply] [--config PATH] [-v]
-  auto-compress-apfs run [--apply] [--config PATH]
+  auto-compress-apfs run [--apply] [--config PATH] [-v]
   auto-compress-apfs stat [--top N] [--all] [--config PATH]
   auto-compress-apfs quarantine list [--config PATH]
   auto-compress-apfs quarantine clear <PATH>|--all [--config PATH]
@@ -100,6 +100,8 @@ their target and build dirs (workspace root, build.target-dir / build.build-dir 
 .cargo/config.toml, only with Cargo's CACHEDIR.TAG) the build units (.fingerprint, build,
 deps, incremental entries) not used for max_age_secs are listed; with --apply deleted for
 good, the rest stays. A profile whose .cargo-lock a build holds is skipped.
+trash / purge / cargo-clean show a progress line on a terminal and the totals; -v lists
+every item (and why one is blocked) and mirrors the log to stderr; run -v passes it on.
 tm-exclude: directories matched by the [tm_exclude] patterns are listed; with --apply excluded
 from Time Machine (the sticky attribute `tmutil addexclusion` sets; tmutil is not run). An
 existing exclusion is never removed or changed.
@@ -145,6 +147,9 @@ struct StatArgs {
 struct CleanArgs {
     config: Option<PathBuf>,
     apply: bool,
+    /// `trash` / `purge` / `cargo-clean` (and `run`): list every item and mirror the log to
+    /// stderr; without it a progress line (on a terminal) and the totals only.
+    verbose: bool,
 }
 
 /// Options of `dedup`.
@@ -334,6 +339,7 @@ fn parse_clean(mut it: impl Iterator<Item = String>) -> Result<Cli, String> {
     let mut a = CleanArgs {
         config: None,
         apply: false,
+        verbose: false,
     };
     while let Some(arg) = it.next() {
         if let Some(exit) = help_or_version(&arg) {
@@ -344,6 +350,7 @@ fn parse_clean(mut it: impl Iterator<Item = String>) -> Result<Cli, String> {
         }
         match arg.as_str() {
             "--apply" => a.apply = true,
+            "-v" | "--verbose" => a.verbose = true,
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
@@ -355,6 +362,7 @@ fn parse_dedup(mut it: impl Iterator<Item = String>) -> Result<Cli, String> {
         clean: CleanArgs {
             config: None,
             apply: false,
+            verbose: false,
         },
         verbose: false,
     };
@@ -862,7 +870,7 @@ fn cmd_remove(args: &CleanArgs, action: remove::Action, home: &Path) -> ExitCode
         return ExitCode::SUCCESS;
     }
     let log_dir = cfg.log_dir();
-    let log = match Logger::open(&log_dir, cfg.log_max_bytes, cfg.log_keep, false) {
+    let log = match Logger::open(&log_dir, cfg.log_max_bytes, cfg.log_keep, args.verbose) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("{NAME}: cannot open log in {}: {e}", log_dir.display());
@@ -928,6 +936,15 @@ fn run_remove(
     } else {
         None
     };
+    // Without -v: a progress line on a terminal, the items stay in the log.
+    if !args.verbose && std::io::stderr().is_terminal() {
+        let width = std::env::var("COLUMNS")
+            .ok()
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(PROGRESS_WIDTH);
+        let color = std::env::var_os("NO_COLOR").is_none();
+        log.enable_progress(Progress::new(width, color, Some(home)));
+    }
     let walked = walk::walk_entries(
         manifest_matcher.as_ref().unwrap_or(&matcher),
         &guard,
@@ -973,7 +990,8 @@ fn run_remove(
     } else {
         (walked.matched, Vec::new())
     };
-    let mut items = remove::plan(matched, &matcher, &guard, &keep, action);
+    log.start_compress(matched.len() as u64, 0);
+    let mut items = remove::plan(matched, &matcher, &guard, &keep, action, &|| log.advance(0));
     for i in &mut items {
         if let Some(t) = targets.iter().find(|t| i.path.starts_with(&t.root)) {
             i.rule.clone_from(&t.rule);
@@ -982,7 +1000,9 @@ fn run_remove(
     let blocked = items.iter().filter(|i| i.blocked.is_some()).count() as u64;
     let out = if args.apply {
         let journal = cfg.log_dir().join(remove::JOURNAL_NAME);
-        let out = remove::apply(&items, action, &trash_dir, &journal, log)?;
+        let out = remove::apply(&items, action, &trash_dir, &journal, log);
+        log.finish_progress(None);
+        let out = out?;
         println!(
             "{name}: {} done ({}), {} failed, {} blocked; journal {}",
             out.done,
@@ -993,6 +1013,7 @@ fn run_remove(
         );
         out
     } else {
+        log.finish_progress(None);
         let extra: String = args
             .config
             .iter()
@@ -1004,7 +1025,8 @@ fn run_remove(
                 &items,
                 home,
                 action,
-                &format!("{NAME} {name} --apply{extra}")
+                &format!("{NAME} {name} --apply{extra}"),
+                args.verbose
             )
         );
         remove::Outcome {
@@ -1531,6 +1553,7 @@ fn cmd_run(args: &CleanArgs, home: &Path) -> ExitCode {
         let step = CleanArgs {
             config: args.config.clone(),
             apply,
+            verbose: args.verbose,
         };
         let code = match name {
             "trash" => cmd_remove(&step, remove::Action::Trash, home),
@@ -1546,8 +1569,8 @@ fn cmd_run(args: &CleanArgs, home: &Path) -> ExitCode {
             ),
             "dedup" => cmd_dedup(
                 &DedupArgs {
+                    verbose: step.verbose,
                     clean: step,
-                    verbose: false,
                 },
                 home,
             ),
@@ -2653,8 +2676,8 @@ mod tests {
             Ok(Cli::Remove(a, remove::Action::Trash)) if a.apply
         ));
         assert!(matches!(
-            parse(&["purge"]),
-            Ok(Cli::Remove(a, remove::Action::Purge)) if !a.apply
+            parse(&["purge", "-v"]),
+            Ok(Cli::Remove(a, remove::Action::Purge)) if !a.apply && a.verbose
         ));
         assert!(
             matches!(parse(&["run", "--config=/c.toml"]), Ok(Cli::Run(a)) if a.config.is_some())

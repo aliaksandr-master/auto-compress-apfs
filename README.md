@@ -218,12 +218,12 @@ untouched. Only `/usr/bin/ditto` is executed, by absolute path.
 ```
 auto-compress-apfs                         this help
 auto-compress-apfs compress [OPTIONS]      preview; with --apply: compress
-auto-compress-apfs trash [--apply] [--config PATH]
-auto-compress-apfs purge [--apply] [--config PATH]
-auto-compress-apfs cargo-clean [--apply] [--config PATH]
+auto-compress-apfs trash [--apply] [--config PATH] [-v]
+auto-compress-apfs purge [--apply] [--config PATH] [-v]
+auto-compress-apfs cargo-clean [--apply] [--config PATH] [-v]
 auto-compress-apfs tm-exclude [--apply] [--config PATH]
 auto-compress-apfs dedup [--apply] [--config PATH] [-v]
-auto-compress-apfs run [--apply] [--config PATH]
+auto-compress-apfs run [--apply] [--config PATH] [-v]
 auto-compress-apfs stat [--top N] [--all] [--config PATH]
 auto-compress-apfs quarantine list [--config PATH]
 auto-compress-apfs quarantine clear <PATH>|--all [--config PATH]
@@ -315,8 +315,10 @@ auto-compress-apfs -h|--help | -V|--version
   spelling, case-sensitively, and below a matched item also its on-disk spelling). A matched directory is not
   entered: it goes as a whole, whatever its age. Only items strictly below the home directory
   or an `allow_volumes` mount are acted on. Without
-  `--apply` they list each item (size, file count, the pattern that matched) and the refused ones
-  with the reason, and change nothing. With `--apply`, under the run lock, `trash` moves each item
+  `--apply` they print the totals (with `-v` also each item: size, file count, the pattern that
+  matched, and the refused ones with the reason), and change nothing. Without `-v` a progress
+  line is drawn on a terminal (stderr) while the items are checked and acted on; `-v` mirrors the
+  log to stderr instead, one line per item acted on. With `--apply`, under the run lock, `trash` moves each item
   to `~/.Trash` (a name already there is never replaced: the moved item gets a time suffix) and
   `purge` deletes it for good. Right before acting the path must still be the same file or
   directory (device, inode, type, symlinks resolved) and carry no protected flag; the Trash move

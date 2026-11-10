@@ -621,7 +621,16 @@ fn trash_purge_and_run() {
     fs::create_dir_all(&trash).unwrap();
     let journal = env.log.with_file_name("removed.tsv");
     // Preview: lists, refuses the home directory itself, changes nothing.
+    // Without -v: the totals only, no item list.
     let out = env.exec(&["trash"], None);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        !text.contains("x.dmg") && !text.contains("BLOCKED") && text.contains("would be moved"),
+        "{text}"
+    );
+    assert!(text.contains("Add -v"), "{text}");
+    let out = env.exec(&["trash", "-v"], None);
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "{out:?}");
     assert!(
@@ -740,7 +749,7 @@ fn cargo_clean_keeps_fresh_and_locked_units() {
     .unwrap();
     let journal = env.log.with_file_name("removed.tsv");
     // Preview: lists the old unit of `a`, skips `b`, changes nothing.
-    let out = env.exec(&["cargo-clean"], None);
+    let out = env.exec(&["cargo-clean", "--verbose"], None);
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "{out:?}");
     assert!(
