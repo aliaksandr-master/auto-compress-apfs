@@ -77,12 +77,133 @@ pub struct Keep<'a> {
 /// On-disk form of `p` for comparisons: realpath when it exists, data prefix stripped,
 /// lowercased (APFS volumes are usually case-insensitive).
 fn disk_form(p: &Path) -> PathBuf {
-    let real = fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    folded(fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()))
+}
+
+/// `real` with the data prefix stripped, lowercased.
+fn folded(real: PathBuf) -> PathBuf {
     let real = match real.strip_prefix("/System/Volumes/Data") {
         Ok(r) => Path::new("/").join(r),
         Err(_) => real,
     };
     PathBuf::from(real.to_string_lossy().to_lowercase())
+}
+
+/// The checks of [`location_refused`], [`refused`] and [`foreign`] for many items: the on-disk
+/// forms of `keep` are resolved once, an item's realpath is its parent's (resolved once per
+/// directory) plus its name, and the filesystem check is done once per parent directory (an
+/// item on another filesystem than its parent is refused before it). Same answers
+/// as resolving everything per item, for items that are not symlinks (the walk and cargo-clean
+/// never hand over a symlink, and `measure` refuses one).
+pub(crate) struct Checker<'a> {
+    keep: &'a Keep<'a>,
+    scope: Vec<PathBuf>,
+    own: Vec<PathBuf>,
+    trash: PathBuf,
+    parents: std::cell::RefCell<std::collections::HashMap<PathBuf, PathBuf>>,
+    filesystems: std::cell::RefCell<std::collections::HashMap<PathBuf, Option<String>>>,
+}
+
+impl<'a> Checker<'a> {
+    pub(crate) fn new(keep: &'a Keep<'a>) -> Self {
+        Self {
+            keep,
+            scope: keep.scope.iter().map(|p| disk_form(p)).collect(),
+            own: keep.own.iter().map(|p| disk_form(p)).collect(),
+            trash: disk_form(keep.trash_dir),
+            parents: Default::default(),
+            filesystems: Default::default(),
+        }
+    }
+
+    /// realpath of `path` (itself when it cannot be resolved), its parent from the cache.
+    fn real(&self, path: &Path) -> PathBuf {
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+            return fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        };
+        if parent.as_os_str().is_empty() {
+            return fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        }
+        let mut cache = self.parents.borrow_mut();
+        let real_parent = match cache.get(parent) {
+            Some(r) => r.clone(),
+            None => match fs::canonicalize(parent) {
+                Ok(r) => {
+                    cache.insert(parent.to_path_buf(), r.clone());
+                    r
+                }
+                Err(_) => return path.to_path_buf(),
+            },
+        };
+        let real = real_parent.join(name);
+        // A missing item resolves to itself, as `canonicalize` failing would.
+        if fs::symlink_metadata(&real).is_err() {
+            return path.to_path_buf();
+        }
+        real
+    }
+
+    /// [`location_refused`] plus the Trash checks of [`refused`] when `action` is given.
+    fn refused(&self, path: &Path, guard: &Guard, action: Option<Action>) -> Option<String> {
+        use std::path::Component::{CurDir, ParentDir};
+        if path.components().any(|c| matches!(c, CurDir | ParentDir)) {
+            return Some("contains `.` or `..`".into());
+        }
+        let real = self.real(path);
+        for p in [path, real.as_path()] {
+            if let Some(why) = guard.removal_refused(p) {
+                return Some(why);
+            }
+        }
+        let disk = folded(real);
+        if !self.scope.iter().any(|s| disk != *s && disk.starts_with(s)) {
+            return Some("is not below the home directory or an allow_volumes mount".into());
+        }
+        if let Some(k) = self
+            .own
+            .iter()
+            .position(|o| o.starts_with(&disk) || disk.starts_with(o))
+        {
+            return Some(format!(
+                "is or contains {} (used by this tool)",
+                self.keep.own[k].display()
+            ));
+        }
+        let action = action?;
+        if action == Action::Trash && disk.starts_with(&self.trash) {
+            return Some("is already in the Trash".into());
+        }
+        if self.trash.starts_with(&disk) {
+            return Some(format!(
+                "is or contains the Trash {}",
+                self.keep.trash_dir.display()
+            ));
+        }
+        None
+    }
+
+    pub(crate) fn location_refused(&self, path: &Path, guard: &Guard) -> Option<String> {
+        self.refused(path, guard, None)
+    }
+
+    /// [`foreign`], the filesystem check cached per parent directory.
+    pub(crate) fn foreign(&self, path: &Path, dev: u64, guard: &Guard) -> Option<String> {
+        let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) else {
+            return foreign(path, dev, guard);
+        };
+        match fs::symlink_metadata(parent) {
+            Ok(pm) if pm.dev() != dev => {
+                return Some("is on another filesystem than its parent (a mount point)".into());
+            }
+            Ok(_) => {}
+            Err(e) => return Some(format!("cannot stat its parent: {e}")),
+        }
+        self.filesystems
+            .borrow_mut()
+            .entry(parent.to_path_buf())
+            .or_insert_with(|| guard.filesystem_allowed(path).err())
+            .clone()
+    }
 }
 
 /// Checks every matched item (sorted by path, as the walk and cargo-clean give them); nothing
@@ -96,6 +217,7 @@ pub fn plan(
     on_item: &dyn Fn(),
 ) -> Vec<Item> {
     let trash_dev = fs::metadata(keep.trash_dir).ok().map(|m| m.dev());
+    let checker = Checker::new(keep);
     let items = matched
         .into_iter()
         .map(|m| {
@@ -110,8 +232,9 @@ pub fn plan(
                 rule,
                 blocked: None,
             };
-            item.blocked = refused(&item.path, guard, keep, action)
-                .or_else(|| foreign(&item.path, item.dev, guard))
+            item.blocked = checker
+                .refused(&item.path, guard, Some(action))
+                .or_else(|| checker.foreign(&item.path, item.dev, guard))
                 .or_else(|| match (action, trash_dev) {
                     (Action::Trash, None) => Some(format!(
                         "the Trash {} does not exist",
@@ -150,7 +273,9 @@ fn drop_covered(items: Vec<Item>) -> Vec<Item> {
     kept
 }
 
-/// Lexical and on-disk refusals: [`location_refused`], then the Trash.
+/// Lexical and on-disk refusals: [`location_refused`], then the Trash. The per-item reference
+/// [`Checker`] is tested against.
+#[cfg(test)]
 fn refused(path: &Path, guard: &Guard, keep: &Keep<'_>, action: Action) -> Option<String> {
     if let Some(why) = location_refused(path, guard, keep) {
         return Some(why);
@@ -170,7 +295,9 @@ fn refused(path: &Path, guard: &Guard, keep: &Keep<'_>, action: Action) -> Optio
 }
 
 /// Lexical and on-disk refusals besides the Trash: `.`/`..`, outside the scope, protected
-/// locations and their ancestors, the tool's own directories.
+/// locations and their ancestors, the tool's own directories. The per-item reference
+/// [`Checker`] is tested against.
+#[cfg(test)]
 pub(crate) fn location_refused(path: &Path, guard: &Guard, keep: &Keep<'_>) -> Option<String> {
     use std::path::Component::{CurDir, ParentDir};
     if path.components().any(|c| matches!(c, CurDir | ParentDir)) {
@@ -203,8 +330,9 @@ pub(crate) fn location_refused(path: &Path, guard: &Guard, keep: &Keep<'_>) -> O
 }
 
 /// An item `path` on device `dev` (as walked) on another filesystem than its parent (a mount
-/// point), or on a filesystem the guard does not allow.
-pub(crate) fn foreign(path: &Path, dev: u64, guard: &Guard) -> Option<String> {
+/// point), or on a filesystem the guard does not allow. The per-item reference [`Checker`] is
+/// tested against.
+fn foreign(path: &Path, dev: u64, guard: &Guard) -> Option<String> {
     let parent = path.parent().unwrap_or(Path::new("/"));
     match fs::symlink_metadata(parent) {
         Ok(pm) if pm.dev() != dev => {
@@ -657,6 +785,70 @@ mod tests {
                 .status();
             let _ = fs::remove_dir_all(&self.dir);
         }
+    }
+
+    #[test]
+    fn the_checker_answers_as_the_per_item_checks() {
+        let t = Tmp::new("checker");
+        let real = t.dir.join("real");
+        fs::create_dir_all(real.join("sub")).unwrap();
+        t.write("real/sub/f");
+        t.write("Trash/in");
+        t.write("own/state");
+        std::os::unix::fs::symlink(&real, t.dir.join("link")).unwrap();
+        let outside = std::env::temp_dir().join(format!("acz-checker-out-{}", std::process::id()));
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("x"), "x").unwrap();
+        let scope = [t.dir.join("link"), t.dir.clone()];
+        let own = [t.dir.join("own")];
+        let trash = t.dir.join("Trash");
+        let keep = Keep {
+            scope: &scope,
+            own: &own,
+            trash_dir: &trash,
+        };
+        let guard = Guard::new(Path::new("/nonexistent-home"), &[], &t.log).unwrap();
+        let checker = Checker::new(&keep);
+        let paths = [
+            t.dir.join("real/sub/f"),
+            t.dir.join("real/sub"),
+            t.dir.join("link/sub/f"),
+            t.dir.join("LINK/sub/F"),
+            t.dir.join("real/missing"),
+            t.dir.join("missing/deeper"),
+            t.dir.join("Trash/in"),
+            t.dir.join("Trash"),
+            t.dir.join("own/state"),
+            t.dir.join("own"),
+            t.dir.clone(),
+            t.dir.join("real/../real/sub"),
+            outside.join("x"),
+            PathBuf::from("/"),
+        ];
+        for p in &paths {
+            let dev = fs::symlink_metadata(p).map_or(0, |m| m.dev());
+            for action in [Action::Trash, Action::Purge, Action::CargoClean] {
+                assert_eq!(
+                    checker.refused(p, &guard, Some(action)),
+                    refused(p, &guard, &keep, action),
+                    "{} {action:?}",
+                    p.display()
+                );
+            }
+            assert_eq!(
+                checker.location_refused(p, &guard),
+                location_refused(p, &guard, &keep),
+                "{}",
+                p.display()
+            );
+            assert_eq!(
+                checker.foreign(p, dev, &guard),
+                foreign(p, dev, &guard),
+                "{}",
+                p.display()
+            );
+        }
+        let _ = fs::remove_dir_all(&outside);
     }
 
     fn names(items: &[Item], root: &Path) -> Vec<String> {

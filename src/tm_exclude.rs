@@ -9,7 +9,7 @@
 use crate::clean::flag_reason;
 use crate::logger::Logger;
 use crate::progress::abbreviate_home;
-use crate::remove::{Keep, foreign, location_refused};
+use crate::remove::{Checker, Keep};
 use crate::sys;
 use crate::walk::{Guard, Matched, Matcher};
 use std::ffi::CStr;
@@ -120,6 +120,7 @@ pub fn plan(
         ));
     }
     let mut kept: Vec<Item> = Vec::new();
+    let checker = Checker::new(keep);
     for m in dirs {
         // Sorted by path: a directory inside an earlier excluded one goes with it, unchecked.
         let covered = kept.iter().any(|k| {
@@ -129,7 +130,7 @@ pub fn plan(
             continue;
         }
         let rule = matcher.matching_pattern(&m.path).unwrap_or("?").to_owned();
-        let state = check(&m, guard, keep, euid);
+        let state = check(&m, guard, &checker, euid);
         kept.push(Item {
             path: m.path,
             dev: m.dev,
@@ -141,9 +142,10 @@ pub fn plan(
     kept
 }
 
-fn check(m: &Matched, guard: &Guard, keep: &Keep<'_>, euid: u32) -> State {
-    if let Some(why) =
-        location_refused(&m.path, guard, keep).or_else(|| foreign(&m.path, m.dev, guard))
+fn check(m: &Matched, guard: &Guard, checker: &Checker<'_>, euid: u32) -> State {
+    if let Some(why) = checker
+        .location_refused(&m.path, guard)
+        .or_else(|| checker.foreign(&m.path, m.dev, guard))
     {
         return State::Blocked(why);
     }

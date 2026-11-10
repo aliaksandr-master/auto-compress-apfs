@@ -570,14 +570,20 @@ pub fn collect(
         }
         match stale_entries(&profiles, cutoff, keep) {
             Err(why) => t.skipped.push((t.root.clone(), why)),
-            Ok(entries) => t.entries.extend(entries.into_iter().filter(|p| {
-                // An excluded entry or ancestor stays, and nothing outside the target goes
-                // (backstop: symlinked directories are never entered).
-                !excluded_below(p, &t.root, matcher)
-                    && p.parent()
-                        .and_then(|d| fs::canonicalize(d).ok())
-                        .is_some_and(|d| d.starts_with(&real_root))
-            })),
+            Ok(entries) => {
+                // realpath per parent directory: thousands of entries share one.
+                let mut inside: HashMap<PathBuf, bool> = HashMap::new();
+                t.entries.extend(entries.into_iter().filter(|p| {
+                    // An excluded entry or ancestor stays, and nothing outside the target goes
+                    // (backstop: symlinked directories are never entered).
+                    !excluded_below(p, &t.root, matcher)
+                        && p.parent().is_some_and(|d| {
+                            *inside.entry(d.to_path_buf()).or_insert_with(|| {
+                                fs::canonicalize(d).is_ok_and(|d| d.starts_with(&real_root))
+                            })
+                        })
+                }));
+            }
         }
         out.push(t);
     }
