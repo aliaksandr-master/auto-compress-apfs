@@ -101,8 +101,8 @@ their target and build dirs (workspace root, build.target-dir / build.build-dir 
 deps, incremental entries) not used for max_age_secs are listed, plus the final debug /
 release artifacts when keep_final_debug / keep_final_release is false; with --apply deleted
 for good, the rest stays. A profile whose .cargo-lock a build holds is skipped.
-trash / purge / cargo-clean show a progress line on a terminal and the totals; -v lists
-every item (and why one is blocked) and mirrors the log to stderr; run -v passes it on.
+trash / purge / cargo-clean / dedup show a progress line on a terminal and the totals; -v
+lists every item (and why one is blocked) and mirrors the log to stderr; run -v passes it on.
 tm-exclude: directories matched by the [tm_exclude] patterns are listed; with --apply excluded
 from Time Machine (the sticky attribute `tmutil addexclusion` sets; tmutil is not run). An
 existing exclusion is never removed or changed.
@@ -380,7 +380,10 @@ fn parse_dedup(mut it: impl Iterator<Item = String>) -> Result<Cli, String> {
         }
         match arg.as_str() {
             "--apply" => a.clean.apply = true,
-            "-v" | "--verbose" => a.verbose = true,
+            "-v" | "--verbose" => {
+                a.verbose = true;
+                a.clean.verbose = true;
+            }
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
@@ -1473,7 +1476,12 @@ fn run_dedup(
             .collect();
         print!(
             "{}",
-            dedup::render(&plan, home, &format!("{NAME} dedup --apply{extra}"))
+            dedup::render(
+                &plan,
+                home,
+                &format!("{NAME} dedup --apply{extra}"),
+                args.verbose
+            )
         );
         dedup::Outcome::default()
     };
@@ -1556,7 +1564,7 @@ fn cmd_run(args: &CleanArgs, home: &Path) -> ExitCode {
             _ if !has_patterns => continue,
             config::RunMode::On => args.apply,
             config::RunMode::DryRunOnly => {
-                log_run_step(&cfg, name);
+                log_run_step(&cfg, name, args.verbose);
                 false
             }
         };
@@ -1691,10 +1699,13 @@ fn render_totals(totals: &[StepTotal]) -> String {
     s
 }
 
-/// Logs that `run` executes the step `name` as a preview only (`run = "dry-run-only"`).
-fn log_run_step(cfg: &Config, name: &str) {
+/// Logs that `run` executes the step `name` as a preview only (`run = "dry-run-only"`); with
+/// `verbose` it is printed too.
+fn log_run_step(cfg: &Config, name: &str, verbose: bool) {
     let line = format!("run step {name} mode=dry-run-only");
-    println!("{line}");
+    if verbose {
+        println!("{line}");
+    }
     match Logger::open(&cfg.log_dir(), cfg.log_max_bytes, cfg.log_keep, false) {
         Ok(log) => {
             log.info(&line);

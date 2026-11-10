@@ -1978,8 +1978,15 @@ fn dedup_preview_run_modes_and_apply() {
     };
     with("false", "false");
     let before = file_states(&dir);
-    // Preview: groups listed, nothing changed.
+    // Preview without -v: totals only.
     let out = env.exec(&["dedup"], None);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !text.contains("  keep  ") && text.contains("would_free="),
+        "{text}"
+    );
+    // Preview with -v: groups listed, nothing changed.
+    let out = env.exec(&["dedup", "-v"], None);
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "{out:?}");
     assert!(
@@ -2022,7 +2029,7 @@ fn dedup_preview_run_modes_and_apply() {
     );
     // dry-run-only: a preview even under --apply.
     with("\"dry-run-only\"", "false");
-    let out = env.exec(&["run", "--apply"], None);
+    let out = env.exec(&["run", "--apply", "-v"], None);
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "{out:?}");
     assert!(text.contains("run step dedup mode=dry-run-only"), "{text}");
@@ -2077,7 +2084,7 @@ fn dedup_preview_run_modes_and_apply() {
         "{log}"
     );
     // The clones share the reference's clone id now: nothing left to do.
-    let out = env.exec(&["dedup"], None);
+    let out = env.exec(&["dedup", "-v"], None);
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("dedup: groups=3 files=0 "), "{text}");
     assert!(
@@ -2257,7 +2264,7 @@ fn dedup_quarantine_after_three_run_days() {
             .any(|l| l.contains(&format!("{}:", b.display()))),
         "{new_lines:?}"
     );
-    let (_, out) = dedup(&["dedup"], "2026-10-06");
+    let (_, out) = dedup(&["dedup", "-v"], "2026-10-06");
     assert!(out.contains("/dq/b: skipped: quarantined"), "{out}");
     let s = dedup_kv(&env.log_text());
     assert_eq!(

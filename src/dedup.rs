@@ -622,11 +622,12 @@ pub fn track(plan: &mut Plan, st: &mut DedupState, s: &Streaks, reason: &str) ->
 
 /// The preview: every group with its reference and targets (skipped ones with the reason),
 /// the totals and the command that would do it.
-pub fn render(plan: &Plan, home: &Path, apply_cmd: &str) -> String {
+/// The groups are listed only when `verbose`; the totals always.
+pub fn render(plan: &Plan, home: &Path, apply_cmd: &str, verbose: bool) -> String {
     use std::fmt::Write as _;
     let mut s = String::new();
     let path = |m: &Member| abbreviate_home(&m.c.path, Some(home));
-    for g in &plan.groups {
+    for g in plan.groups.iter().filter(|_| verbose) {
         let _ = writeln!(
             s,
             "identical: {} files of {}",
