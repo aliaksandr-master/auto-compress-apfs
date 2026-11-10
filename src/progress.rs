@@ -127,13 +127,18 @@ impl Progress {
 
     /// One file of the compress phase is finished.
     pub fn advance(&mut self, bytes: u64) {
+        self.advance_by(1, bytes);
+    }
+
+    /// `files` files of `bytes` of the compress phase are finished.
+    pub fn advance_by(&mut self, files: u64, bytes: u64) {
         if let Phase::Compress {
             done_files,
             done_bytes,
             ..
         } = &mut self.phase
         {
-            *done_files += 1;
+            *done_files += files;
             *done_bytes += bytes;
         }
     }

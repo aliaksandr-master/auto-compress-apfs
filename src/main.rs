@@ -945,14 +945,7 @@ fn run_remove(
         None
     };
     // Without -v: a progress line on a terminal, the items stay in the log.
-    if !args.verbose && std::io::stderr().is_terminal() {
-        let width = std::env::var("COLUMNS")
-            .ok()
-            .and_then(|c| c.parse().ok())
-            .unwrap_or(PROGRESS_WIDTH);
-        let color = std::env::var_os("NO_COLOR").is_none();
-        log.enable_progress(Progress::new(width, color, Some(home)));
-    }
+    start_progress(log, home, args.verbose);
     let walked = walk::walk_entries(
         manifest_matcher.as_ref().unwrap_or(&matcher),
         &guard,
@@ -994,7 +987,10 @@ fn run_remove(
         for t in &targets {
             for (profile, why) in &t.skipped {
                 log.info(format_args!("{name}: skipped {}: {why}", profile.display()));
-                println!("SKIPPED {}: {why}", abbreviate_home(profile, Some(home)));
+                print_painted(&format!(
+                    "SKIPPED {}: {why}\n",
+                    abbreviate_home(profile, Some(home))
+                ));
             }
             matched.extend(t.entries.iter().cloned().filter_map(cargo_clean::matched));
         }
@@ -1032,16 +1028,13 @@ fn run_remove(
             .iter()
             .map(|p| format!(" --config {}", shell_quote(&p.display().to_string())))
             .collect();
-        print!(
-            "{}",
-            remove::render(
-                &items,
-                home,
-                action,
-                &format!("{NAME} {name} --apply{extra}"),
-                args.verbose
-            )
-        );
+        print_painted(&remove::render(
+            &items,
+            home,
+            action,
+            &format!("{NAME} {name} --apply{extra}"),
+            args.verbose,
+        ));
         remove::Outcome {
             blocked,
             ..Default::default()
@@ -1194,6 +1187,7 @@ fn run_tm_exclude(
         None
     };
     let rule = &cfg.tm_exclude;
+    start_progress(log, home, args.verbose);
     let guard = walk::Guard::new(home, &cfg.allow_volumes, log)?;
     let matcher = walk::Matcher::new(&rule.patterns, &rule.exclude, None)?;
     let walked = walk::walk_entries(
@@ -1220,6 +1214,7 @@ fn run_tm_exclude(
         sys::effective_uid(),
         log,
     );
+    log.finish_progress(None);
     let out = if args.apply {
         let out = tm_exclude::apply(&items, sys::effective_uid(), log);
         println!(
@@ -1233,10 +1228,11 @@ fn run_tm_exclude(
             .iter()
             .map(|p| format!(" --config {}", shell_quote(&p.display().to_string())))
             .collect();
-        print!(
-            "{}",
-            tm_exclude::render(&items, home, &format!("{NAME} tm-exclude --apply{extra}"))
-        );
+        print_painted(&tm_exclude::render(
+            &items,
+            home,
+            &format!("{NAME} tm-exclude --apply{extra}"),
+        ));
         tm_exclude::tally(&items)
     };
     record_total(StepTotal {
@@ -1368,6 +1364,7 @@ fn run_dedup(
             .collect()
     });
     let rule = &cfg.dedup;
+    start_progress(log, home, args.verbose);
     let guard = walk::Guard::new(home, &cfg.allow_volumes, log)?;
     let matcher = walk::Matcher::new(&rule.patterns, &rule.exclude, None)?;
     let walked = walk::walk(
@@ -1399,6 +1396,9 @@ fn run_dedup(
         quarantined: &quarantined,
     };
     let mut plan = dedup::plan(cands, found, &opts, log);
+    if !args.apply {
+        log.finish_progress(None);
+    }
     let streaks = dedup::Streaks {
         today,
         prev: st.previous_run_day(today),
@@ -1415,6 +1415,7 @@ fn run_dedup(
     let targets: usize = plan.groups.iter().map(|g| g.targets.len()).sum();
     let out = if args.apply {
         let out = dedup::apply(&plan, log);
+        log.finish_progress(None);
         for (p, ident) in &out.deduped_paths {
             if !st.record_deduped(p, DedupRow::new(*ident, now)) {
                 log.debug(format_args!(
@@ -1474,15 +1475,12 @@ fn run_dedup(
             .iter()
             .map(|p| format!(" --config {}", shell_quote(&p.display().to_string())))
             .collect();
-        print!(
-            "{}",
-            dedup::render(
-                &plan,
-                home,
-                &format!("{NAME} dedup --apply{extra}"),
-                args.verbose
-            )
-        );
+        print_painted(&dedup::render(
+            &plan,
+            home,
+            &format!("{NAME} dedup --apply{extra}"),
+            args.verbose,
+        ));
         dedup::Outcome::default()
     };
     let (count, freed) = if args.apply {
@@ -1568,7 +1566,7 @@ fn cmd_run(args: &CleanArgs, home: &Path) -> ExitCode {
                 false
             }
         };
-        println!("== {name} ==");
+        print_painted(&format!("== {name} ==\n"));
         let step = CleanArgs {
             config: args.config.clone(),
             apply,
@@ -1601,7 +1599,7 @@ fn cmd_run(args: &CleanArgs, home: &Path) -> ExitCode {
     let totals = STEP_TOTALS.lock().map(|v| v.clone()).unwrap_or_default();
     if !totals.is_empty() {
         let text = render_totals(&totals);
-        print!("{text}");
+        print_painted(&text);
         if let Ok(log) = Logger::open(&cfg.log_dir(), cfg.log_max_bytes, cfg.log_keep, false) {
             for line in text
                 .lines()
@@ -1697,6 +1695,81 @@ fn render_totals(totals: &[StepTotal]) -> String {
         let _ = writeln!(s, "; compress savings are not estimated");
     }
     s
+}
+
+/// Whether stdout gets colors: a terminal, and `NO_COLOR` not set.
+fn stdout_color() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none())
+}
+
+/// `line` with the color its kind gets on a terminal: step headers, totals, warnings, hints.
+fn painted(line: &str, color: bool) -> String {
+    const BOLD_CYAN: &str = "\x1b[1;36m";
+    const BOLD: &str = "\x1b[1m";
+    const GREEN: &str = "\x1b[1;32m";
+    const YELLOW: &str = "\x1b[33m";
+    const RED: &str = "\x1b[31m";
+    const DIM: &str = "\x1b[2m";
+    if !color || line.is_empty() {
+        return line.to_owned();
+    }
+    let style = if line.starts_with("== ") {
+        BOLD_CYAN
+    } else if line.starts_with("freed:") || line.starts_with("would free:") {
+        GREEN
+    } else if line.starts_with("ERROR") || line.contains(" failed") && !line.contains(" 0 failed") {
+        RED
+    } else if line.starts_with("SKIPPED") || line.starts_with("Warning:") {
+        YELLOW
+    } else if [
+        "Nothing changed",
+        "Add -v",
+        "Time Machine local",
+        "Exclusions are never",
+    ]
+    .iter()
+    .any(|p| line.starts_with(p))
+    {
+        DIM
+    } else if line.starts_with("would ")
+        || line.starts_with("dedup:")
+        || line.starts_with("top roots")
+        || line.starts_with("trash:")
+        || line.starts_with("purge:")
+        || line.starts_with("cargo-clean:")
+    {
+        BOLD
+    } else {
+        return line.to_owned();
+    };
+    format!("{style}{line}\x1b[0m")
+}
+
+/// Prints `text` on stdout, each line [`painted`].
+fn print_painted(text: &str) {
+    use std::io::Write;
+    let color = stdout_color();
+    let mut out = std::io::stdout().lock();
+    for line in text.split_inclusive('\n') {
+        let (body, nl) = match line.strip_suffix('\n') {
+            Some(b) => (b, "\n"),
+            None => (line, ""),
+        };
+        let _ = write!(out, "{}{nl}", painted(body, color));
+    }
+}
+
+/// A progress line on stderr, when it is a terminal and `-v` is not given.
+fn start_progress(log: &Logger, home: &Path, verbose: bool) {
+    if !verbose && std::io::stderr().is_terminal() {
+        let width = std::env::var("COLUMNS")
+            .ok()
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(PROGRESS_WIDTH);
+        let color = std::env::var_os("NO_COLOR").is_none();
+        log.enable_progress(Progress::new(width, color, Some(home)));
+    }
 }
 
 /// Logs that `run` executes the step `name` as a preview only (`run = "dry-run-only"`); with
@@ -2447,8 +2520,8 @@ fn print_preview(
     (inaccessible, refused): (u64, u64),
     log: Option<&Path>,
 ) {
-    use std::io::Write;
-    let mut out = std::io::stdout().lock();
+    use std::fmt::Write as _;
+    let mut out = String::new();
     let show = |p: &Path| abbreviate_home(p, Some(home));
     let width = std::io::stdout().is_terminal().then(|| {
         std::env::var("COLUMNS")
@@ -2503,6 +2576,7 @@ fn print_preview(
         "{}",
         preview_hint(todo.len(), total, inaccessible, &extra)
     );
+    print_painted(&out);
 }
 
 /// Notes before the preview totals: roots that could not be read (an access problem, ERROR
@@ -2590,6 +2664,17 @@ fn acquire_lock(state_dir: &Path) -> Result<Option<File>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn painted_lines() {
+        assert_eq!(painted("== dedup ==", false), "== dedup ==");
+        assert_eq!(painted("== dedup ==", true), "\x1b[1;36m== dedup ==\x1b[0m");
+        assert!(painted("would free: about 1 GiB", true).starts_with("\x1b[1;32m"));
+        assert!(painted("Nothing changed. Run x", true).starts_with("\x1b[2m"));
+        assert!(painted("SKIPPED /a: busy", true).starts_with("\x1b[33m"));
+        assert_eq!(painted("  12 MiB  ~/x", true), "  12 MiB  ~/x");
+        assert_eq!(painted("", true), "");
+    }
 
     #[test]
     fn totals_split_applied_and_preview() {

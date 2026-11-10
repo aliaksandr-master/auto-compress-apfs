@@ -123,6 +123,14 @@ impl Logger {
         });
     }
 
+    /// `files` files of `bytes` of the compress phase are finished.
+    pub fn advance_by(&self, files: u64, bytes: u64) {
+        self.with_progress(|p, err| {
+            p.advance_by(files, bytes);
+            p.draw(err, false);
+        });
+    }
+
     fn with_progress(&self, f: impl FnOnce(&mut Progress, &mut io::StderrLock<'static>)) {
         if !self.progress_on.load(Ordering::Relaxed) {
             return;

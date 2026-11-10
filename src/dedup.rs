@@ -471,7 +471,12 @@ pub fn plan(cands: Vec<Candidate>, walked: u64, opts: &PlanOptions, log: &Logger
         ..Plan::default()
     };
     let mut buf = vec![0u8; BUF];
+    log.start_compress(cands.len() as u64, cands.iter().map(Candidate::size).sum());
     for same_size in regroup(cands, |c| (c.key.dev, c.size())) {
+        log.advance_by(
+            same_size.len() as u64,
+            same_size.iter().map(Candidate::size).sum(),
+        );
         let members: Vec<Member> = same_size
             .into_iter()
             .filter_map(|c| match scan(c) {
