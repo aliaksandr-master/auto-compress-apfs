@@ -146,7 +146,13 @@ impl Logger {
             }
             FileEvent::Error(_) | FileEvent::Skip(_) => format!("{}: {msg}", path.display()),
         };
-        self.write(level, &text, |p, err| p.event(err, path, ev, &msg));
+        // Without -v the terminal shows only the progress line and errors; skips and per-file
+        // results stay in the log.
+        self.write(level, &text, |p, err| {
+            if matches!(ev, FileEvent::Error(_)) {
+                p.event(err, path, ev, &msg);
+            }
+        });
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
