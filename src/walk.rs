@@ -655,8 +655,16 @@ impl Walker<'_> {
         entry
             .metadata()
             .inspect_err(|e| {
-                self.log
-                    .warn(format_args!("cannot stat {}: {e}", path.display()))
+                // Gone since the directory was read (a cache churning): not a problem to show.
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    self.log.info(format_args!(
+                        "{} vanished during the scan: {e}",
+                        path.display()
+                    ));
+                } else {
+                    self.log
+                        .warn(format_args!("cannot stat {}: {e}", path.display()));
+                }
             })
             .ok()
     }
