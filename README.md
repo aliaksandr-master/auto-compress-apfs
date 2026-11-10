@@ -272,7 +272,9 @@ auto-compress-apfs -h|--help | -V|--version
     found`, then percent, bar, file counts, bytes and an estimate, by bytes). Width from
     `COLUMNS` (else 100), colours unless `NO_COLOR` is set. When stderr is not a terminal
     nothing extra is written.
-  - `-v` logs DEBUG lines and mirrors the log to stderr.
+  - `-v` logs DEBUG lines and mirrors the log to stderr; the preview then lists every file it
+    would compress and every skip. Without `-v` the preview prints only the totals, the top
+    roots by size and a hint to add `-v`. `run -v` passes `-v` to compress.
 - `stat` reads only `state.tsv` and `quarantine.txt` (no walk, no lock, no log, no config
   parse): totals (files, original, on disk, saved, ratio, quarantined, last run day), the files
   sorted by original size (top 30, `--top N`, `--all`), path left-truncated to `COLUMNS` (else

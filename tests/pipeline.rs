@@ -247,8 +247,16 @@ fn pipeline() {
     let hard_ino = lstat(&lib.join("hard1.txt")).ino();
     let stale = env.venv.join(".acz-staging-1-2");
 
+    // 0. Preview without -v: totals and top roots, no file list.
+    let (_, plain) = env.run_day(&["compress"], None);
+    assert!(
+        plain.contains("would compress: 5 files")
+            && !plain.contains("a.txt")
+            && plain.contains("Add -v"),
+        "{plain}"
+    );
     // 1. Preview (old `--dry-run` spelling): classifies, changes nothing.
-    let (s, stdout) = env.run_day(&["--dry-run"], None);
+    let (s, stdout) = env.run_day(&["--dry-run", "-v"], None);
     assert_eq!(s["dry_run"], "true");
     // hard1/hard2 are one inode: deduplicated by (dev, ino).
     assert_eq!(s["found"], "7", "{s:?}");
@@ -1070,6 +1078,7 @@ fn dir_scope_and_relative_search() {
             "tree/a",
             "--search",
             "**/.venv",
+            "-v",
         ],
         None,
     );

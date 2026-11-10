@@ -272,7 +272,11 @@ fn parse_compress(it: impl Iterator<Item = String>) -> Result<Cli, String> {
                 dry_run = true;
                 a.raw.truncate(start);
             }
-            "-v" | "--verbose" => a.verbose = true,
+            "-v" | "--verbose" => {
+                // Not repeated in the `--apply` hint: it only changes what is printed.
+                a.verbose = true;
+                a.raw.truncate(start);
+            }
             "--progress" => a.progress = Some(true),
             "--no-progress" => a.progress = Some(false),
             "--ignore-global-search" => a.ignore_global = true,
@@ -1563,6 +1567,7 @@ fn cmd_run(args: &CleanArgs, home: &Path) -> ExitCode {
                 &CompressArgs {
                     config: step.config,
                     apply,
+                    verbose: step.verbose,
                     ..CompressArgs::default()
                 },
                 home,
@@ -2438,11 +2443,14 @@ fn print_preview(
         .map(|c| (show(&c.path), human(c.size())))
         .collect();
     let total: u64 = todo.iter().map(|c| c.size()).sum();
-    for line in preview_lines(&rows, width) {
-        let _ = writeln!(out, "{line}");
-    }
-    for s in skips {
-        let _ = writeln!(out, "{}   SKIP({}): {}", show(&s.path), s.kind, s.reason);
+    // Without -v: the totals and top roots only.
+    if args.verbose {
+        for line in preview_lines(&rows, width) {
+            let _ = writeln!(out, "{line}");
+        }
+        for s in skips {
+            let _ = writeln!(out, "{}   SKIP({}): {}", show(&s.path), s.kind, s.reason);
+        }
     }
     let mut roots: HashMap<&Arc<Path>, u64> = HashMap::new();
     for c in todo {
@@ -2469,6 +2477,9 @@ fn print_preview(
         .iter()
         .map(|a| format!(" {}", shell_quote(a)))
         .collect();
+    if !args.verbose && (!todo.is_empty() || !skips.is_empty()) {
+        let _ = writeln!(out, "Add -v to list every file (and why one is skipped).");
+    }
     let _ = write!(
         out,
         "{}",
