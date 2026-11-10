@@ -999,6 +999,9 @@ fn run_remove(
     } else {
         (walked.matched, Vec::new())
     };
+    if action == remove::Action::CargoClean && cfg.cargo_clean.exclude_time_machine {
+        exclude_targets_from_tm(&targets, &matcher, &guard, &keep, args.apply, log);
+    }
     log.start_compress(matched.len() as u64, 0);
     let mut items = remove::plan(matched, &matcher, &guard, &keep, action, &|| log.advance(0));
     for i in &mut items {
@@ -1758,6 +1761,46 @@ fn print_painted(text: &str) {
         };
         let _ = write!(out, "{}{nl}", painted(body, color));
     }
+}
+
+/// `[cargo_clean] exclude_time_machine`: every target and build directory found is excluded
+/// from Time Machine (with `apply`; a preview counts them), as `tm-exclude` does it: the
+/// sticky xattr is created, never replaced or removed.
+fn exclude_targets_from_tm(
+    targets: &[cargo_clean::Target],
+    matcher: &walk::Matcher,
+    guard: &walk::Guard,
+    keep: &remove::Keep<'_>,
+    apply: bool,
+    log: &Logger,
+) {
+    let roots: Vec<walk::Matched> = targets
+        .iter()
+        .filter_map(|t| cargo_clean::matched(t.root.clone()))
+        .collect();
+    let euid = sys::effective_uid();
+    let items = tm_exclude::plan(roots, matcher, guard, keep, euid, log);
+    let o = if apply {
+        tm_exclude::apply(&items, euid, log)
+    } else {
+        tm_exclude::tally(&items)
+    };
+    let pending = items.len() as u64 - o.already - o.blocked - o.errors - o.excluded;
+    let done = if apply { o.excluded } else { pending };
+    let verb = if apply { "excluded" } else { "would exclude" };
+    print_painted(&format!(
+        "Time Machine: {verb} {done} target dirs ({} already, {} blocked, {} errors)\n",
+        o.already, o.blocked, o.errors
+    ));
+    log.info(format_args!(
+        "cargo-clean tm_exclude targets={} already={} {verb}={done} blocked={} errors={} \
+         dry_run={}",
+        items.len(),
+        o.already,
+        o.blocked,
+        o.errors,
+        !apply
+    ));
 }
 
 /// A progress line on stderr, when it is a terminal and `-v` is not given.

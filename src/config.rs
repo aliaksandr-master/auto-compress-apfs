@@ -337,6 +337,9 @@ pub struct CargoCleanRule {
     /// whatever their age; `false`: they go once not used for `max_age_secs`.
     pub keep_final_debug: bool,
     pub keep_final_release: bool,
+    /// Every target and build directory found is excluded from Time Machine (the sticky
+    /// xattr `tm-exclude` sets), whatever is deleted in it.
+    pub exclude_time_machine: bool,
     pub run: RunMode,
 }
 
@@ -348,6 +351,7 @@ impl Default for CargoCleanRule {
             max_age_secs: 30 * 86_400,
             keep_final_debug: true,
             keep_final_release: true,
+            exclude_time_machine: false,
             run: RunMode::Off,
         }
     }

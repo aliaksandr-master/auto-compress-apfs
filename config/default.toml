@@ -138,6 +138,8 @@ exclude = []
 max_age_secs = 2592000
 keep_final_debug = true
 keep_final_release = true
+# true: every target/build dir found is also excluded from Time Machine (as tm-exclude does).
+exclude_time_machine = false
 run = false
 
 # What `run` does with compress (the top-level patterns above); `run` as for [trash].

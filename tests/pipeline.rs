@@ -755,7 +755,8 @@ fn cargo_clean_keeps_fresh_and_locked_units() {
     fs::write(
         &env.config,
         format!(
-            "{body}\n[cargo_clean]\nroots = [\"{}/src\"]\nmax_age_secs = 2592000\n",
+            "{body}\n[cargo_clean]\nroots = [\"{}/src\"]\nmax_age_secs = 2592000\n\
+             exclude_time_machine = true\n",
             env.home.display()
         ),
     )
@@ -775,9 +776,26 @@ fn cargo_clean_keeps_fresh_and_locked_units() {
     );
     assert!(paths[0].join("deps/libold-0123456789abcdef.rlib").exists());
     assert!(!journal.exists());
+    let excluded = |p: &Path| {
+        Command::new("/usr/bin/xattr")
+            .args(["-p", "com.apple.metadata:com_apple_backup_excludeItem"])
+            .arg(p)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    };
+    let target = |p: &Path| p.parent().unwrap().to_path_buf();
+    assert!(
+        text.contains("Time Machine: would exclude 2 target dirs"),
+        "{text}"
+    );
+    assert!(!excluded(&target(&paths[0])));
     // --apply: only the old unit of the unlocked target goes.
     let out = env.exec(&["cargo-clean", "--apply"], None);
     assert!(out.status.success(), "{out:?}");
+    // Both target dirs are excluded from Time Machine, the busy one too.
+    assert!(excluded(&target(&paths[0])) && excluded(&target(&paths[1])));
     let a = &paths[0];
     assert!(!a.join(".fingerprint/old-0123456789abcdef").exists());
     assert!(!a.join("deps/libold-0123456789abcdef.rlib").exists());

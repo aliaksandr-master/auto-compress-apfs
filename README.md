@@ -518,7 +518,9 @@ resolution), so `exclude = ["/private/var/**"]` does not exclude a walk started 
   `false` or `"dry-run-only"` is refused.
 - `[cargo_clean]`: `roots` (absolute directories or globs, empty by default), `exclude` (empty
   by default), `max_age_secs` (default 2592000, at least 1), `keep_final_debug` and `keep_final_release`
-  (`true` by default) and `run` (`false` by default), as above.
+  (`true` by default), `exclude_time_machine` (`false` by default: with `true` every target and
+  build directory found is excluded from Time Machine as `tm-exclude` does it, under `--apply`;
+  a preview counts them) and `run` (`false` by default), as above.
 - `[compress]`: only `run` (`true` by default), for the compress step of `run`.
 - `[dedup]`: `patterns` (empty by default), `exclude` (default `[".git", "target",
   "node_modules"]`), `min_size` (bytes, default 1048576, at least 1) and `run` (`false` by
