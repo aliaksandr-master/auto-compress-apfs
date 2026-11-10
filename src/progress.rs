@@ -231,8 +231,10 @@ pub fn progress_line(
     width: usize,
 ) -> String {
     let (done_bytes, total_bytes) = bytes;
-    let estimate = if elapsed >= ETA_AFTER && done_bytes > 0 && total_bytes >= done_bytes {
-        let rest = elapsed.as_secs_f64() * (total_bytes - done_bytes) as f64 / done_bytes as f64;
+    // Without a byte total (a plan that only counts items) the estimate goes by items.
+    let (done_units, total_units) = if total_bytes > 0 { bytes } else { files };
+    let estimate = if elapsed >= ETA_AFTER && done_units > 0 && total_units >= done_units {
+        let rest = elapsed.as_secs_f64() * (total_units - done_units) as f64 / done_units as f64;
         duration_text(rest.round() as u64)
     } else {
         "--".to_owned()
@@ -253,12 +255,19 @@ pub fn progress_line(
         BYTES_COLUMN.max(total_text.len())
     };
     let files_col = files.1.to_string().len();
-    let tail = format!(
-        "({:>files_col$}/{}) {:>bytes_col$}/{total_text}  estimate: {estimate:<ESTIMATE_COLUMN$}",
-        files.0,
-        files.1,
-        human(done_bytes),
-    );
+    let tail = if total_bytes == 0 && done_bytes == 0 && files.1 > 0 {
+        format!(
+            "({:>files_col$}/{})  estimate: {estimate:<ESTIMATE_COLUMN$}",
+            files.0, files.1,
+        )
+    } else {
+        format!(
+            "({:>files_col$}/{}) {:>bytes_col$}/{total_text}  estimate: {estimate:<ESTIMATE_COLUMN$}",
+            files.0,
+            files.1,
+            human(done_bytes),
+        )
+    };
     // "<pct> [" + bar + "] " + tail, one char spare so the line never wraps; all ASCII but the bar.
     let fixed = pct.len() + 2 + 2 + tail.len() + 1;
     let bar_len = width.saturating_sub(fixed).max(10);
@@ -307,6 +316,13 @@ pub fn event_line(path: &str, ev: FileEvent<'_>, msg: &str, width: usize, color:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_count_only_line_has_no_bytes_and_estimates_by_items() {
+        let l = progress_line((25, 100), (0, 0), Duration::from_secs(10), 80);
+        assert!(l.trim_end().ends_with("( 25/100)  estimate: 30s"), "{l}");
+        assert!(l.starts_with(" 25%"), "{l}");
+    }
 
     #[test]
     fn human_sizes() {
