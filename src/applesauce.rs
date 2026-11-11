@@ -272,8 +272,27 @@ fn write_copy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::process::Command;
     use std::sync::Arc;
+
+    /// File sizes far below `u64::MAX`: `round_to_block_size` overflows within 4 KiB of it.
+    const SIZE: std::ops::RangeInclusive<u64> = 0..=1 << 62;
+
+    proptest! {
+        #[test]
+        fn saves_space_never_when_stored_is_not_smaller(size in SIZE, extra in SIZE) {
+            prop_assert!(!saves_space(size + extra, size));
+        }
+
+        #[test]
+        fn saves_space_is_monotone_in_stored(s in SIZE, s2 in SIZE, n in SIZE) {
+            let (lo, hi) = (s.min(s2), s.max(s2));
+            if saves_space(hi, n) {
+                prop_assert!(saves_space(lo, n));
+            }
+        }
+    }
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("acz-as-{tag}-{}", std::process::id()));

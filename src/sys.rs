@@ -511,13 +511,18 @@ pub(crate) fn flist_xattr(f: &File) -> io::Result<Vec<CString>> {
             return Err(e);
         }
         buf.truncate(got.cast_unsigned());
-        return Ok(buf
-            .split(|&b| b == 0)
-            .filter(|n| !n.is_empty())
-            // Never drops a name: a piece split at NUL holds no interior NUL.
-            .filter_map(|n| CString::new(n).ok())
-            .collect());
+        return Ok(split_xattr_names(&buf));
     }
+}
+
+/// The names of a `flistxattr(2)` list: NUL-terminated names back to back; empty pieces are
+/// skipped.
+fn split_xattr_names(buf: &[u8]) -> Vec<CString> {
+    buf.split(|&b| b == 0)
+        .filter(|n| !n.is_empty())
+        // Never drops a name: a piece split at NUL holds no interior NUL.
+        .filter_map(|n| CString::new(n).ok())
+        .collect()
 }
 
 /// Sets the `st_flags` of `f` to `flags` (`fchflags(2)`).
@@ -600,6 +605,12 @@ pub(crate) fn fclone_info(f: &File) -> io::Result<CloneInfo> {
             libc::FSOPT_PACK_INVAL_ATTRS | libc::FSOPT_ATTR_CMN_EXTENDED,
         )
     })?;
+    Ok(parse_clone_info(&buf))
+}
+
+/// Decodes the [`fclone_info`] reply in `buf` (its layout there). Panics when `buf` is
+/// shorter than 48 bytes.
+fn parse_clone_info(buf: &[u8]) -> CloneInfo {
     // Constant offsets inside the fixed buffer; the slice index panics on a layout bug.
     let u32_at = |o: usize| {
         let mut b = [0u8; 4];
@@ -613,11 +624,11 @@ pub(crate) fn fclone_info(f: &File) -> io::Result<CloneInfo> {
     };
     let (common, fork) = (u32_at(4), u32_at(20));
     let valid = |set: u32, bit: u32| set & bit != 0;
-    Ok(CloneInfo {
+    CloneInfo {
         acl: valid(common, libc::ATTR_CMN_EXTENDED_SECURITY) && u32_at(28) > 0,
         private_size: valid(fork, libc::ATTR_CMNEXT_PRIVATESIZE).then(|| u64_at(32)),
         clone_id: valid(fork, libc::ATTR_CMNEXT_CLONEID).then(|| u64_at(40)),
-    })
+    }
 }
 
 /// The resource fork of a file as a seekable byte stream: every write is an
@@ -784,7 +795,102 @@ impl Seek for RforkReader<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::os::macos::fs::MetadataExt as _;
+
+    fn u32_at(buf: &[u8], o: usize) -> u32 {
+        u32::from_ne_bytes(buf[o..o + 4].try_into().unwrap())
+    }
+
+    fn u64_at(buf: &[u8], o: usize) -> u64 {
+        u64::from_ne_bytes(buf[o..o + 8].try_into().unwrap())
+    }
+
+    fn clone_fixture(common: u32, fork: u32, acl_len: u32) -> Vec<u8> {
+        let mut b = vec![0u8; 48];
+        b[4..8].copy_from_slice(&common.to_ne_bytes());
+        b[20..24].copy_from_slice(&fork.to_ne_bytes());
+        b[28..32].copy_from_slice(&acl_len.to_ne_bytes());
+        b[32..40].copy_from_slice(&0x1122_3344_5566_7788u64.to_ne_bytes());
+        b[40..48].copy_from_slice(&0x0102_0304_0506_0708u64.to_ne_bytes());
+        b
+    }
+
+    #[test]
+    fn parse_clone_info_of_known_bytes() {
+        let all = libc::ATTR_CMNEXT_PRIVATESIZE | libc::ATTR_CMNEXT_CLONEID;
+        let full = clone_fixture(libc::ATTR_CMN_EXTENDED_SECURITY, all, 12);
+        assert_eq!(
+            parse_clone_info(&full),
+            CloneInfo {
+                clone_id: Some(0x0102_0304_0506_0708),
+                private_size: Some(0x1122_3344_5566_7788),
+                acl: true,
+            }
+        );
+        let none = clone_fixture(libc::ATTR_CMN_EXTENDED_SECURITY, 0, 0);
+        assert_eq!(
+            parse_clone_info(&none),
+            CloneInfo {
+                clone_id: None,
+                private_size: None,
+                acl: false,
+            }
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "range end index 48")]
+    fn parse_clone_info_panics_on_a_short_buffer() {
+        // The clone id bit is set, so the read at 40..48 runs past the 47 bytes.
+        let mut b = clone_fixture(0, libc::ATTR_CMNEXT_CLONEID, 0);
+        b.truncate(47);
+        parse_clone_info(&b);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        #[test]
+        fn split_xattr_names_returns_the_joined_names(
+            names in prop::collection::vec(prop::collection::vec(1u8..=255, 1..16), 0..8)
+        ) {
+            let buf: Vec<u8> = names.iter().flat_map(|n| n.iter().copied().chain([0])).collect();
+            let got: Vec<Vec<u8>> =
+                split_xattr_names(&buf).into_iter().map(CString::into_bytes).collect();
+            prop_assert_eq!(got, names);
+        }
+
+        #[test]
+        fn split_xattr_names_of_any_bytes_gives_nonempty_nul_free_names(
+            buf in prop::collection::vec(any::<u8>(), 0..64)
+        ) {
+            let names = split_xattr_names(&buf);
+            prop_assert!(names.iter().all(|n| !n.as_bytes().is_empty()));
+            let total: usize = names.iter().map(|n| n.as_bytes().len()).sum();
+            prop_assert_eq!(total, buf.iter().filter(|&&b| b != 0).count());
+        }
+
+        #[test]
+        fn parse_clone_info_follows_the_returned_bits(
+            buf in prop::collection::vec(any::<u8>(), 4096..=4096)
+        ) {
+            let info = parse_clone_info(&buf);
+            let (common, fork) = (u32_at(&buf, 4), u32_at(&buf, 20));
+            prop_assert_eq!(
+                info.clone_id,
+                (fork & libc::ATTR_CMNEXT_CLONEID != 0).then(|| u64_at(&buf, 40))
+            );
+            prop_assert_eq!(
+                info.private_size,
+                (fork & libc::ATTR_CMNEXT_PRIVATESIZE != 0).then(|| u64_at(&buf, 32))
+            );
+            prop_assert_eq!(
+                info.acl,
+                common & libc::ATTR_CMN_EXTENDED_SECURITY != 0 && u32_at(&buf, 28) > 0
+            );
+        }
+    }
 
     #[test]
     fn local_time_is_plausible() {

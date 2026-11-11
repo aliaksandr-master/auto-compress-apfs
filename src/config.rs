@@ -667,9 +667,107 @@ fn write_default(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn home() -> PathBuf {
         PathBuf::from("/Users/u")
+    }
+
+    /// Bounds near 0 and near [`MAX_SIZE`], so overlaps, gaps and ditto overruns all occur.
+    fn bound() -> impl Strategy<Value = u64> {
+        prop::sample::select(vec![
+            0,
+            1,
+            2,
+            3,
+            10,
+            MAX_SIZE - 1,
+            MAX_SIZE,
+            MAX_SIZE + 1,
+            MAX_SIZE + 2,
+        ])
+    }
+
+    fn size_range() -> impl Strategy<Value = SizeRange> {
+        (any::<bool>(), bound(), prop::option::of(bound())).prop_map(
+            |(ditto, min_size, max_size)| SizeRange {
+                backend: if ditto {
+                    Backend::Ditto
+                } else {
+                    Backend::Applesauce
+                },
+                min_size,
+                max_size,
+            },
+        )
+    }
+
+    proptest! {
+        #[test]
+        fn checked_routing_is_sorted_disjoint_and_ditto_bounded(
+            ranges in prop::collection::vec(size_range(), 0..4)
+        ) {
+            let Ok(r) = check_routing(&ranges) else {
+                let mut sorted = ranges.clone();
+                sorted.sort_by_key(|x| x.min_size);
+                let broken = sorted.is_empty()
+                    || sorted.iter().any(|x| {
+                        x.max_size.is_some_and(|m| x.min_size > m)
+                            || (x.backend == Backend::Ditto && x.max_size.is_none_or(|m| m > MAX_SIZE))
+                    })
+                    || sorted.windows(2).any(|w| w[0].max_size.is_none_or(|m| m >= w[1].min_size));
+                prop_assert!(broken, "{:?}", ranges);
+                return Ok(());
+            };
+            {
+                prop_assert_eq!(r.len(), ranges.len());
+                for w in r.windows(2) {
+                    prop_assert!(w[0].min_size <= w[1].min_size);
+                    prop_assert!(w[0].max_size.is_some_and(|m| m < w[1].min_size));
+                }
+                for x in &r {
+                    prop_assert!(x.max_size.is_none_or(|m| x.min_size <= m));
+                    if x.backend == Backend::Ditto {
+                        prop_assert!(x.max_size.is_some_and(|m| m <= MAX_SIZE));
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn backend_for_agrees_with_a_linear_scan(
+            ranges in prop::collection::vec(size_range(), 1..4),
+            size in prop_oneof![bound(), any::<u64>()],
+        ) {
+            if let Ok(r) = check_routing(&ranges) {
+                let hits: Vec<Backend> = r
+                    .iter()
+                    .filter(|x| size >= x.min_size && x.max_size.is_none_or(|m| size <= m))
+                    .map(|x| x.backend)
+                    .collect();
+                prop_assert!(hits.len() <= 1);
+                prop_assert_eq!(backend_for(&r, size), hits.first().copied());
+            }
+        }
+
+        #[test]
+        fn expand_tilde_leaves_non_tilde_strings(s in "[^~].*|") {
+            prop_assert_eq!(expand_tilde(&s, &home()), s);
+        }
+
+        #[test]
+        fn expand_tilde_puts_the_rest_under_home(rest in "([a-zA-Z0-9_.* -][a-zA-Z0-9_.*/ -]{0,23})?") {
+            let got = expand_tilde(&format!("~/{rest}"), &home());
+            prop_assert!(got.starts_with("/Users/u/"), "{}", got);
+            prop_assert!(got.ends_with(&rest), "{}", got);
+            prop_assert_eq!(got.len(), "/Users/u/".len() + rest.len());
+        }
+    }
+
+    #[test]
+    fn tilde_double_slash_drops_home() {
+        // Pinned on purpose: `Path::join` of an absolute rest replaces `home`.
+        assert_eq!(expand_tilde("~//etc", &home()), "/etc");
     }
 
     #[test]

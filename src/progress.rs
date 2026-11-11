@@ -345,6 +345,33 @@ pub(crate) fn event_line(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn human_is_exact_bytes_or_one_decimal_in_range(
+            bytes in prop_oneof![
+                // Log-uniform: every unit equally likely.
+                (0u32..64, any::<u64>()).prop_map(|(bits, r)| r >> bits),
+                prop::sample::select(vec![
+                    0, 1023, 1024, 1025, (1 << 20) - 1, 1 << 20, (1 << 30) - 1, 1 << 30,
+                    1 << 40, u64::MAX,
+                ]),
+            ]
+        ) {
+            let h = human(bytes);
+            if bytes < 1024 {
+                prop_assert_eq!(h, format!("{bytes} B"));
+            } else {
+                let (num, unit) = h.split_once(' ').unwrap();
+                prop_assert!(["KiB", "MiB", "GiB"].contains(&unit), "{}", h);
+                prop_assert_eq!(num.split_once('.').map(|(_, d)| d.len()), Some(1), "{}", h);
+                let v: f64 = num.parse().unwrap();
+                prop_assert!(v >= 1.0, "{}", h);
+                prop_assert!(unit == "GiB" || v <= 1024.0, "{}", h);
+            }
+        }
+    }
 
     #[test]
     fn a_count_only_line_has_no_bytes_and_estimates_by_items() {
