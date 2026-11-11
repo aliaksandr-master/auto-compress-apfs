@@ -180,3 +180,13 @@ runs (no `--config`) move run days, prune rows or touch streaks, and a streak is
 the row was last found rewritten today or on the previous run day (`state::streak_current`).
 **Action**: to see why a file is or is not quarantined, compare its `dedup.tsv` identity with
 `stat -f '%d %i %c'` of the file; a narrowed run never explains a streak change.
+
+## `cargo-clean` preview holds every profile's `.cargo-lock`
+
+**Symptom**: `run --apply` prints dozens of `SKIPPED ...: a build holds .cargo-lock` lines although
+no build is running.
+**Cause**: `cargo-clean` takes the `.cargo-lock` of every profile even in a preview and keeps it for
+the whole pass (about 2 minutes over hundreds of targets). A second run started meanwhile (a preview
+in another terminal, an agent verifying an install) makes the first one skip those profiles.
+**Action**: run one `cargo-clean`/`run` at a time; verify an install with `--version` or `cmp` of the
+binaries, not with a real-data preview.
