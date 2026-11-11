@@ -955,7 +955,17 @@ mod tests {
         held.lock().unwrap();
         assert!(lock_profile(&p).unwrap_err().contains(".cargo-build-lock"));
         drop(held);
-        assert_eq!(lock_profile(&p).unwrap().len(), 2);
+        // Probably a child forked by a concurrent test: it shares the open file (and so the flock) until
+        // its exec closes it, so the release may be seen a moment late.
+        let mut got = lock_profile(&p);
+        for _ in 0..100 {
+            if got.is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            got = lock_profile(&p);
+        }
+        assert_eq!(got.unwrap().len(), 2);
         fs::remove_file(p.join(".cargo-lock")).unwrap();
         fs::remove_file(p.join(".cargo-build-lock")).unwrap();
         assert_eq!(lock_profile(&p).unwrap_err(), "no Cargo lock file");

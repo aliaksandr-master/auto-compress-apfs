@@ -190,3 +190,13 @@ the whole pass (about 2 minutes over hundreds of targets). A second run started 
 in another terminal, an agent verifying an install) makes the first one skip those profiles.
 **Action**: run one `cargo-clean`/`run` at a time; verify an install with `--version` or `cmp` of the
 binaries, not with a real-data preview.
+
+## A dropped flock can stay held for a moment in tests
+
+**Symptom**: `cargo_clean::tests::every_lock_file_counts` failed once in a full `cargo test`: the
+profile lock was still busy right after the test dropped its own lock file handle.
+**Cause** (hypothesis, not reproduced): flock belongs to the open file, and a child forked by a
+concurrent test shares it until its exec closes the descriptor.
+**Action**: the test retries `lock_profile` for up to 2 s after the drop. Production code is not
+affected: it only try-locks and reports a busy profile.
+
