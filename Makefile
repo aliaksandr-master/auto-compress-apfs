@@ -13,11 +13,11 @@ INSTALLED  := $(CURDIR)/release/installed/$(BIN)
 build:
 	cargo build
 
-# Optimised build (lto = "fat", see Cargo.toml); exactly one artefact, release/$(BIN).
+# Optimised build ([profile.dist], which inherits [profile.release]: lto = "fat", see Cargo.toml); exactly one artefact, release/$(BIN).
 release:
-	cargo build --release --locked
+	cargo build --profile dist --locked
 	mkdir -p release
-	install -m 0755 target/release/$(BIN) release/
+	install -m 0755 target/dist/$(BIN) release/
 
 # Installs the last `make release` build: a copy under release/installed/ plus the symlink.
 link:
@@ -41,4 +41,6 @@ test:
 
 lint:
 	cargo fmt --check
-	cargo clippy --all-targets -- -D warnings
+	cargo clippy --locked --all-targets -- -D warnings
+	RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --document-private-items
+	cargo deny --locked check

@@ -1,0 +1,39 @@
+[graph]
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
+all-features = true
+
+[advisories]
+yanked = "deny"
+unmaintained = "all"
+unsound = "all"
+ignore = []
+
+[licenses]
+# Exactly what the dependency graph has; GPL-3.0-or-later is this crate and applesauce-core.
+allow = ["MIT", "Apache-2.0", "Unicode-3.0", "GPL-3.0-or-later"]
+confidence-threshold = 0.8
+unused-allowed-license = "deny"
+exceptions = []
+
+[licenses.private]
+ignore = true
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+allow-wildcard-paths = true
+highlight = "all"
+deny = []
+skip = [
+    # serde_derive moved to syn 3, tracing-attributes (via applesauce-core) still uses syn 2;
+    # build-time only, gone once tracing-attributes moves to syn 3.
+    { crate = "syn@2.0.119", reason = "tracing-attributes of applesauce-core still on syn 2" },
+]
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+required-git-spec = "rev"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

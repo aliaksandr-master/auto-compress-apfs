@@ -127,6 +127,16 @@ invalid_html_tags = "warn"
 bare_urls = "warn"
 missing_crate_level_docs = "warn"
 
+[profile.dev]
+# Backtraces keep file:line, smaller link input.
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+# Dependencies optimised once and cached: blake3 and lzfse dominate test time unoptimised.
+opt-level = 1
+debug = false
+
+# `cargo install` builds this profile, so it stays the shipped one.
 [profile.release]
 lto = "fat"
 codegen-units = 1
@@ -135,3 +145,7 @@ panic = "abort"
 # Not stripped: an endpoint security agent (static scan) quarantined the stripped release binary
 # right after the build, while the same build with its symbol table kept was left alone.
 strip = false
+
+# What `make release` builds: the release profile under its own name (target/dist).
+[profile.dist]
+inherits = "release"

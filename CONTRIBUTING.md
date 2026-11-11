@@ -7,10 +7,10 @@ walk, compress, verify and swap paths get extra scrutiny; please keep them small
 
 ```sh
 cargo build
-make lint test        # cargo fmt --check, cargo clippy --all-targets -- -D warnings, cargo test
+make lint test        # cargo fmt --check, cargo clippy -D warnings, cargo doc -D warnings, cargo deny check, cargo test
 ```
 
-`make lint test` must be green before a pull request.
+`make lint test` must be green before a pull request. `make lint` needs `cargo install --locked cargo-deny` and network access for the advisory database; the toolchain is pinned in `rust-toolchain.toml`.
 
 - Tests build their trees under `std::env::temp_dir()` (must be APFS) and run the binary with a
   temporary `HOME`, so they never touch your real config, log, cache, state or lock.
