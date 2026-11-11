@@ -200,3 +200,11 @@ concurrent test shares it until its exec closes the descriptor.
 **Action**: the test retries `lock_profile` for up to 2 s after the drop. Production code is not
 affected: it only try-locks and reports a busy profile.
 
+## No fuzz targets and no benchmarks
+
+**Symptom**: the Rust audit scores fuzz 0 and has no `benches/`.
+**Cause**: cargo-fuzz and criterion reach the code only through a library target, and this crate is a
+binary whose modules are `pub(crate)`.
+**Action**: a deliberate exception (owner, 2026-11-11). The pure decoders and helpers are covered by
+proptest properties instead (`src/sys.rs`, `src/config.rs`, `src/applesauce.rs`, `src/progress.rs`).
+Revisit if a library target appears for another reason.
