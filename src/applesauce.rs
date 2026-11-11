@@ -11,7 +11,7 @@ use crate::sys::{self, O_NOFOLLOW, UF_COMPRESSED};
 use crate::walk::{Candidate, FileKey};
 use applesauce_core::compressor::{Compressor, Kind};
 use applesauce_core::writer::Writer;
-use applesauce_core::{BLOCK_SIZE, decmpfs, num_blocks, round_to_block_size};
+use applesauce_core::{BLOCK_SIZE, decmpfs, num_blocks};
 use std::ffi::CStr;
 use std::fs::{self, DirBuilder, File, FileTimes, Permissions};
 use std::io::{self, BufWriter};
@@ -84,8 +84,10 @@ impl Default for Buffers {
 
 /// True when compression saves at least one allocation unit: `stored` (resource fork length,
 /// or the inline decmpfs xattr bytes) rounded up to 4 KiB is below `size` rounded up.
+/// Compares allocation unit counts, which equals comparing the rounded sizes and cannot
+/// overflow near `u64::MAX` the way `round_to_block_size` does.
 pub(crate) fn saves_space(stored: u64, size: u64) -> bool {
-    round_to_block_size(stored, ALLOC) < round_to_block_size(size, ALLOC)
+    stored.div_ceil(ALLOC) < size.div_ceil(ALLOC)
 }
 
 /// Bytes the compressed form takes: the decmpfs xattr when the only block fits inline (the
@@ -276,13 +278,26 @@ mod tests {
     use std::process::Command;
     use std::sync::Arc;
 
-    /// File sizes far below `u64::MAX`: `round_to_block_size` overflows within 4 KiB of it.
+    /// Bounded for the oracle: `round_to_block_size` overflows within 4 KiB of `u64::MAX`.
     const SIZE: std::ops::RangeInclusive<u64> = 0..=1 << 62;
 
     proptest! {
         #[test]
         fn saves_space_never_when_stored_is_not_smaller(size in SIZE, extra in SIZE) {
             prop_assert!(!saves_space(size + extra, size));
+        }
+
+        #[test]
+        fn saves_space_matches_rounded_sizes(s in SIZE, n in SIZE) {
+            let rounded = applesauce_core::round_to_block_size(s, ALLOC)
+                < applesauce_core::round_to_block_size(n, ALLOC);
+            prop_assert_eq!(saves_space(s, n), rounded);
+        }
+
+        #[test]
+        fn saves_space_holds_near_the_top(n in u64::MAX - 8192..=u64::MAX) {
+            prop_assert!(!saves_space(n, n));
+            prop_assert!(saves_space(0, n));
         }
 
         #[test]
