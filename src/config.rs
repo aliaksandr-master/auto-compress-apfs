@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use crate::classify::MAX_SIZE;
 
 /// The embedded default configuration, written out when the config file does not exist.
-pub const DEFAULT_TOML: &str = include_str!("../config/default.toml");
+pub(crate) const DEFAULT_TOML: &str = include_str!("../config/default.toml");
 
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
@@ -16,12 +16,12 @@ const GIB: u64 = 1024 * MIB;
 const LOG_FOOTPRINT_MAX: u64 = 10 * MIB;
 /// launchd.log (a file a service manager may redirect stdout/stderr into) is truncated at
 /// startup once it exceeds this size.
-pub const LAUNCHD_LOG_MAX: u64 = MIB;
+pub(crate) const LAUNCHD_LOG_MAX: u64 = MIB;
 
 /// Runtime configuration. After [`Config::parse`] every path-like value is `~`-expanded.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct Config {
+pub(crate) struct Config {
     pub patterns: Vec<String>,
     pub exclude: Vec<String>,
     /// Mount points of further LOCAL apfs volumes that may be walked (the data volume always is).
@@ -69,7 +69,7 @@ pub struct Config {
 
 /// `run` of a command section: whether (and how) `run` executes that command.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum RunMode {
+pub(crate) enum RunMode {
     /// `false`: skipped by `run`.
     #[default]
     Off,
@@ -84,7 +84,7 @@ impl<'de> Deserialize<'de> for RunMode {
         struct Visitor;
         impl serde::de::Visitor<'_> for Visitor {
             type Value = RunMode;
-            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 f.write_str(r#"true, false or "dry-run-only""#)
             }
             fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<RunMode, E> {
@@ -106,7 +106,7 @@ impl<'de> Deserialize<'de> for RunMode {
 
 /// `verify`: `false`, `true` or `"extended"`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum VerifyMode {
+pub(crate) enum VerifyMode {
     /// `false`: no compare of a ditto copy (an applesauce copy is still compared).
     Off,
     /// `true`: the copy's kernel-decompressed bytes are compared with the original.
@@ -122,7 +122,7 @@ impl<'de> Deserialize<'de> for VerifyMode {
         struct Visitor;
         impl serde::de::Visitor<'_> for Visitor {
             type Value = VerifyMode;
-            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 f.write_str(r#"true, false or "extended""#)
             }
             fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<VerifyMode, E> {
@@ -149,7 +149,7 @@ impl<'de> Deserialize<'de> for VerifyMode {
 /// The compressor that writes the staged copies.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum Backend {
+pub(crate) enum Backend {
     /// `/usr/bin/ditto --hfsCompression` (the system's own compressor).
     #[default]
     Ditto,
@@ -160,7 +160,7 @@ pub enum Backend {
 
 impl Backend {
     /// Parses the config/CLI spelling (`ditto`, `applesauce`).
-    pub fn parse(s: &str) -> Option<Self> {
+    pub(crate) fn parse(s: &str) -> Option<Self> {
         match s {
             "ditto" => Some(Self::Ditto),
             "applesauce" => Some(Self::Applesauce),
@@ -173,7 +173,7 @@ impl Backend {
 /// `max_size` absent is unbounded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct SizeRange {
+pub(crate) struct SizeRange {
     pub backend: Backend,
     pub min_size: u64,
     #[serde(default)]
@@ -200,10 +200,10 @@ impl std::fmt::Display for SizeRange {
 }
 
 /// Default lower bound: files below it are never compressed.
-pub const DEFAULT_MIN_SIZE: u64 = 16385;
+pub(crate) const DEFAULT_MIN_SIZE: u64 = 16385;
 
 /// The builtin routing: ditto up to [`MAX_SIZE`] (512 MiB), applesauce above it.
-pub fn default_routing() -> Vec<SizeRange> {
+pub(crate) fn default_routing() -> Vec<SizeRange> {
     vec![
         SizeRange {
             backend: Backend::Ditto,
@@ -219,18 +219,18 @@ pub fn default_routing() -> Vec<SizeRange> {
 }
 
 /// The backend whose range holds `size`, if any (`routing` as in [`Config::routing`]).
-pub fn backend_for(routing: &[SizeRange], size: u64) -> Option<Backend> {
+pub(crate) fn backend_for(routing: &[SizeRange], size: u64) -> Option<Backend> {
     routing.iter().find(|r| r.contains(size)).map(|r| r.backend)
 }
 
 /// The lowest `min_size` of `routing`: smaller files are too small for every backend.
-pub fn lowest_min_size(routing: &[SizeRange]) -> u64 {
+pub(crate) fn lowest_min_size(routing: &[SizeRange]) -> u64 {
     routing.iter().map(|r| r.min_size).min().unwrap_or(0)
 }
 
 /// The routing of `--backend`: `backend` alone from the lowest `min_size` of `routing`, up
 /// to [`MAX_SIZE`] for ditto (it leaves bigger files uncompressed), unbounded for applesauce.
-pub fn forced_routing(routing: &[SizeRange], backend: Backend) -> Vec<SizeRange> {
+pub(crate) fn forced_routing(routing: &[SizeRange], backend: Backend) -> Vec<SizeRange> {
     vec![SizeRange {
         backend,
         min_size: lowest_min_size(routing),
@@ -277,7 +277,7 @@ fn check_routing(ranges: &[SizeRange]) -> Result<Vec<SizeRange>, String> {
 /// (the old `scheduled = true|false` is read as `run = true|false`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(try_from = "RawRule")]
-pub struct Rule {
+pub(crate) struct Rule {
     pub patterns: Vec<String>,
     pub exclude: Vec<String>,
     pub run: RunMode,
@@ -315,7 +315,7 @@ impl TryFrom<RawRule> for Rule {
 /// `[compress]`: only what `run` does with compress (on by default).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct CompressRule {
+pub(crate) struct CompressRule {
     pub run: RunMode,
 }
 
@@ -329,7 +329,7 @@ impl Default for CompressRule {
 /// and build directories not used for `max_age_secs` (>= 1).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct CargoCleanRule {
+pub(crate) struct CargoCleanRule {
     pub roots: Vec<String>,
     pub exclude: Vec<String>,
     pub max_age_secs: u64,
@@ -361,7 +361,7 @@ impl Default for CargoCleanRule {
 /// ones are replaced by APFS clones of one of them.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct DedupRule {
+pub(crate) struct DedupRule {
     pub patterns: Vec<String>,
     pub exclude: Vec<String>,
     pub min_size: u64,
@@ -423,7 +423,7 @@ impl Default for Config {
 
 /// Exclude syntax: a pattern without `/` matches an entry name at any depth; a pattern with `/`
 /// is a full-path glob and must be absolute (or start with `**/`).
-pub fn validate_excludes(exclude: &[String]) -> Result<(), String> {
+pub(crate) fn validate_excludes(exclude: &[String]) -> Result<(), String> {
     match exclude
         .iter()
         .find(|e| e.contains('/') && !e.starts_with('/') && !e.starts_with("**/"))
@@ -436,7 +436,7 @@ pub fn validate_excludes(exclude: &[String]) -> Result<(), String> {
 }
 
 /// Expands a leading `~` or `~/` to `home`; anything else (including `~user`) is returned as is.
-pub fn expand_tilde(s: &str, home: &Path) -> String {
+pub(crate) fn expand_tilde(s: &str, home: &Path) -> String {
     if s == "~" {
         home.to_string_lossy().into_owned()
     } else if let Some(rest) = s.strip_prefix("~/") {
@@ -448,7 +448,7 @@ pub fn expand_tilde(s: &str, home: &Path) -> String {
 
 impl Config {
     /// Parses TOML text, expands `~` against `home` and validates the result.
-    pub fn parse(text: &str, home: &Path) -> Result<Self, String> {
+    pub(crate) fn parse(text: &str, home: &Path) -> Result<Self, String> {
         let mut cfg: Config = toml::from_str(text).map_err(|e| e.to_string())?;
         for p in cfg
             .patterns
@@ -615,7 +615,7 @@ impl Config {
 
     /// Reads the config at `path`; when the file does not exist it is created from
     /// [`DEFAULT_TOML`] first. Returns the config and whether the file was created.
-    pub fn load_or_create(path: &Path, home: &Path) -> Result<(Self, bool), String> {
+    pub(crate) fn load_or_create(path: &Path, home: &Path) -> Result<(Self, bool), String> {
         let (text, created) = match fs::read_to_string(path) {
             Ok(text) => (text, false),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -631,19 +631,19 @@ impl Config {
     }
 
     /// True when the old top-level `backend` alone decides the routing (one range).
-    pub fn single_backend(&self) -> bool {
+    pub(crate) fn single_backend(&self) -> bool {
         self.backend.is_some() && self.backend_by_size.is_none()
     }
 
     /// Worker thread count with `0` resolved to the available parallelism.
-    pub fn worker_threads(&self) -> usize {
+    pub(crate) fn worker_threads(&self) -> usize {
         match self.threads {
-            0 => std::thread::available_parallelism().map_or(4, |n| n.get()),
+            0 => std::thread::available_parallelism().map_or(4, std::num::NonZero::get),
             n => n,
         }
     }
 
-    pub fn log_dir(&self) -> PathBuf {
+    pub(crate) fn log_dir(&self) -> PathBuf {
         PathBuf::from(&self.log_dir)
     }
 }
@@ -755,6 +755,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::string_add,
+        reason = "test configs are TOML snippets joined with `+`"
+    )]
     fn backend_by_size_errors() {
         let table = |b: &str, min: u64, max: Option<u64>| {
             let max = max.map_or(String::new(), |m| format!("max_size = {m}\n"));
@@ -965,7 +969,7 @@ mod tests {
         let cfg = Config::parse("", &home()).unwrap();
         assert_eq!(cfg.dedup, DedupRule::default());
         assert_eq!(cfg.dedup.exclude, [".git", "target", "node_modules"]);
-        assert_eq!(cfg.dedup.min_size, 1048576);
+        assert_eq!(cfg.dedup.min_size, 1_048_576);
         let cfg = Config::parse(
             "[dedup]\npatterns = [\"~/x/**\"]\nexclude = [\"~/x/keep\"]\nmin_size = 1",
             &home(),
@@ -1003,7 +1007,7 @@ mod tests {
     #[test]
     fn load_or_create_writes_default() {
         let dir = std::env::temp_dir().join(format!("acz-cfg-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        fs::remove_dir_all(&dir).ok();
         let path = dir.join("sub/default.toml");
         let (cfg, created) = Config::load_or_create(&path, &home()).unwrap();
         assert!(created);

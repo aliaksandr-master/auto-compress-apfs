@@ -23,7 +23,7 @@ const MIN_PATH_COLUMN: usize = 20;
 
 /// What happened to one file, for the terminal line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FileEvent<'a> {
+pub(crate) enum FileEvent<'a> {
     /// Logical size before, allocated bytes after.
     Compressed { size: u64, after: u64 },
     /// `ERROR(<kind>)`: ditto, verify, swap, perm, timeout, staging, io.
@@ -47,7 +47,7 @@ enum Phase {
 }
 
 /// Terminal state: phase counters, line width, and whether a progress line is on screen.
-pub struct Progress {
+pub(crate) struct Progress {
     width: usize,
     color: bool,
     home: Option<Box<Path>>,
@@ -60,7 +60,7 @@ pub struct Progress {
 }
 
 impl Progress {
-    pub fn new(width: usize, color: bool, home: Option<&Path>) -> Self {
+    pub(crate) fn new(width: usize, color: bool, home: Option<&Path>) -> Self {
         Self {
             width: width.max(40),
             color,
@@ -73,16 +73,16 @@ impl Progress {
     }
 
     /// Erases the progress line, if one is on screen.
-    pub fn clear(&mut self, w: &mut impl Write) {
+    pub(crate) fn clear(&mut self, w: &mut impl Write) {
         if self.shown {
-            let _ = w.write_all(CLEAR.as_bytes());
+            w.write_all(CLEAR.as_bytes()).ok();
             self.shown = false;
         }
     }
 
     /// Redraws the progress line; without `force` at most every [`REDRAW_EVERY`] (unless the
     /// line is stale after an event).
-    pub fn draw(&mut self, w: &mut impl Write, force: bool) {
+    pub(crate) fn draw(&mut self, w: &mut impl Write, force: bool) {
         let now = Instant::now();
         if !force && !self.stale && self.last_draw.is_some_and(|t| now - t < REDRAW_EVERY) {
             return;
@@ -104,25 +104,25 @@ impl Progress {
             ),
         };
         let line = truncate_right(&line, self.width - 1);
-        let _ = write!(w, "{CLEAR}{line}");
-        let _ = w.flush();
+        write!(w, "{CLEAR}{line}").ok();
+        w.flush().ok();
         self.last_draw = Some(now);
         self.shown = true;
     }
 
-    pub fn scan_found(&mut self, n: u64) {
+    pub(crate) fn scan_found(&mut self, n: u64) {
         self.scan_progress(1, n);
     }
 
     /// One more directory read by the walk, `n` more items found in it.
-    pub fn scan_progress(&mut self, read: u64, n: u64) {
+    pub(crate) fn scan_progress(&mut self, read: u64, n: u64) {
         if let Phase::Scan { found, dirs } = &mut self.phase {
             *found += n;
             *dirs += read;
         }
     }
 
-    pub fn start_compress(&mut self, total_files: u64, total_bytes: u64) {
+    pub(crate) fn start_compress(&mut self, total_files: u64, total_bytes: u64) {
         self.phase = Phase::Compress {
             total_files,
             total_bytes,
@@ -133,12 +133,12 @@ impl Progress {
     }
 
     /// One file of the compress phase is finished.
-    pub fn advance(&mut self, bytes: u64) {
+    pub(crate) fn advance(&mut self, bytes: u64) {
         self.advance_by(1, bytes);
     }
 
     /// `files` files of `bytes` of the compress phase are finished.
-    pub fn advance_by(&mut self, files: u64, bytes: u64) {
+    pub(crate) fn advance_by(&mut self, files: u64, bytes: u64) {
         if let Phase::Compress {
             done_files,
             done_bytes,
@@ -151,25 +151,29 @@ impl Progress {
     }
 
     /// Writes one event line above the progress line.
-    pub fn event(&mut self, w: &mut impl Write, path: &Path, ev: FileEvent<'_>, msg: &str) {
+    pub(crate) fn event(&mut self, w: &mut impl Write, path: &Path, ev: FileEvent<'_>, msg: &str) {
         self.clear(w);
         let shown = abbreviate_home(path, self.home.as_deref());
         let line = event_line(&shown, ev, msg, self.width, self.color);
-        let _ = writeln!(w, "{line}");
+        writeln!(w, "{line}").ok();
         self.draw(w, true);
         self.stale = matches!(self.phase, Phase::Compress { .. });
     }
 
     /// Writes a free-form line (a WARN/ERROR log message) above the progress line.
-    pub fn message(&mut self, w: &mut impl Write, text: &str) {
+    pub(crate) fn message(&mut self, w: &mut impl Write, text: &str) {
         self.clear(w);
-        let _ = writeln!(w, "{text}");
+        writeln!(w, "{text}").ok();
         self.draw(w, true);
     }
 }
 
 /// `1023 B`, `1.5 KiB`, `123.3 MiB`, `12.0 GiB` (binary units, one decimal).
-pub fn human(bytes: u64) -> String {
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "a display size with one decimal"
+)]
+pub(crate) fn human(bytes: u64) -> String {
     const UNITS: [&str; 3] = ["KiB", "MiB", "GiB"];
     if bytes < 1024 {
         return format!("{bytes} B");
@@ -184,7 +188,7 @@ pub fn human(bytes: u64) -> String {
 }
 
 /// Keeps the last `max` chars of `s`, replacing the cut head with `...`.
-pub fn truncate_left(s: &str, max: usize) -> String {
+pub(crate) fn truncate_left(s: &str, max: usize) -> String {
     let n = s.chars().count();
     if n <= max {
         return s.to_owned();
@@ -202,7 +206,7 @@ fn truncate_right(s: &str, max: usize) -> String {
 }
 
 /// `path` with a leading `home` shown as `~`.
-pub fn abbreviate_home(path: &Path, home: Option<&Path>) -> String {
+pub(crate) fn abbreviate_home(path: &Path, home: Option<&Path>) -> String {
     match home.and_then(|h| path.strip_prefix(h).ok()) {
         Some(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
         Some(rest) => format!("~/{}", rest.display()),
@@ -211,7 +215,7 @@ pub fn abbreviate_home(path: &Path, home: Option<&Path>) -> String {
 }
 
 /// `1h 4m 20s`, `4m 0s`, `20s`.
-pub fn duration_text(secs: u64) -> String {
+pub(crate) fn duration_text(secs: u64) -> String {
     let (h, m, s) = (secs / 3600, secs % 3600 / 60, secs % 60);
     if h > 0 {
         format!("{h}h {m}m {s}s")
@@ -222,7 +226,7 @@ pub fn duration_text(secs: u64) -> String {
     }
 }
 
-pub fn scan_line(found: u64, dirs: u64) -> String {
+pub(crate) fn scan_line(found: u64, dirs: u64) -> String {
     format!("scanning... {dirs} dirs read, {found} found")
 }
 
@@ -236,7 +240,13 @@ const ESTIMATE_COLUMN: usize = 11;
 /// ` 10% [███▏____] ( 33/111)    1.0 GiB/10.0 GiB  estimate: 1h 4m 20s`; percent and estimate by
 /// bytes, counts by files; the bar takes the width the rest leaves. Every number has its column
 /// reserved up front, so the bar keeps its width for the whole run.
-pub fn progress_line(
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "a display ETA: a non-negative estimate in seconds, rounded"
+)]
+pub(crate) fn progress_line(
     files: (u64, u64),
     bytes: (u64, u64),
     elapsed: Duration,
@@ -294,7 +304,14 @@ pub fn progress_line(
 }
 
 /// One event line: the path column (left-truncated, padded) and the outcome.
-pub fn event_line(path: &str, ev: FileEvent<'_>, msg: &str, width: usize, color: bool) -> String {
+#[expect(clippy::cast_precision_loss, reason = "a display percentage")]
+pub(crate) fn event_line(
+    path: &str,
+    ev: FileEvent<'_>,
+    msg: &str,
+    width: usize,
+    color: bool,
+) -> String {
     let col = width.saturating_sub(RIGHT_COLUMN + 3).max(MIN_PATH_COLUMN);
     let path = truncate_left(path, col);
     let pad = col - path.chars().count();

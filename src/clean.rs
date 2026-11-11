@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 
 /// A leftover with a timestamp younger than this (seconds) may belong to a running compress or
 /// dedup.
-pub const LIVE_GUARD: i64 = 6 * 3600;
+pub(crate) const LIVE_GUARD: i64 = 6 * 3600;
 /// Byte-compares tried per leftover file before it counts as having no copy.
 const MAX_COMPARES: usize = 8;
 /// Leftover bytes byte-compared by one `clean` run at most.
@@ -43,7 +43,7 @@ const VERIFY_BUDGET: u64 = 4 << 30;
 const DITTO_TEMP_PREFIX: &[u8] = b".BC.T_";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Kind {
+pub(crate) enum Kind {
     Staging,
     Rescue,
 }
@@ -73,7 +73,7 @@ impl Kind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FileClass {
+pub(crate) enum FileClass {
     /// Partial file of an interrupted ditto call (`.BC.T_*`).
     DittoTemp,
     /// Byte-identical to this file found by the walk.
@@ -85,7 +85,7 @@ pub enum FileClass {
 
 /// One entry below a leftover dir, from `lstat`.
 #[derive(Debug)]
-pub struct Item {
+pub(crate) struct Item {
     pub path: PathBuf,
     pub class: FileClass,
     pub size: u64,
@@ -99,7 +99,7 @@ pub struct Item {
 
 /// A leftover staging or rescue dir with its scanned contents.
 #[derive(Debug)]
-pub struct Leftover {
+pub(crate) struct Leftover {
     pub path: PathBuf,
     pub kind: Kind,
     /// Digits of the creating process id, as in the name (never parsed).
@@ -130,12 +130,12 @@ impl Leftover {
     }
 
     /// Logical size of the regular files.
-    pub fn size(&self) -> u64 {
+    pub(crate) fn size(&self) -> u64 {
         self.files().map(|i| i.size).sum()
     }
 
     /// Allocated bytes of every entry.
-    pub fn allocated(&self) -> u64 {
+    pub(crate) fn allocated(&self) -> u64 {
         self.entries.iter().map(|i| i.allocated).sum()
     }
 }
@@ -162,7 +162,7 @@ pub(crate) fn flag_reason(path: &Path, m: &Metadata) -> Option<String> {
 /// Lists `path` recursively with `lstat` only: never follows a symlink, never enters a
 /// directory on another filesystem or a dataless one. Any flagged, dataless, foreign-filesystem
 /// or unreadable entry blocks the dir. `None` (with a WARN) when `path` is no longer a directory.
-pub fn scan(path: &Path, kind: Kind, log: &Logger) -> Option<Leftover> {
+pub(crate) fn scan(path: &Path, kind: Kind, log: &Logger) -> Option<Leftover> {
     let root = match fs::symlink_metadata(path) {
         Ok(m) if m.is_dir() => m,
         Ok(_) => {
@@ -196,7 +196,7 @@ pub fn scan(path: &Path, kind: Kind, log: &Logger) -> Option<Leftover> {
     if let Some(why) = flag_reason(path, &root) {
         lo.block(why);
     }
-    match fs::symlink_metadata(path.parent().unwrap_or(Path::new("/"))) {
+    match fs::symlink_metadata(path.parent().unwrap_or_else(|| Path::new("/"))) {
         Ok(pm) if pm.dev() == lo.dev => {}
         Ok(_) => lo.block("on another filesystem than its parent".into()),
         Err(e) => lo.block(format!("cannot stat its parent: {e}")),
@@ -269,13 +269,13 @@ pub fn scan(path: &Path, kind: Kind, log: &Logger) -> Option<Leftover> {
 /// scan are not read.
 /// Correct because a staged copy keeps the original's basename and basenames are unique within
 /// a batch (see `Compressor::process` and `split_batches`).
-pub fn classify(leftovers: &mut [Leftover], candidates: &[Candidate]) {
+pub(crate) fn classify(leftovers: &mut [Leftover], candidates: &[Candidate]) {
     classify_with(leftovers, candidates, VERIFY_BUDGET);
 }
 
 /// Adds the leftovers of another walk scope to `into` and sorts by path; a dir already in
 /// `into` stays once, as first found (its classification kept).
-pub fn merge(into: &mut Vec<Leftover>, more: Vec<Leftover>) {
+pub(crate) fn merge(into: &mut Vec<Leftover>, more: Vec<Leftover>) {
     let seen: std::collections::HashSet<PathBuf> = into.iter().map(|l| l.path.clone()).collect();
     into.extend(more.into_iter().filter(|l| !seen.contains(&l.path)));
     into.sort_unstable_by(|a, b| a.path.cmp(&b.path));
@@ -301,7 +301,11 @@ fn classify_with(leftovers: &mut [Leftover], candidates: &[Candidate], mut budge
     }
     let mut bufs = Buffers::default();
     for lo in leftovers.iter_mut() {
-        let parent = lo.path.parent().unwrap_or(Path::new("/")).to_path_buf();
+        let parent = lo
+            .path
+            .parent()
+            .unwrap_or_else(|| Path::new("/"))
+            .to_path_buf();
         let compare = lo.blocked.is_none();
         // A file classified by an earlier pass (another walk scope) is not compared again.
         for item in lo
@@ -342,7 +346,7 @@ fn classify_with(leftovers: &mut [Leftover], candidates: &[Candidate], mut budge
 
 /// Blocks every leftover (staging or rescue) whose birthtime, mtime or newest content
 /// mtime/ctime is younger than [`LIVE_GUARD`] (or in the future).
-pub fn block_live(leftovers: &mut [Leftover], now: i64) {
+pub(crate) fn block_live(leftovers: &mut [Leftover], now: i64) {
     for lo in leftovers.iter_mut() {
         let newest = lo
             .entries
@@ -376,7 +380,7 @@ fn span(secs: i64) -> String {
 }
 
 /// `3d 4h ago` for a past age in seconds, `5m in the future` for a negative one.
-pub fn ago(secs: i64) -> String {
+pub(crate) fn ago(secs: i64) -> String {
     if secs < 0 {
         format!("{} in the future", span(secs.saturating_neg()))
     } else {
@@ -394,7 +398,7 @@ fn when_ago(t: Option<i64>, now: i64) -> String {
 
 /// The preview on stdout: every leftover with its age, sizes, per-class counts, the files with
 /// no copy, why it is kept; totals; and `apply_cmd`, the command that would delete them.
-pub fn render(leftovers: &[Leftover], home: &Path, now: i64, apply_cmd: &str) -> String {
+pub(crate) fn render(leftovers: &[Leftover], home: &Path, now: i64, apply_cmd: &str) -> String {
     let show = |p: &Path| abbreviate_home(p, Some(home));
     let mut out = String::new();
     if leftovers.is_empty() {
@@ -402,35 +406,38 @@ pub fn render(leftovers: &[Leftover], home: &Path, now: i64, apply_cmd: &str) ->
         return out;
     }
     for lo in leftovers {
-        let _ = writeln!(
+        writeln!(
             out,
             "{}   {}, pid {}",
             show(&lo.path),
             lo.kind.name(),
             lo.pid
-        );
-        let _ = writeln!(out, "  created        {}", when_ago(Some(lo.created), now));
-        let _ = writeln!(out, "  dir modified   {}", when_ago(Some(lo.mtime), now));
+        )
+        .ok();
+        writeln!(out, "  created        {}", when_ago(Some(lo.created), now)).ok();
+        writeln!(out, "  dir modified   {}", when_ago(Some(lo.mtime), now)).ok();
         let last = lo.entries.iter().map(|i| i.ctime).max();
-        let _ = writeln!(out, "  last written   {}", when_ago(last, now));
+        writeln!(out, "  last written   {}", when_ago(last, now)).ok();
         let oldest = lo.files().map(|i| i.mtime).min();
         let newest = lo.files().map(|i| i.mtime).max();
         if let (Some(a), Some(b)) = (oldest, newest) {
-            let _ = writeln!(
+            writeln!(
                 out,
                 "  content mtime  {} .. {} (copies keep the original's mtime)",
                 when(a),
                 when(b)
-            );
+            )
+            .ok();
         }
-        let _ = writeln!(
+        writeln!(
             out,
             "  files          {} ({} entries), {}, {} on disk",
             lo.files().count(),
             lo.entries.len(),
             human(lo.size()),
             human(lo.allocated())
-        );
+        )
+        .ok();
         let mut no_copy = Vec::new();
         let mut not_files = Vec::new();
         let (mut temp, mut copy, mut none) = ((0, 0), (0, 0), (0, 0));
@@ -458,47 +465,49 @@ pub fn render(leftovers: &[Leftover], home: &Path, now: i64, apply_cmd: &str) ->
             ("has live copy ", copy),
             ("no copy found ", none),
         ] {
-            let _ = writeln!(out, "  {label} {n}, {}", human(bytes));
+            writeln!(out, "  {label} {n}, {}", human(bytes)).ok();
         }
         for i in no_copy {
-            let _ = writeln!(out, "    {}", show(&i.path));
+            writeln!(out, "    {}", show(&i.path)).ok();
         }
         if !not_files.is_empty() {
-            let _ = writeln!(
+            writeln!(
                 out,
                 "  not a file     {} (symlinks and special files, never compared)",
                 not_files.len()
-            );
+            )
+            .ok();
             for i in not_files {
                 let what = if i.is_symlink {
                     "symlink"
                 } else {
                     "special file"
                 };
-                let _ = writeln!(out, "    {} ({what})", show(&i.path));
+                writeln!(out, "    {} ({what})", show(&i.path)).ok();
             }
         }
         if lo.keep_marker {
-            let _ = writeln!(
+            writeln!(
                 out,
                 "  note           has {KEEP_MARKER}: holds a file compress or dedup could not swap back, \
                  or the original of an interrupted swap"
-            );
+            ).ok();
         }
         if let Some(why) = &lo.incomplete {
-            let _ = writeln!(
+            writeln!(
                 out,
                 "  INCOMPLETE     {why}: unchecked files count as no copy"
-            );
+            )
+            .ok();
         }
         if let Some(why) = &lo.blocked {
-            let _ = writeln!(out, "  BLOCKED        {why}; never removed");
+            writeln!(out, "  BLOCKED        {why}; never removed").ok();
         }
         out.push('\n');
     }
     let count = |k: Kind| leftovers.iter().filter(|l| l.kind == k).count();
     let removable: Vec<&Leftover> = leftovers.iter().filter(|l| l.blocked.is_none()).collect();
-    let _ = writeln!(
+    writeln!(
         out,
         "found {} leftover dirs ({} staging, {} rescue): {} files, {}, {} on disk; {} blocked",
         leftovers.len(),
@@ -508,23 +517,25 @@ pub fn render(leftovers: &[Leftover], home: &Path, now: i64, apply_cmd: &str) ->
         human(leftovers.iter().map(Leftover::size).sum()),
         human(leftovers.iter().map(Leftover::allocated).sum()),
         leftovers.len() - removable.len()
-    );
-    let _ = writeln!(
+    )
+    .ok();
+    writeln!(
         out,
         "A running compress or dedup has staging and rescue dirs of its own; a dir changed less than {}h \
          ago is blocked.",
         LIVE_GUARD / 3600
-    );
+    ).ok();
     if removable.is_empty() {
         out.push_str("Nothing changed. Nothing can be removed.\n");
     } else {
-        let _ = writeln!(
+        writeln!(
             out,
             "Nothing changed. Run '{apply_cmd}' to delete these {} dirs ({} on disk), files \
              without a copy included.",
             removable.len(),
             human(removable.iter().map(|l| l.allocated()).sum())
-        );
+        )
+        .ok();
     }
     out
 }
@@ -546,7 +557,7 @@ fn recheck(lo: &Leftover) -> Result<(), String> {
     if (m.dev(), m.ino()) != (lo.dev, lo.ino) {
         return Err("replaced since the scan".into());
     }
-    let parent = lo.path.parent().unwrap_or(Path::new("/"));
+    let parent = lo.path.parent().unwrap_or_else(|| Path::new("/"));
     let pm = fs::symlink_metadata(parent).map_err(|e| format!("cannot stat parent: {e}"))?;
     if pm.dev() != m.dev() {
         return Err("on another filesystem than its parent".into());
@@ -571,7 +582,7 @@ fn count_entries(dir: &Path) -> u64 {
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
-pub struct Removal {
+pub(crate) struct Removal {
     pub removed: u64,
     /// Refused by the re-check, not or partially removed.
     pub failed: u64,
@@ -583,7 +594,7 @@ pub struct Removal {
 
 /// Deletes every leftover not blocked, each only after [`recheck`]. Every dir left in place
 /// gets a WARN and an entry in [`Removal::kept`].
-pub fn remove(leftovers: &[Leftover], log: &Logger) -> Removal {
+pub(crate) fn remove(leftovers: &[Leftover], log: &Logger) -> Removal {
     let mut r = Removal::default();
     let keep = |r: &mut Removal, lo: &Leftover, why: String| {
         log.warn(format_args!(
@@ -654,11 +665,12 @@ mod tests {
 
         fn cleanup(dir: &Path) {
             if dir.exists() {
-                let _ = std::process::Command::new("/usr/bin/chflags")
+                std::process::Command::new("/usr/bin/chflags")
                     .args(["-R", "nouchg"])
                     .arg(dir)
-                    .status();
-                let _ = fs::remove_dir_all(dir);
+                    .status()
+                    .ok();
+                fs::remove_dir_all(dir).ok();
             }
         }
 
@@ -707,7 +719,11 @@ mod tests {
             .unwrap()
             .set_times(fs::FileTimes::new().set_modified(t).set_accessed(t))
             .unwrap();
-        let t_secs = t.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs() as i64;
+        let t_secs = t
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .cast_signed();
         let birth = fs::symlink_metadata(p).unwrap().st_birthtime();
         assert!(birth <= t_secs, "birthtime of {} not lowered", p.display());
     }
@@ -716,7 +732,8 @@ mod tests {
         SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
-            .as_secs() as i64
+            .as_secs()
+            .cast_signed()
     }
 
     #[test]

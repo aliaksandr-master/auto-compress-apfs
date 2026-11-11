@@ -1,6 +1,12 @@
 //! auto-compress-apfs: turns on APFS transparent compression for files matched by glob
 //! patterns, using Apple's `/usr/bin/ditto --hfsCompression` or an in-process LZFSE writer.
 
+#![expect(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "a CLI: main, launchd, logger, remove and tm_exclude print reports, progress and errors to the terminal"
+)]
+
 mod applesauce;
 mod cache;
 mod cargo_clean;
@@ -487,7 +493,7 @@ fn main() -> ExitCode {
         Cli::TmExclude(args) => return cmd_tm_exclude(&args, &home),
         Cli::Dedup(args) => return cmd_dedup(&args, &home),
         Cli::Run(args) => return cmd_run(&args, &home),
-        Cli::Quarantine { config, cmd } => cmd_quarantine(config, &cmd, &home),
+        Cli::Quarantine { config, cmd } => cmd_quarantine(config.as_ref(), &cmd, &home),
         Cli::Launchd { config, cmd } => cmd_launchd(config, cmd, &home),
         Cli::Exit(code) => return code,
     };
@@ -514,7 +520,7 @@ fn state_dir(home: &Path) -> PathBuf {
 fn quarantine_file(config_path: &Path) -> PathBuf {
     config_path
         .parent()
-        .unwrap_or(Path::new("."))
+        .unwrap_or_else(|| Path::new("."))
         .join(quarantine::QUARANTINE_NAME)
 }
 
@@ -577,7 +583,7 @@ fn cmd_launchd(config: Option<PathBuf>, cmd: LaunchdCmd, home: &Path) -> Result<
     let script = config_path.with_file_name(launchd::SCRIPT_NAME);
     let plist = launchd::agents_dir(home).join(format!("{}.plist", launchd::LABEL));
     if cmd == LaunchdCmd::Check {
-        return check_launchd(config.as_deref(), &plist, &script, home);
+        return Ok(check_launchd(config.as_deref(), &plist, &script, home));
     }
     // Released before the agent is loaded: its first run takes the lock itself.
     if acquire_lock(&state_dir(home))?.is_none() {
@@ -611,12 +617,7 @@ fn cmd_launchd(config: Option<PathBuf>, cmd: LaunchdCmd, home: &Path) -> Result<
 /// version would write for the binary and config run.sh names, and asks launchd whether the
 /// agent is loaded. Exit 0: nothing to do; 1: run `install-launchd` (the printed command keeps
 /// the installed config); 2: the check itself failed (unreadable file, invalid config).
-fn check_launchd(
-    config: Option<&Path>,
-    plist: &Path,
-    script: &Path,
-    home: &Path,
-) -> Result<ExitCode, String> {
+fn check_launchd(config: Option<&Path>, plist: &Path, script: &Path, home: &Path) -> ExitCode {
     let script = fs::read_to_string(plist)
         .ok()
         .and_then(|t| launchd::plist_script(&t))
@@ -650,7 +651,7 @@ fn check_launchd(
         Ok(v) => v,
         Err(e) => {
             eprintln!("{NAME}: check-launchd failed: {e}");
-            return Ok(ExitCode::from(2));
+            return ExitCode::from(2);
         }
     };
     // Keep the config the installed agent runs; fall back to --config for a new install.
@@ -665,7 +666,7 @@ fn check_launchd(
         ),
         None => format!("{NAME} install-launchd"),
     };
-    Ok(match verdict {
+    match verdict {
         launchd::Verdict::UpToDate => {
             let loaded = if ask_launchd {
                 "loaded"
@@ -686,17 +687,17 @@ fn check_launchd(
             println!("REINSTALL: {why}; run: {fix}");
             ExitCode::FAILURE
         }
-    })
+    }
 }
 
 /// `quarantine list` (read-only) and `quarantine clear` (under the run lock; also resets the
 /// streaks in `state.tsv` and `dedup.tsv`).
 fn cmd_quarantine(
-    config: Option<PathBuf>,
+    config: Option<&PathBuf>,
     cmd: &QuarantineCmd,
     home: &Path,
 ) -> Result<ExitCode, String> {
-    let qfile = quarantine_file(&config_path(config.as_ref(), home));
+    let qfile = quarantine_file(&config_path(config, home));
     let err = |e: std::io::Error| format!("{}: {e}", qfile.display());
     let target = match cmd {
         QuarantineCmd::List => {
@@ -728,15 +729,12 @@ fn cmd_quarantine(
     let what = target.as_deref().map_or(Release::All, Release::Path);
     let released = quarantine::clear(&qfile, what).map_err(err)?;
     if released.is_empty() {
-        return Ok(match &target {
-            Some(p) => {
-                eprintln!("{NAME}: not in quarantine: {}", p.display());
-                ExitCode::FAILURE
-            }
-            None => {
-                println!("quarantine is empty ({})", qfile.display());
-                ExitCode::SUCCESS
-            }
+        return Ok(if let Some(p) = &target {
+            eprintln!("{NAME}: not in quarantine: {}", p.display());
+            ExitCode::FAILURE
+        } else {
+            println!("quarantine is empty ({})", qfile.display());
+            ExitCode::SUCCESS
         });
     }
     for p in &released {
@@ -918,13 +916,12 @@ fn run_remove(
         ));
     }
     let _lock = if args.apply {
-        match acquire_lock(&state_dir(home))? {
-            Some(f) => Some(f),
-            None => {
-                log.info("another run in progress, exiting");
-                eprintln!("{NAME}: a run is in progress, try again when it has finished");
-                return Ok(ExitCode::FAILURE);
-            }
+        if let Some(f) = acquire_lock(&state_dir(home))? {
+            Some(f)
+        } else {
+            log.info("another run in progress, exiting");
+            eprintln!("{NAME}: a run is in progress, try again when it has finished");
+            return Ok(ExitCode::FAILURE);
         }
     } else {
         None
@@ -1026,11 +1023,9 @@ fn run_remove(
         out
     } else {
         log.finish_progress(None);
-        let extra: String = args
-            .config
-            .iter()
-            .map(|p| format!(" --config {}", shell_quote(&p.display().to_string())))
-            .collect();
+        let extra = args.config.as_ref().map_or_else(String::new, |p| {
+            format!(" --config {}", shell_quote(&p.display().to_string()))
+        });
         print_painted(&remove::render(
             &items,
             home,
@@ -1059,10 +1054,7 @@ fn run_remove(
             remove::Action::CargoClean => "cargo-clean",
         },
         dry_run: !args.apply,
-        what: match action {
-            remove::Action::Trash => "items",
-            _ => "items",
-        },
+        what: "items",
         count,
         freed: if action == remove::Action::Trash {
             0
@@ -1105,7 +1097,7 @@ fn remove_rule(cfg: &Config, action: remove::Action) -> (&[String], &[String]) {
 /// The tool's own files next to the config (not that whole directory: it may be HOME), its log,
 /// state and cache directories.
 fn own_paths(cfg: &Config, config_path: &Path, home: &Path) -> [PathBuf; 8] {
-    let config_dir = config_path.parent().unwrap_or(Path::new("/"));
+    let config_dir = config_path.parent().unwrap_or_else(|| Path::new("/"));
     [
         config_path.to_path_buf(),
         config_dir.join(launchd::SCRIPT_NAME),
@@ -1178,13 +1170,12 @@ fn run_tm_exclude(
         ));
     }
     let _lock = if args.apply {
-        match acquire_lock(&state_dir(home))? {
-            Some(f) => Some(f),
-            None => {
-                log.info("another run in progress, exiting");
-                eprintln!("{NAME}: a run is in progress, try again when it has finished");
-                return Ok(ExitCode::FAILURE);
-            }
+        if let Some(f) = acquire_lock(&state_dir(home))? {
+            Some(f)
+        } else {
+            log.info("another run in progress, exiting");
+            eprintln!("{NAME}: a run is in progress, try again when it has finished");
+            return Ok(ExitCode::FAILURE);
         }
     } else {
         None
@@ -1226,11 +1217,9 @@ fn run_tm_exclude(
         );
         out
     } else {
-        let extra: String = args
-            .config
-            .iter()
-            .map(|p| format!(" --config {}", shell_quote(&p.display().to_string())))
-            .collect();
+        let extra = args.config.as_ref().map_or_else(String::new, |p| {
+            format!(" --config {}", shell_quote(&p.display().to_string()))
+        });
         print_painted(&tm_exclude::render(
             &items,
             home,
@@ -1329,13 +1318,12 @@ fn run_dedup(
         ));
     }
     let _lock = if args.apply {
-        match acquire_lock(&state_dir(home))? {
-            Some(f) => Some(f),
-            None => {
-                log.info("another run in progress, exiting");
-                eprintln!("{NAME}: a run is in progress, try again when it has finished");
-                return Ok(ExitCode::FAILURE);
-            }
+        if let Some(f) = acquire_lock(&state_dir(home))? {
+            Some(f)
+        } else {
+            log.info("another run in progress, exiting");
+            eprintln!("{NAME}: a run is in progress, try again when it has finished");
+            return Ok(ExitCode::FAILURE);
         }
     } else {
         None
@@ -1386,7 +1374,7 @@ fn run_dedup(
     let found = walked.candidates.len() as u64;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64);
+        .map_or(0, |d| d.as_secs().cast_signed());
     let today = today(now)?;
     let cands = dedup::eligible(
         walked.candidates,
@@ -1473,11 +1461,9 @@ fn run_dedup(
         );
         out
     } else {
-        let extra: String = args
-            .config
-            .iter()
-            .map(|p| format!(" --config {}", shell_quote(&p.display().to_string())))
-            .collect();
+        let extra = args.config.as_ref().map_or_else(String::new, |p| {
+            format!(" --config {}", shell_quote(&p.display().to_string()))
+        });
         print_painted(&dedup::render(
             &plan,
             home,
@@ -1653,23 +1639,24 @@ fn render_totals(totals: &[StepTotal]) -> String {
         let mode = if t.dry_run { "preview" } else { "applied" };
         let mut line = format!("{:<12} {mode:<8} {} {}", t.name, t.count, t.what);
         if t.freed > 0 {
-            let _ = write!(
+            write!(
                 line,
                 ", {} {}",
                 if t.dry_run { "would free" } else { "freed" },
                 human(t.freed)
-            );
+            )
+            .ok();
         }
         if t.trashed > 0 {
-            let _ = write!(line, ", {} to the Trash", human(t.trashed));
+            write!(line, ", {} to the Trash", human(t.trashed)).ok();
         }
         if t.to_compress > 0 {
-            let _ = write!(line, ", {} to compress", human(t.to_compress));
+            write!(line, ", {} to compress", human(t.to_compress)).ok();
         }
         if t.failed > 0 {
-            let _ = write!(line, ", {} failed", t.failed);
+            write!(line, ", {} failed", t.failed).ok();
         }
-        let _ = writeln!(s, "{line}");
+        writeln!(s, "{line}").ok();
     }
     let sum = |dry: bool| -> (u64, u64) {
         totals
@@ -1679,23 +1666,24 @@ fn render_totals(totals: &[StepTotal]) -> String {
     };
     let (freed, trashed) = sum(false);
     if totals.iter().any(|t| !t.dry_run) {
-        let _ = write!(s, "freed: about {}", human(freed));
+        write!(s, "freed: about {}", human(freed)).ok();
         if trashed > 0 {
-            let _ = write!(
+            write!(
                 s,
                 " (plus {} moved to the Trash, freed when it is emptied)",
                 human(trashed)
-            );
+            )
+            .ok();
         }
-        let _ = writeln!(s);
+        writeln!(s).ok();
     }
     let (freed, trashed) = sum(true);
     if totals.iter().any(|t| t.dry_run) {
-        let _ = write!(s, "would free: about {}", human(freed));
+        write!(s, "would free: about {}", human(freed)).ok();
         if trashed > 0 {
-            let _ = write!(s, " (plus {} to the Trash)", human(trashed));
+            write!(s, " (plus {} to the Trash)", human(trashed)).ok();
         }
-        let _ = writeln!(s, "; compress savings are not estimated");
+        writeln!(s, "; compress savings are not estimated").ok();
     }
     s
 }
@@ -1759,7 +1747,7 @@ fn print_painted(text: &str) {
             Some(b) => (b, "\n"),
             None => (line, ""),
         };
-        let _ = write!(out, "{}{nl}", painted(body, color));
+        write!(out, "{}{nl}", painted(body, color)).ok();
     }
 }
 
@@ -1860,13 +1848,12 @@ fn run_clean(
     }
     // Held across walk, scan and delete; the preview neither takes nor needs it.
     let _lock = if args.apply {
-        match acquire_lock(&state_dir(home))? {
-            Some(f) => Some(f),
-            None => {
-                log.info("another run in progress, exiting");
-                eprintln!("{NAME}: a run is in progress, try again when it has finished");
-                return Ok(ExitCode::FAILURE);
-            }
+        if let Some(f) = acquire_lock(&state_dir(home))? {
+            Some(f)
+        } else {
+            log.info("another run in progress, exiting");
+            eprintln!("{NAME}: a run is in progress, try again when it has finished");
+            return Ok(ExitCode::FAILURE);
         }
     } else {
         None
@@ -1912,7 +1899,7 @@ fn run_clean(
     }
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64);
+        .map_or(0, |d| d.as_secs().cast_signed());
     clean::block_live(&mut leftovers, now);
     let blocked = leftovers.iter().filter(|l| l.blocked.is_some()).count();
     let removal = if args.apply {
@@ -1934,11 +1921,9 @@ fn run_clean(
         }
         r
     } else {
-        let extra: String = args
-            .config
-            .iter()
-            .map(|p| format!(" --config {}", shell_quote(&p.display().to_string())))
-            .collect();
+        let extra = args.config.as_ref().map_or_else(String::new, |p| {
+            format!(" --config {}", shell_quote(&p.display().to_string()))
+        });
         let cmd = format!("{NAME} clean --apply{extra}");
         print!("{}", clean::render(&leftovers, home, now, &cmd));
         clean::Removal::default()
@@ -2072,13 +2057,12 @@ fn run(
 
     // Held until the end of `run`; previews neither take nor need it.
     let _lock = if apply {
-        match acquire_lock(&state_dir(home))? {
-            Some(f) => Some(f),
-            None => {
-                log.info("another run in progress, exiting");
-                eprintln!("{NAME}: a run is in progress, exiting (see the log for its progress)");
-                return Ok(());
-            }
+        if let Some(f) = acquire_lock(&state_dir(home))? {
+            Some(f)
+        } else {
+            log.info("another run in progress, exiting");
+            eprintln!("{NAME}: a run is in progress, exiting (see the log for its progress)");
+            return Ok(());
         }
     } else {
         None
@@ -2212,7 +2196,7 @@ fn run(
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64);
+        .map_or(0, |d| d.as_secs().cast_signed());
     let today = today(now)?;
     let prev_day = st.previous_run_day(today);
     let rules = Rules {
@@ -2272,13 +2256,12 @@ fn run(
                 sum.already_compressed += 1;
                 match st.rows.get_mut(&c.path) {
                     Some(r) if !listed && unrestricted => state::on_compressed(r, today),
-                    Some(_) => {}
                     // Compressed earlier (another version, another tool): recorded for `stat`.
                     None if state::storable(&c.path) => {
                         let row = Row::new(c.key.dev, c.key.ino, c.size(), c.allocated(), 0);
                         st.rows.insert(c.path.clone(), row);
                     }
-                    None => {}
+                    Some(_) | None => {}
                 }
             }
             Class::Flagged(flags) => {
@@ -2359,20 +2342,25 @@ fn run(
     }
 
     let todo_count = todo.len() as u64;
-    let todo_bytes: u64 = todo.iter().map(|c| c.size()).sum();
+    let todo_bytes: u64 = todo.iter().map(walk::Candidate::size).sum();
     let out = if apply {
+        // Routed before any side effect, so an internal error leaves nothing half-done.
+        // `b` came from `classify` over `routing`, and `backends` holds a probed entry for
+        // every backend `routing` names, so the lookup cannot miss; a miss is an internal error.
+        let routed = todo
+            .into_iter()
+            .zip(todo_backends)
+            .map(|(c, b)| {
+                let ready = backends.iter().find(|(k, _)| *k == b).map(|(_, r)| *r);
+                ready
+                    .map(|r| (c, r))
+                    .ok_or_else(|| format!("internal error: backend {b:?} was not probed"))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         compress::remove_stale(&walked.stale_staging, log);
         log.start_compress(todo_count, todo_bytes);
         let out = Compressor::new(log, cfg.verify, cfg.batch_size, threads, cfg.min_free_bytes)
-            .run_routed(
-                todo.into_iter()
-                    .zip(todo_backends)
-                    .map(|(c, b)| {
-                        let ready = backends.iter().find(|(k, _)| *k == b).map(|(_, r)| *r);
-                        (c, ready.expect("every routed backend was probed"))
-                    })
-                    .collect(),
-            );
+            .run_routed(routed);
         let keys = keep_cached.iter().chain(&out.new_incompressible);
         // The record follows the cache: a stale record only costs a re-check.
         match cache::store(&cache_path, keys) {
@@ -2499,7 +2487,7 @@ fn probe_backend(
             compress::probe_applesauce(d).map(|()| Backend::Applesauce)
         }),
     };
-    let config_dir = config_path.parent().unwrap_or(Path::new("."));
+    let config_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
     let mut r = probe(config_dir);
     let mut dir = config_dir.to_path_buf();
     if let Err(ProbeError::Setup(e)) = &r {
@@ -2576,14 +2564,14 @@ fn print_preview(
         .iter()
         .map(|c| (show(&c.path), human(c.size())))
         .collect();
-    let total: u64 = todo.iter().map(|c| c.size()).sum();
+    let total: u64 = todo.iter().map(walk::Candidate::size).sum();
     // Without -v: the totals and top roots only.
     if args.verbose {
         for line in preview_lines(&rows, width) {
-            let _ = writeln!(out, "{line}");
+            writeln!(out, "{line}").ok();
         }
         for s in skips {
-            let _ = writeln!(out, "{}   SKIP({}): {}", show(&s.path), s.kind, s.reason);
+            writeln!(out, "{}   SKIP({}): {}", show(&s.path), s.kind, s.reason).ok();
         }
     }
     let mut roots: HashMap<&Arc<Path>, u64> = HashMap::new();
@@ -2592,33 +2580,34 @@ fn print_preview(
     }
     let mut roots: Vec<_> = roots.into_iter().collect();
     roots.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
-    let _ = write!(out, "{}", preview_notes(inaccessible, refused, log));
-    let _ = writeln!(
+    write!(out, "{}", preview_notes(inaccessible, refused, log)).ok();
+    writeln!(
         out,
         "\nwould compress: {} files, {} ({} skipped)",
         todo.len(),
         human(total),
         skips.len()
-    );
+    )
+    .ok();
     if !roots.is_empty() {
-        let _ = writeln!(out, "top roots by size:");
+        writeln!(out, "top roots by size:").ok();
         for (root, bytes) in roots.iter().take(PREVIEW_TOP_ROOTS) {
-            let _ = writeln!(out, "  {:>10}  {}", human(*bytes), show(root));
+            writeln!(out, "  {:>10}  {}", human(*bytes), show(root)).ok();
         }
     }
-    let extra: String = args
-        .raw
-        .iter()
-        .map(|a| format!(" {}", shell_quote(a)))
-        .collect();
+    let extra = args.raw.iter().fold(String::new(), |mut s, a| {
+        write!(s, " {}", shell_quote(a)).ok();
+        s
+    });
     if !args.verbose && (!todo.is_empty() || !skips.is_empty()) {
-        let _ = writeln!(out, "Add -v to list every file (and why one is skipped).");
+        writeln!(out, "Add -v to list every file (and why one is skipped).").ok();
     }
-    let _ = write!(
+    write!(
         out,
         "{}",
         preview_hint(todo.len(), total, inaccessible, &extra)
-    );
+    )
+    .ok();
     print_painted(&out);
 }
 
@@ -2626,18 +2615,23 @@ fn print_preview(
 /// logged) and roots refused by the guard (by design, WARN logged), each on its own line. The
 /// note says where those lines are: "above" on stderr, or in `log` when they went only there.
 fn preview_notes(inaccessible: u64, refused: u64, log: Option<&Path>) -> String {
+    use std::fmt::Write as _;
     let at = log.map_or_else(|| "above".to_owned(), |p| format!("in {}", p.display()));
     let mut s = String::new();
     if inaccessible > 0 {
-        s += &format!(
+        write!(
+            s,
             "\n{inaccessible} root(s) not accessible (see ERROR {at}); files there are not \
              listed\n"
-        );
+        )
+        .ok();
     }
     if refused > 0 {
-        s += &format!(
+        write!(
+            s,
             "\n{refused} root(s) refused by the volume/protection guard (see WARN {at})\n"
-        );
+        )
+        .ok();
     }
     s
 }
@@ -2808,7 +2802,7 @@ mod tests {
     }
 
     fn parse(args: &[&str]) -> Result<Cli, String> {
-        parse_args(args.iter().map(|s| s.to_string()))
+        parse_args(args.iter().map(ToString::to_string))
     }
 
     fn compress(args: &[&str]) -> CompressArgs {
@@ -3018,7 +3012,7 @@ mod tests {
     #[test]
     fn second_lock_is_refused() {
         let dir = std::env::temp_dir().join(format!("acz-lock-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        fs::remove_dir_all(&dir).ok();
         let first = acquire_lock(&dir).unwrap();
         assert!(first.is_some());
         assert!(acquire_lock(&dir).unwrap().is_none());

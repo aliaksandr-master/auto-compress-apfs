@@ -1,33 +1,39 @@
 //! Thin FFI wrappers over libSystem and the BSD flag constants this tool relies on.
 
+#![expect(
+    unsafe_code,
+    reason = "the FFI home: every libSystem call std lacks is wrapped here, each with a SAFETY comment"
+)]
+
 use std::ffi::{CStr, CString, c_char, c_int, c_long, c_uint};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::mem::MaybeUninit;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 /// `st_flags`: file is stored with transparent (decmpfs) compression.
-pub const UF_COMPRESSED: u32 = 0x0000_0020;
+pub(crate) const UF_COMPRESSED: u32 = 0x0000_0020;
 /// `st_flags`: user immutable.
-pub const UF_IMMUTABLE: u32 = 0x0000_0002;
+pub(crate) const UF_IMMUTABLE: u32 = 0x0000_0002;
 /// `st_flags`: user append-only.
-pub const UF_APPEND: u32 = 0x0000_0004;
+pub(crate) const UF_APPEND: u32 = 0x0000_0004;
 /// `st_flags`: system immutable.
-pub const SF_IMMUTABLE: u32 = 0x0002_0000;
+pub(crate) const SF_IMMUTABLE: u32 = 0x0002_0000;
 /// `st_flags`: system append-only.
-pub const SF_APPEND: u32 = 0x0004_0000;
+pub(crate) const SF_APPEND: u32 = 0x0004_0000;
 /// `st_flags`: entitlement required for writing (SIP protected).
-pub const SF_RESTRICTED: u32 = 0x0008_0000;
+pub(crate) const SF_RESTRICTED: u32 = 0x0008_0000;
 /// `st_flags`: dataless file or directory (cloud placeholder); reading it downloads the data.
-pub const SF_DATALESS: u32 = 0x4000_0000;
+pub(crate) const SF_DATALESS: u32 = 0x4000_0000;
 /// Flags of files and directories this tool never touches.
-pub const PROTECTED_FLAGS: u32 =
+pub(crate) const PROTECTED_FLAGS: u32 =
     UF_IMMUTABLE | UF_APPEND | SF_IMMUTABLE | SF_APPEND | SF_RESTRICTED;
 /// `statfs.f_flags`: filesystem is stored locally.
-pub const MNT_LOCAL: u32 = 0x0000_1000;
+pub(crate) const MNT_LOCAL: u32 = 0x0000_1000;
 /// `open(2)`: fail instead of following a symlink in the last component.
-pub const O_NOFOLLOW: i32 = 0x0000_0100;
+pub(crate) const O_NOFOLLOW: i32 = 0x0000_0100;
 /// `renamex_np(2)`: atomically exchange the two paths.
 const RENAME_SWAP: c_uint = 0x0000_0002;
 /// `renamex_np` flag: fail with `EEXIST` instead of replacing an existing destination.
@@ -35,6 +41,10 @@ const RENAME_EXCL: c_uint = 0x0000_0004;
 /// `renamex_np` flag: fail instead of following a symlink in any component of either path.
 const RENAME_NOFOLLOW_ANY: c_uint = 0x0000_0010;
 
+#[expect(
+    clippy::struct_field_names,
+    reason = "mirrors the `tm_*` fields of the C `struct tm`"
+)]
 #[repr(C)]
 struct Tm {
     tm_sec: c_int,
@@ -51,6 +61,10 @@ struct Tm {
 }
 
 /// `struct statfs` of the 64-bit inode ABI (`<sys/mount.h>`).
+#[expect(
+    clippy::struct_field_names,
+    reason = "mirrors the `f_*` fields of the C `struct statfs`"
+)]
 #[repr(C)]
 struct Statfs {
     f_bsize: u32,
@@ -72,13 +86,23 @@ struct Statfs {
     f_reserved: [u32; 7],
 }
 
-const _: () = assert!(std::mem::size_of::<Statfs>() == 2168);
+const _: () = assert!(size_of::<Statfs>() == 2168);
 
 /// `setiopolicy_np(2)`: I/O policy type controlling materialization of dataless files.
 const IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES: c_int = 3;
 const IOPOL_SCOPE_PROCESS: c_int = 0;
 const IOPOL_MATERIALIZE_DATALESS_FILES_OFF: c_int = 1;
 
+#[expect(
+    clippy::unnecessary_safety_comment,
+    reason = "the SAFETY comment documents why these declarations match the C prototypes"
+)]
+// SAFETY: each declaration matches its libSystem prototype on 64-bit macOS (arm64 and x86_64):
+// `uid_t geteuid(void)` (geteuid(2), uid_t = u32); `struct tm *localtime_r(const time_t *,
+// struct tm *)` (localtime(3), time_t = i64); `int renamex_np(const char *, const char *,
+// unsigned int)` (rename(2)); `int statfs(const char *, struct statfs *)` (statfs(2)), bound to
+// `statfs$INODE64` on x86_64 and to the plain symbol on arm64, both the 64-bit inode layout of
+// `Statfs`; `int setiopolicy_np(int, int, int)` (setiopolicy_np(3)).
 unsafe extern "C" {
     fn geteuid() -> u32;
     fn localtime_r(clock: *const i64, result: *mut Tm) -> *mut Tm;
@@ -90,14 +114,14 @@ unsafe extern "C" {
 }
 
 /// Effective user id of this process.
-pub fn effective_uid() -> u32 {
+pub(crate) fn effective_uid() -> u32 {
     // SAFETY: geteuid takes no arguments, cannot fail and has no side effects.
     unsafe { geteuid() }
 }
 
 /// Broken-down local time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LocalTime {
+pub(crate) struct LocalTime {
     pub year: i32,
     pub month: u32,
     pub day: u32,
@@ -109,7 +133,7 @@ pub struct LocalTime {
 }
 
 /// Converts seconds since the Unix epoch to local time, `None` if libc cannot represent it.
-pub fn local_time(secs: i64) -> Option<LocalTime> {
+pub(crate) fn local_time(secs: i64) -> Option<LocalTime> {
     let mut tm = Tm {
         tm_sec: 0,
         tm_min: 0,
@@ -126,17 +150,17 @@ pub fn local_time(secs: i64) -> Option<LocalTime> {
     // SAFETY: both pointers refer to live, properly aligned locals for the duration of the call;
     // localtime_r is the reentrant variant and only writes into `tm`. `tm_zone` ends up pointing
     // into libc's static timezone data and is never dereferenced here.
-    let res = unsafe { localtime_r(&secs, &mut tm) };
+    let res = unsafe { localtime_r(&raw const secs, &raw mut tm) };
     if res.is_null() {
         return None;
     }
     Some(LocalTime {
         year: tm.tm_year + 1900,
-        month: (tm.tm_mon + 1) as u32,
-        day: tm.tm_mday as u32,
-        hour: tm.tm_hour as u32,
-        minute: tm.tm_min as u32,
-        second: tm.tm_sec as u32,
+        month: (tm.tm_mon + 1).cast_unsigned(),
+        day: tm.tm_mday.cast_unsigned(),
+        hour: tm.tm_hour.cast_unsigned(),
+        minute: tm.tm_min.cast_unsigned(),
+        second: tm.tm_sec.cast_unsigned(),
         gmtoff: tm.tm_gmtoff,
     })
 }
@@ -148,7 +172,7 @@ fn c_path(path: &Path) -> io::Result<CString> {
 
 /// Atomically exchanges the directory entries `a` and `b` (`renamex_np(a, b, RENAME_SWAP)`).
 /// Both must exist on the same filesystem.
-pub fn rename_swap(a: &Path, b: &Path) -> io::Result<()> {
+pub(crate) fn rename_swap(a: &Path, b: &Path) -> io::Result<()> {
     let a = c_path(a)?;
     let b = c_path(b)?;
     // SAFETY: `a` and `b` are valid NUL-terminated strings that outlive the call; renamex_np
@@ -164,7 +188,7 @@ pub fn rename_swap(a: &Path, b: &Path) -> io::Result<()> {
 /// Renames `from` to `to` unless `to` exists (`EEXIST` then), never following a symlink in any
 /// component of either path (`renamex_np(from, to, RENAME_EXCL | RENAME_NOFOLLOW_ANY)`); never
 /// replaces an entry. Both must be on the same filesystem.
-pub fn rename_excl(from: &Path, to: &Path) -> io::Result<()> {
+pub(crate) fn rename_excl(from: &Path, to: &Path) -> io::Result<()> {
     let a = c_path(from)?;
     let b = c_path(to)?;
     // SAFETY: `a` and `b` are valid NUL-terminated strings that outlive the call; renamex_np
@@ -180,7 +204,7 @@ pub fn rename_excl(from: &Path, to: &Path) -> io::Result<()> {
 /// Renames `from` to `to` unless `to` exists (`EEXIST` then); never replaces an entry
 /// (`renamex_np(from, to, RENAME_EXCL)`). Unlike [`rename_excl`] it follows symlinks in the
 /// leading components, as [`rename_swap`] does: for two names inside one staging dir of ours.
-pub fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+pub(crate) fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
     let a = c_path(from)?;
     let b = c_path(to)?;
     // SAFETY: `a` and `b` are valid NUL-terminated strings that outlive the call; renamex_np
@@ -194,7 +218,7 @@ pub fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
 }
 
 /// Names (as `chflags(1)` spells them) of the [`PROTECTED_FLAGS`] set in `flags`, comma separated.
-pub fn flag_names(flags: u32) -> String {
+pub(crate) fn flag_names(flags: u32) -> String {
     [
         (UF_IMMUTABLE, "uchg"),
         (UF_APPEND, "uappnd"),
@@ -211,7 +235,7 @@ pub fn flag_names(flags: u32) -> String {
 
 /// The parts of `statfs(2)` this tool uses.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FsInfo {
+pub(crate) struct FsInfo {
     /// Filesystem id (`f_fsid`), unique per mounted volume.
     pub fsid: [i32; 2],
     /// Mount flags (`f_flags`), e.g. [`MNT_LOCAL`].
@@ -228,23 +252,24 @@ pub struct FsInfo {
 fn c_chars(chars: &[c_char]) -> Vec<u8> {
     chars
         .iter()
-        .map(|&c| c as u8)
+        .map(|&c| c.cast_unsigned())
         .take_while(|&b| b != 0)
         .collect()
 }
 
 /// `statfs(2)` of the filesystem holding `path` (follows symlinks, never reads file data).
-pub fn statfs(path: &Path) -> io::Result<FsInfo> {
+pub(crate) fn statfs(path: &Path) -> io::Result<FsInfo> {
     let p = c_path(path)?;
-    // SAFETY: Statfs is plain old data (integers and char arrays); all-zero is a valid value.
-    let mut buf: Statfs = unsafe { std::mem::zeroed() };
-    // SAFETY: `p` is a valid NUL-terminated string and `buf` a live, properly aligned Statfs
-    // whose layout matches the 64-bit inode ABI of the linked symbol (size asserted above);
-    // statfs only writes into `buf` and does not retain either pointer.
-    let rc = unsafe { c_statfs(p.as_ptr(), &mut buf) };
+    let mut buf = MaybeUninit::<Statfs>::uninit();
+    // SAFETY: `p` is a valid NUL-terminated string and `buf` live, properly aligned storage for
+    // a Statfs whose layout matches the 64-bit inode ABI of the linked symbol (size asserted
+    // above); statfs only writes into `buf` and does not retain either pointer.
+    let rc = unsafe { c_statfs(p.as_ptr(), buf.as_mut_ptr()) };
     if rc != 0 {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: statfs returned 0, so it filled the whole struct.
+    let buf = unsafe { buf.assume_init() };
     Ok(FsInfo {
         fsid: buf.f_fsid,
         flags: buf.f_flags,
@@ -256,7 +281,7 @@ pub fn statfs(path: &Path) -> io::Result<FsInfo> {
 
 /// Turns off materialization of dataless (cloud placeholder) files for this process, so a read
 /// of such a file fails with `EDEADLK` instead of downloading it.
-pub fn disable_dataless_materialization() -> io::Result<()> {
+pub(crate) fn disable_dataless_materialization() -> io::Result<()> {
     // SAFETY: setiopolicy_np takes three integers, has no pointer arguments and only changes
     // the I/O policy of this process.
     let rc = unsafe {
@@ -274,13 +299,13 @@ pub fn disable_dataless_materialization() -> io::Result<()> {
 }
 
 /// Name of the resource fork xattr; a decmpfs file keeps its compressed blocks there.
-pub const RESOURCE_FORK: &CStr = c"com.apple.ResourceFork";
+pub(crate) const RESOURCE_FORK: &CStr = c"com.apple.ResourceFork";
 /// Name of the decmpfs header xattr of a transparently compressed file.
-pub const DECMPFS: &CStr = c"com.apple.decmpfs";
+pub(crate) const DECMPFS: &CStr = c"com.apple.decmpfs";
 /// `fcopyfile(3)`: copy the extended attributes.
-pub const COPYFILE_XATTR: u32 = libc::COPYFILE_XATTR;
+pub(crate) const COPYFILE_XATTR: u32 = libc::COPYFILE_XATTR;
 /// `fcopyfile(3)`: copy the access control list.
-pub const COPYFILE_ACL: u32 = libc::COPYFILE_ACL;
+pub(crate) const COPYFILE_ACL: u32 = libc::COPYFILE_ACL;
 
 fn check(rc: c_int) -> io::Result<()> {
     if rc == 0 {
@@ -301,7 +326,11 @@ fn xattr_opts(show_compression: bool) -> c_int {
 /// Length of the xattr `name` of `f`, `None` when it is not set. `show_compression` passes
 /// `XATTR_SHOWCOMPRESSION`, which makes the decmpfs and resource fork xattrs of a compressed
 /// file visible.
-pub fn fxattr_len(f: &File, name: &CStr, show_compression: bool) -> io::Result<Option<usize>> {
+pub(crate) fn fxattr_len(
+    f: &File,
+    name: &CStr,
+    show_compression: bool,
+) -> io::Result<Option<usize>> {
     // SAFETY: the fd is open for the lifetime of `f`, `name` is NUL-terminated; a null
     // buffer of size 0 asks only for the value length.
     let len = unsafe {
@@ -315,7 +344,7 @@ pub fn fxattr_len(f: &File, name: &CStr, show_compression: bool) -> io::Result<O
         )
     };
     if len >= 0 {
-        return Ok(Some(len as usize));
+        return Ok(Some(len.cast_unsigned()));
     }
     let e = io::Error::last_os_error();
     match e.raw_os_error() {
@@ -326,7 +355,11 @@ pub fn fxattr_len(f: &File, name: &CStr, show_compression: bool) -> io::Result<O
 
 /// Value of the xattr `name` of `f`, `None` when it is not set (`show_compression` as for
 /// [`fxattr_len`]).
-pub fn fget_xattr(f: &File, name: &CStr, show_compression: bool) -> io::Result<Option<Vec<u8>>> {
+pub(crate) fn fget_xattr(
+    f: &File,
+    name: &CStr,
+    show_compression: bool,
+) -> io::Result<Option<Vec<u8>>> {
     loop {
         let Some(len) = fxattr_len(f, name, show_compression)? else {
             return Ok(None);
@@ -345,13 +378,13 @@ pub fn fget_xattr(f: &File, name: &CStr, show_compression: bool) -> io::Result<O
             )
         };
         if got >= 0 {
-            buf.truncate(got as usize);
+            buf.truncate(got.cast_unsigned());
             return Ok(Some(buf));
         }
         let e = io::Error::last_os_error();
         match e.raw_os_error() {
             // Grew between the two calls: ask for the length again.
-            Some(libc::ERANGE) => continue,
+            Some(libc::ERANGE) => {}
             Some(libc::ENOATTR) => return Ok(None),
             _ => return Err(e),
         }
@@ -361,7 +394,12 @@ pub fn fget_xattr(f: &File, name: &CStr, show_compression: bool) -> io::Result<O
 /// Reads the xattr `name` of `f` from byte `position` into `buf` with
 /// `XATTR_SHOWCOMPRESSION` (only the resource fork takes a non-zero position); returns the
 /// bytes read, 0 at or past the end of the value.
-pub fn fget_xattr_at(f: &File, name: &CStr, buf: &mut [u8], position: u32) -> io::Result<usize> {
+pub(crate) fn fget_xattr_at(
+    f: &File,
+    name: &CStr,
+    buf: &mut [u8],
+    position: u32,
+) -> io::Result<usize> {
     // SAFETY: `buf` is a live allocation of `buf.len()` writable bytes, the fd is open for the
     // lifetime of `f` and `name` is NUL-terminated; fgetxattr writes at most `buf.len()` bytes
     // and retains no pointer.
@@ -376,7 +414,7 @@ pub fn fget_xattr_at(f: &File, name: &CStr, buf: &mut [u8], position: u32) -> io
         )
     };
     if got >= 0 {
-        return Ok(got as usize);
+        return Ok(got.cast_unsigned());
     }
     Err(io::Error::last_os_error())
 }
@@ -384,7 +422,7 @@ pub fn fget_xattr_at(f: &File, name: &CStr, buf: &mut [u8], position: u32) -> io
 /// Drops the cached pages of the first `len` bytes of `f`, so the next read decompresses
 /// from disk: a read-only shared mapping is `msync`ed with `MS_INVALIDATE`, then unmapped.
 /// A no-op for `len` 0.
-pub fn evict_cached(f: &File, len: u64) -> io::Result<()> {
+pub(crate) fn evict_cached(f: &File, len: u64) -> io::Result<()> {
     if len == 0 {
         return Ok(());
     }
@@ -413,7 +451,7 @@ pub fn evict_cached(f: &File, len: u64) -> io::Result<()> {
 
 /// Writes `value` into the xattr `name` of `f` at byte `position` (only the resource fork
 /// takes a non-zero position), with `XATTR_SHOWCOMPRESSION`.
-pub fn fset_xattr(f: &File, name: &CStr, value: &[u8], position: u32) -> io::Result<()> {
+pub(crate) fn fset_xattr(f: &File, name: &CStr, value: &[u8], position: u32) -> io::Result<()> {
     // SAFETY: the fd is open for the lifetime of `f`, `name` is NUL-terminated and `value` is
     // valid for `value.len()` bytes; fsetxattr only reads them and retains no pointer.
     check(unsafe {
@@ -431,7 +469,7 @@ pub fn fset_xattr(f: &File, name: &CStr, value: &[u8], position: u32) -> io::Res
 /// Creates the xattr `name` of `f` with `value` (`XATTR_CREATE`); an existing value is never
 /// replaced: `Ok(false)` when the xattr is already set. No `XATTR_NOFOLLOW`: fsetxattr rejects
 /// it with `EINVAL` (an fd has no path to follow; open it with `O_NOFOLLOW` instead).
-pub fn fset_xattr_new(f: &File, name: &CStr, value: &[u8]) -> io::Result<bool> {
+pub(crate) fn fset_xattr_new(f: &File, name: &CStr, value: &[u8]) -> io::Result<bool> {
     // SAFETY: the fd is open for the lifetime of `f`, `name` is NUL-terminated and `value` is
     // valid for `value.len()` bytes; fsetxattr only reads them and retains no pointer.
     let rc = unsafe {
@@ -453,7 +491,7 @@ pub fn fset_xattr_new(f: &File, name: &CStr, value: &[u8]) -> io::Result<bool> {
 
 /// Names of the xattrs of `f` as a plain listing shows them (no `XATTR_SHOWCOMPRESSION`: the
 /// decmpfs and resource fork xattrs of a compressed file are hidden).
-pub fn flist_xattr(f: &File) -> io::Result<Vec<CString>> {
+pub(crate) fn flist_xattr(f: &File) -> io::Result<Vec<CString>> {
     loop {
         // SAFETY: the fd is open for the lifetime of `f`; a null buffer of size 0 asks only
         // for the list length.
@@ -461,7 +499,7 @@ pub fn flist_xattr(f: &File) -> io::Result<Vec<CString>> {
         if len < 0 {
             return Err(io::Error::last_os_error());
         }
-        let mut buf = vec![0u8; len as usize];
+        let mut buf = vec![0u8; len.cast_unsigned()];
         // SAFETY: `buf` is a live allocation of `buf.len()` writable bytes; flistxattr writes
         // at most that many and does not retain the pointer.
         let got = unsafe { libc::flistxattr(f.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
@@ -472,24 +510,25 @@ pub fn flist_xattr(f: &File) -> io::Result<Vec<CString>> {
             }
             return Err(e);
         }
-        buf.truncate(got as usize);
+        buf.truncate(got.cast_unsigned());
         return Ok(buf
             .split(|&b| b == 0)
             .filter(|n| !n.is_empty())
-            .map(|n| CString::new(n).expect("split at NUL"))
+            // Never drops a name: a piece split at NUL holds no interior NUL.
+            .filter_map(|n| CString::new(n).ok())
             .collect());
     }
 }
 
 /// Sets the `st_flags` of `f` to `flags` (`fchflags(2)`).
-pub fn fchflags(f: &File, flags: u32) -> io::Result<()> {
+pub(crate) fn fchflags(f: &File, flags: u32) -> io::Result<()> {
     // SAFETY: the fd is open for the lifetime of `f`; fchflags takes no pointers.
     check(unsafe { libc::fchflags(f.as_raw_fd(), flags) })
 }
 
 /// Copies what `flags` ([`COPYFILE_XATTR`], [`COPYFILE_ACL`]) select from `src` to `dst`
 /// (`fcopyfile(3)` without state).
-pub fn fcopyfile(src: &File, dst: &File, flags: u32) -> io::Result<()> {
+pub(crate) fn fcopyfile(src: &File, dst: &File, flags: u32) -> io::Result<()> {
     // SAFETY: both fds are open for the lifetime of the borrows; a null state is allowed and
     // fcopyfile retains nothing.
     check(unsafe {
@@ -508,7 +547,7 @@ const CLONE_NOFOLLOW: u32 = 0x0001;
 /// Creates `name` (one path component, must not exist) in the directory `dir` as an APFS
 /// clone of `src`: its own inode sharing `src`'s data blocks, with `src`'s mode, flags,
 /// extended attributes and ACL (`fclonefileat(2)` with `CLONE_NOFOLLOW`).
-pub fn fclone_at(src: &File, dir: &File, name: &CStr) -> io::Result<()> {
+pub(crate) fn fclone_at(src: &File, dir: &File, name: &CStr) -> io::Result<()> {
     // SAFETY: both fds are open for the lifetime of the borrows and `name` is NUL-terminated;
     // fclonefileat retains no pointer.
     check(unsafe {
@@ -523,7 +562,7 @@ pub fn fclone_at(src: &File, dir: &File, name: &CStr) -> io::Result<()> {
 
 /// What [`fclone_info`] reads with `fgetattrlist(2)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CloneInfo {
+pub(crate) struct CloneInfo {
     /// `ATTR_CMNEXT_CLONEID`: equal for files that are clones of each other; `None` when the
     /// filesystem does not report it.
     pub clone_id: Option<u64>,
@@ -535,7 +574,7 @@ pub struct CloneInfo {
 
 /// The clone id, private size and ACL presence of `f` (`fgetattrlist(2)` with
 /// `FSOPT_PACK_INVAL_ATTRS`, so the fixed layout holds whatever the filesystem reports).
-pub fn fclone_info(f: &File) -> io::Result<CloneInfo> {
+pub(crate) fn fclone_info(f: &File) -> io::Result<CloneInfo> {
     let mut req = libc::attrlist {
         bitmapcount: libc::ATTR_BIT_MAP_COUNT,
         reserved: 0,
@@ -561,8 +600,17 @@ pub fn fclone_info(f: &File) -> io::Result<CloneInfo> {
             libc::FSOPT_PACK_INVAL_ATTRS | libc::FSOPT_ATTR_CMN_EXTENDED,
         )
     })?;
-    let u32_at = |o: usize| u32::from_ne_bytes(buf[o..o + 4].try_into().expect("4 bytes"));
-    let u64_at = |o: usize| u64::from_ne_bytes(buf[o..o + 8].try_into().expect("8 bytes"));
+    // Constant offsets inside the fixed buffer; the slice index panics on a layout bug.
+    let u32_at = |o: usize| {
+        let mut b = [0u8; 4];
+        b.copy_from_slice(&buf[o..o + 4]);
+        u32::from_ne_bytes(b)
+    };
+    let u64_at = |o: usize| {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&buf[o..o + 8]);
+        u64::from_ne_bytes(b)
+    };
     let (common, fork) = (u32_at(4), u32_at(20));
     let valid = |set: u32, bit: u32| set & bit != 0;
     Ok(CloneInfo {
@@ -575,7 +623,7 @@ pub fn fclone_info(f: &File) -> io::Result<CloneInfo> {
 /// The resource fork of a file as a seekable byte stream: every write is an
 /// [`fset_xattr`] of [`RESOURCE_FORK`] at the current position. Positions beyond `u32::MAX`
 /// are errors (the xattr position is 32-bit). The fork is assumed absent when created.
-pub struct RforkWriter<'a> {
+pub(crate) struct RforkWriter<'a> {
     file: &'a File,
     pos: u64,
     /// Bytes written so far up to the furthest end (the fork length).
@@ -583,7 +631,7 @@ pub struct RforkWriter<'a> {
 }
 
 impl<'a> RforkWriter<'a> {
-    pub fn new(file: &'a File) -> Self {
+    pub(crate) fn new(file: &'a File) -> Self {
         Self {
             file,
             pos: 0,
@@ -605,7 +653,12 @@ impl Write for RforkWriter<'_> {
         if end > u64::from(u32::MAX) {
             return Err(too_far());
         }
-        fset_xattr(self.file, RESOURCE_FORK, buf, self.pos as u32)?;
+        fset_xattr(
+            self.file,
+            RESOURCE_FORK,
+            buf,
+            u32::try_from(self.pos).map_err(|_| too_far())?,
+        )?;
         self.pos = end;
         self.len = self.len.max(end);
         Ok(buf.len())
@@ -624,7 +677,7 @@ impl Seek for RforkWriter<'_> {
             SeekFrom::End(d) => self.len.checked_add_signed(d),
         };
         match pos {
-            Some(p) if p <= u64::from(u32::MAX) => {
+            Some(p) if u32::try_from(p).is_ok() => {
                 self.pos = p;
                 Ok(p)
             }
@@ -640,7 +693,7 @@ impl Seek for RforkWriter<'_> {
 /// The resource fork of a file as a seekable read stream, the counterpart of
 /// [`RforkWriter`]: reads are [`fget_xattr_at`] of [`RESOURCE_FORK`] refilling a 1 MiB
 /// buffer. The fork length is taken when created; positions beyond `u32::MAX` are errors.
-pub struct RforkReader<'a> {
+pub(crate) struct RforkReader<'a> {
     file: &'a File,
     pos: u64,
     len: u64,
@@ -654,7 +707,7 @@ const RFORK_READ_BUF: usize = 1 << 20;
 
 impl<'a> RforkReader<'a> {
     /// A reader at position 0; an absent fork reads as empty.
-    pub fn new(file: &'a File) -> io::Result<Self> {
+    pub(crate) fn new(file: &'a File) -> io::Result<Self> {
         let len = fxattr_len(file, RESOURCE_FORK, true)?.unwrap_or(0) as u64;
         Ok(Self {
             file,
@@ -668,7 +721,7 @@ impl<'a> RforkReader<'a> {
 
     /// A reader of no bytes that never calls into the kernel nor allocates its buffer: the
     /// stand-in for data stored inline in the decmpfs xattr.
-    pub fn empty(file: &'a File) -> Self {
+    pub(crate) fn empty(file: &'a File) -> Self {
         Self {
             file,
             pos: 0,
@@ -695,6 +748,10 @@ impl Read for RforkReader<'_> {
                 return Ok(0);
             }
         }
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "pos - buf_start < buf_len, a usize"
+        )]
         let at = (self.pos - self.buf_start) as usize;
         let n = out.len().min(self.buf_len - at);
         out[..n].copy_from_slice(&self.buf[at..at + n]);
@@ -711,7 +768,7 @@ impl Seek for RforkReader<'_> {
             SeekFrom::End(d) => self.len.checked_add_signed(d),
         };
         match pos {
-            Some(p) if p <= u64::from(u32::MAX) => {
+            Some(p) if u32::try_from(p).is_ok() => {
                 self.pos = p;
                 Ok(p)
             }
@@ -739,7 +796,7 @@ mod tests {
     #[test]
     fn rename_swap_exchanges_files() {
         let dir = std::env::temp_dir().join(format!("acz-sys-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
         let (a, b) = (dir.join("a"), dir.join("b"));
         std::fs::write(&a, "A").unwrap();
@@ -754,7 +811,7 @@ mod tests {
     #[test]
     fn clone_shares_clone_id_and_acl_is_seen() {
         let dir = std::env::temp_dir().join(format!("acz-sys-clone-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
         let a = dir.join("a");
         std::fs::write(&a, vec![7u8; 200_000]).unwrap();
@@ -823,7 +880,7 @@ mod tests {
     #[test]
     fn xattr_wrappers_round_trip() {
         let dir = std::env::temp_dir().join(format!("acz-sys-xattr-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
         let (a, b) = (dir.join("a"), dir.join("b"));
         std::fs::write(&a, "A").unwrap();
@@ -857,7 +914,7 @@ mod tests {
     #[test]
     fn rfork_writer_gap_seek_and_overwrite() {
         let dir = std::env::temp_dir().join(format!("acz-sys-rfork-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("f");
         std::fs::write(&p, "").unwrap();
@@ -882,9 +939,14 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "test: a fork of a few KiB; i % 251 fits a byte"
+    )]
     fn rfork_reader_seeks_and_ends() {
         let dir = std::env::temp_dir().join(format!("acz-sys-rfork-r-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("f");
         std::fs::write(&p, "").unwrap();

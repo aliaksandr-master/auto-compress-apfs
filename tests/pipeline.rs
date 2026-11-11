@@ -1,6 +1,20 @@
 //! End-to-end runs of the binary on temp trees (APFS under `std::env::temp_dir()`) with a
 //! temporary `HOME`; `chflags uchg` and mode-000 dirs are undone on drop, also on failure.
 
+#![expect(
+    clippy::unwrap_used,
+    reason = "test helpers outside #[test] fns: a failed setup step should panic"
+)]
+#![expect(
+    clippy::string_add,
+    clippy::format_collect,
+    clippy::many_single_char_names,
+    clippy::case_sensitive_file_extension_comparisons,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    reason = "test code: configs joined with `+`, short fixture names, byte/second fixture casts"
+)]
+
 use std::collections::HashMap;
 use std::fs::{self, Metadata};
 use std::os::macos::fs::MetadataExt as _;
@@ -49,16 +63,17 @@ fn force_remove(dir: &Path) {
         return;
     }
     let run = |cmd: &str, args: &[&str]| {
-        let _ = Command::new(cmd)
+        Command::new(cmd)
             .args(args)
             .arg(dir)
             .stderr(std::process::Stdio::null())
-            .status();
+            .status()
+            .ok();
     };
     run("/bin/chmod", &["-R", "u+rwx"]);
     run("/usr/bin/chflags", &["-R", "nouchg"]);
     run("/bin/chmod", &["-R", "u+rwx"]);
-    let _ = fs::remove_dir_all(dir);
+    fs::remove_dir_all(dir).ok();
 }
 
 fn summary_of(log: &str) -> HashMap<String, String> {
@@ -102,7 +117,7 @@ impl Env {
         }
     }
 
-    /// Runs the binary with `args` (default config under the temp HOME); `day` sets ACZ_TODAY.
+    /// Runs the binary with `args` (default config under the temp HOME); `day` sets `ACZ_TODAY`.
     fn exec(&self, args: &[&str], day: Option<&str>) -> std::process::Output {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_auto-compress-apfs"));
         cmd.args(args)
@@ -1448,7 +1463,7 @@ fn clean_lists_and_removes_leftovers() {
     for kept in [
         venv.join(".acz-rescue-x"),
         venv.join(".acz-staging-1-2-3"),
-        outside.clone(),
+        outside,
         venv.join("a.txt"),
     ] {
         assert!(kept.exists(), "{} removed", kept.display());
@@ -1940,7 +1955,7 @@ fn dedup_preview_run_modes_and_apply() {
     // a2 is the oldest: the reference.
     backdate(&a2);
     // Same size, different content.
-    let mut other = data.clone();
+    let mut other = data;
     other[600_000] ^= 1;
     fs::write(dir.join("b1"), &other).unwrap();
     other[600_001] ^= 1;
@@ -2137,7 +2152,7 @@ fn dedup_preview_run_modes_and_apply() {
     );
 }
 
-/// The key/values of the last dedup_summary line.
+/// The key/values of the last `dedup_summary` line.
 fn dedup_kv(log: &str) -> HashMap<String, String> {
     dedup_summary(log)
         .split(' ')

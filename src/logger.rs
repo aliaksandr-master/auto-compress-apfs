@@ -12,12 +12,12 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const LOG_NAME: &str = "auto-compress-apfs.log";
+pub(crate) const LOG_NAME: &str = "auto-compress-apfs.log";
 /// File a service manager may redirect stdout/stderr into.
-pub const LAUNCHD_LOG_NAME: &str = "launchd.log";
+pub(crate) const LAUNCHD_LOG_NAME: &str = "launchd.log";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Level {
+pub(crate) enum Level {
     Error,
     Warn,
     Info,
@@ -43,7 +43,7 @@ struct Inner {
     progress: Option<Progress>,
 }
 
-pub struct Logger {
+pub(crate) struct Logger {
     inner: Mutex<Inner>,
     path: PathBuf,
     max_bytes: u64,
@@ -57,7 +57,7 @@ pub struct Logger {
 
 impl Logger {
     /// Opens (appends to) `<dir>/auto-compress-apfs.log`, creating `dir` if needed.
-    pub fn open(dir: &Path, max_bytes: u64, keep: u32, verbose: bool) -> io::Result<Self> {
+    pub(crate) fn open(dir: &Path, max_bytes: u64, keep: u32, verbose: bool) -> io::Result<Self> {
         fs::create_dir_all(dir)?;
         let path = dir.join(LOG_NAME);
         let file = open_append(&path)?;
@@ -78,14 +78,18 @@ impl Logger {
     }
 
     /// Starts interactive progress on stderr (scan phase).
-    pub fn enable_progress(&self, progress: Progress) {
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "the progress flag is set under the lock that installs the progress"
+    )]
+    pub(crate) fn enable_progress(&self, progress: Progress) {
         let mut inner = self.lock();
         inner.progress = Some(progress);
         self.progress_on.store(true, Ordering::Relaxed);
     }
 
     /// Clears the progress line, prints `final_line` in its place (if any) and stops progress.
-    pub fn finish_progress(&self, final_line: Option<&str>) {
+    pub(crate) fn finish_progress(&self, final_line: Option<&str>) {
         if !self.progress_on.swap(false, Ordering::Relaxed) {
             return;
         }
@@ -94,13 +98,13 @@ impl Logger {
             let mut err = io::stderr().lock();
             p.clear(&mut err);
             if let Some(line) = final_line {
-                let _ = writeln!(err, "{line}");
+                writeln!(err, "{line}").ok();
             }
         }
     }
 
     /// `n` more files found by the walk.
-    pub fn scan_found(&self, n: u64) {
+    pub(crate) fn scan_found(&self, n: u64) {
         self.with_progress(|p, err| {
             p.scan_found(n);
             p.draw(err, false);
@@ -108,7 +112,7 @@ impl Logger {
     }
 
     /// Switches the progress line to the compress phase.
-    pub fn start_compress(&self, files: u64, bytes: u64) {
+    pub(crate) fn start_compress(&self, files: u64, bytes: u64) {
         self.with_progress(|p, err| {
             p.start_compress(files, bytes);
             p.draw(err, true);
@@ -116,7 +120,7 @@ impl Logger {
     }
 
     /// One file of the compress phase is finished (any outcome).
-    pub fn advance(&self, bytes: u64) {
+    pub(crate) fn advance(&self, bytes: u64) {
         self.with_progress(|p, err| {
             p.advance(bytes);
             p.draw(err, false);
@@ -124,7 +128,7 @@ impl Logger {
     }
 
     /// `files` files of `bytes` of the compress phase are finished.
-    pub fn advance_by(&self, files: u64, bytes: u64) {
+    pub(crate) fn advance_by(&self, files: u64, bytes: u64) {
         self.with_progress(|p, err| {
             p.advance_by(files, bytes);
             p.draw(err, false);
@@ -143,7 +147,13 @@ impl Logger {
 
     /// Logs one per-file outcome at `level` and, with progress enabled, prints its terminal line.
     /// The log line is `compressed <path> <size> -> <after>` or `<path>: <msg>`.
-    pub fn file_event(&self, level: Level, path: &Path, ev: FileEvent<'_>, msg: impl fmt::Display) {
+    pub(crate) fn file_event(
+        &self,
+        level: Level,
+        path: &Path,
+        ev: FileEvent<'_>,
+        msg: impl fmt::Display,
+    ) {
         if !self.wanted(level) {
             return;
         }
@@ -164,26 +174,28 @@ impl Logger {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    pub fn error(&self, msg: impl fmt::Display) {
+    pub(crate) fn error(&self, msg: impl fmt::Display) {
         self.log(Level::Error, msg);
     }
 
-    pub fn warn(&self, msg: impl fmt::Display) {
+    pub(crate) fn warn(&self, msg: impl fmt::Display) {
         self.log(Level::Warn, msg);
     }
 
-    pub fn info(&self, msg: impl fmt::Display) {
+    pub(crate) fn info(&self, msg: impl fmt::Display) {
         self.log(Level::Info, msg);
     }
 
-    pub fn debug(&self, msg: impl fmt::Display) {
+    pub(crate) fn debug(&self, msg: impl fmt::Display) {
         self.log(Level::Debug, msg);
     }
 
-    pub fn enabled(&self, level: Level) -> bool {
+    pub(crate) fn enabled(&self, level: Level) -> bool {
         level != Level::Debug || self.verbose
     }
 
@@ -194,7 +206,7 @@ impl Logger {
 
     /// Writes one line. The first I/O error of the run is reported on stderr, the rest are
     /// ignored: logging must never abort the run.
-    pub fn log(&self, level: Level, msg: impl fmt::Display) {
+    pub(crate) fn log(&self, level: Level, msg: impl fmt::Display) {
         if !self.wanted(level) {
             return;
         }
@@ -208,6 +220,10 @@ impl Logger {
 
     /// Writes `text` as a log line (when `level` is enabled) and lets `on_tty` draw on the
     /// terminal when progress is on; `-v` mirrors the log line to stderr instead.
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "the terminal line and the log line are written under one lock"
+    )]
     fn write(
         &self,
         level: Level,
@@ -286,11 +302,11 @@ impl Logger {
     }
 
     /// The current log file.
-    pub fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.path
     }
 
-    pub fn flush(&self) {
+    pub(crate) fn flush(&self) {
         let mut inner = self.lock();
         if let Err(e) = inner.out.flush() {
             self.report_io_error(&e);
@@ -309,7 +325,7 @@ fn open_append(path: &Path) -> io::Result<File> {
 }
 
 /// Truncates `<dir>/launchd.log` to zero when it is larger than `max`. Returns whether it did.
-pub fn truncate_launchd_log(dir: &Path, max: u64) -> io::Result<bool> {
+pub(crate) fn truncate_launchd_log(dir: &Path, max: u64) -> io::Result<bool> {
     let path = dir.join(LAUNCHD_LOG_NAME);
     match fs::metadata(&path) {
         Ok(m) if m.len() > max => {
@@ -323,9 +339,9 @@ pub fn truncate_launchd_log(dir: &Path, max: u64) -> io::Result<bool> {
 }
 
 /// `YYYY-MM-DDTHH:MM:SS.mmm+HH:MM` in local time.
-pub fn timestamp(t: SystemTime) -> String {
+pub(crate) fn timestamp(t: SystemTime) -> String {
     let d = t.duration_since(UNIX_EPOCH).unwrap_or_default();
-    let secs = d.as_secs() as i64;
+    let secs = d.as_secs().cast_signed();
     let millis = d.subsec_millis();
     let Some(lt) = sys::local_time(secs) else {
         return format!("@{secs}.{millis:03}");
@@ -351,7 +367,7 @@ mod tests {
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("acz-log-{tag}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        fs::remove_dir_all(&dir).ok();
         dir
     }
 

@@ -6,14 +6,14 @@ use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
 
-pub const CACHE_NAME: &str = "incompressible.tsv";
+pub(crate) const CACHE_NAME: &str = "incompressible.tsv";
 /// Next to the cache: the ditto options that filled it, on one line.
-pub const ARGS_NAME: &str = "ditto-args.txt";
+pub(crate) const ARGS_NAME: &str = "ditto-args.txt";
 
 /// Whether the cache was filled by ditto with options other than `args`, per the record at
 /// `path`. Without a record the cache is trusted only for `--hfsCompression` alone: before the
 /// record existed, macOS 27 ditto compressed nothing with it and every file was cached.
-pub fn filled_with_other_args(path: &Path, args: &[&str]) -> bool {
+pub(crate) fn filled_with_other_args(path: &Path, args: &[&str]) -> bool {
     match fs::read_to_string(path) {
         Ok(text) => text.trim_end() != args.join(" "),
         Err(e) if e.kind() == io::ErrorKind::NotFound => args != ["--hfsCompression"],
@@ -22,12 +22,12 @@ pub fn filled_with_other_args(path: &Path, args: &[&str]) -> bool {
 }
 
 /// Atomically records `args` as the options that filled the cache.
-pub fn store_args(path: &Path, args: &[&str]) -> io::Result<()> {
+pub(crate) fn store_args(path: &Path, args: &[&str]) -> io::Result<()> {
     write_atomic(path, |w| writeln!(w, "{}", args.join(" ")))
 }
 
 /// Parses cache text; malformed lines are ignored.
-pub fn parse(text: &str) -> HashSet<FileKey> {
+pub(crate) fn parse(text: &str) -> HashSet<FileKey> {
     text.lines().filter_map(parse_line).collect()
 }
 
@@ -44,7 +44,7 @@ fn parse_line(line: &str) -> Option<FileKey> {
 }
 
 /// Loads the cache; a missing file is an empty cache.
-pub fn load(path: &Path) -> io::Result<HashSet<FileKey>> {
+pub(crate) fn load(path: &Path) -> io::Result<HashSet<FileKey>> {
     match fs::read_to_string(path) {
         Ok(text) => Ok(parse(&text)),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(HashSet::new()),
@@ -53,7 +53,10 @@ pub fn load(path: &Path) -> io::Result<HashSet<FileKey>> {
 }
 
 /// Atomically replaces the cache with `keys` (write to a temp file, then rename).
-pub fn store<'a>(path: &Path, keys: impl IntoIterator<Item = &'a FileKey>) -> io::Result<()> {
+pub(crate) fn store<'a>(
+    path: &Path,
+    keys: impl IntoIterator<Item = &'a FileKey>,
+) -> io::Result<()> {
     write_atomic(path, |w| {
         for k in keys {
             writeln!(
@@ -69,7 +72,7 @@ pub fn store<'a>(path: &Path, keys: impl IntoIterator<Item = &'a FileKey>) -> io
 /// Atomically replaces `path`: `fill` streams the new content into `<path>.tmp.<pid>`, which is
 /// synced to disk and then renamed over `path` (parent dirs are created). On any error the temp
 /// file is removed.
-pub fn write_atomic(
+pub(crate) fn write_atomic(
     path: &Path,
     fill: impl FnOnce(&mut BufWriter<File>) -> io::Result<()>,
 ) -> io::Result<()> {
@@ -88,7 +91,7 @@ pub fn write_atomic(
     written
         .and_then(|()| fs::rename(&tmp, path))
         .inspect_err(|_| {
-            let _ = fs::remove_file(&tmp);
+            fs::remove_file(&tmp).ok();
         })
 }
 
@@ -99,7 +102,7 @@ mod tests {
     #[test]
     fn args_record_decides_whether_the_cache_is_trusted() {
         let dir = std::env::temp_dir().join(format!("acz-cache-args-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        fs::remove_dir_all(&dir).ok();
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join(ARGS_NAME);
         // No record (a cache from before it existed): trusted only for `--hfsCompression`.
@@ -122,7 +125,7 @@ mod tests {
     #[test]
     fn roundtrip_with_corrupt_lines() {
         let dir = std::env::temp_dir().join(format!("acz-cache-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        fs::remove_dir_all(&dir).ok();
         let path = dir.join("state").join(CACHE_NAME);
         assert!(load(&path).unwrap().is_empty());
         let keys = [

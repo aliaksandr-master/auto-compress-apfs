@@ -25,7 +25,7 @@ use std::time::{Duration, SystemTime};
 const CACHEDIR_SIGNATURE: &str = "Signature: 8a477f597d28d172789f06886806bc55";
 
 /// Whether `dir` holds the `CACHEDIR.TAG` Cargo writes into a target directory.
-pub fn is_cargo_target(dir: &Path) -> bool {
+pub(crate) fn is_cargo_target(dir: &Path) -> bool {
     let Ok(f) = File::open(dir.join("CACHEDIR.TAG")) else {
         return false;
     };
@@ -55,7 +55,7 @@ fn child_dirs(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Profile directories of a target: those holding `.fingerprint`, one or two levels down.
-pub fn profile_dirs(target: &Path) -> Vec<PathBuf> {
+pub(crate) fn profile_dirs(target: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for d in child_dirs(target) {
         if is_real_dir(&d.join(".fingerprint")) {
@@ -76,7 +76,7 @@ const LOCK_NAMES: [&str; 3] = [".cargo-lock", ".cargo-build-lock", ".cargo-artif
 
 /// Takes every Cargo lock file present in a profile without waiting. `Err`: another process
 /// holds one, one cannot be opened, or there is none (not a profile Cargo built).
-pub fn lock_profile(profile: &Path) -> Result<Vec<File>, String> {
+pub(crate) fn lock_profile(profile: &Path) -> Result<Vec<File>, String> {
     let mut held = Vec::new();
     for name in LOCK_NAMES {
         let path = profile.join(name);
@@ -252,6 +252,10 @@ struct Unit {
 
 /// Adds the units of one profile to `units`; returns its `deps` entries whose hash names no
 /// unit there.
+#[expect(
+    clippy::case_sensitive_file_extension_comparisons,
+    reason = "cargo names its fingerprint json files with a lowercase `.json`"
+)]
 fn profile_units(
     profile: &Path,
     keep_all: bool,
@@ -302,7 +306,7 @@ fn profile_units(
 /// Which final artifacts `cargo-clean` keeps whatever their age: those of the `debug` (dev)
 /// and the `release` profile. Other profiles' final artifacts always stay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct KeepFinal {
+pub(crate) struct KeepFinal {
     pub debug: bool,
     pub release: bool,
 }
@@ -346,7 +350,7 @@ fn stale_finals(profile: &Path, cutoff: SystemTime) -> Vec<PathBuf> {
 /// of `deps` entries) stay unless `keep` allows them to go; those not used since `cutoff` are
 /// then listed too.
 /// `Err` when a kept unit's dependencies cannot be read: then nothing is listed.
-pub fn stale_entries(
+pub(crate) fn stale_entries(
     profiles: &[(PathBuf, bool)],
     cutoff: SystemTime,
     keep: KeepFinal,
@@ -404,7 +408,7 @@ pub fn stale_entries(
 }
 
 /// A walk entry for `p` (lstat), for the checks of `remove::plan`.
-pub fn matched(p: PathBuf) -> Option<Matched> {
+pub(crate) fn matched(p: PathBuf) -> Option<Matched> {
     let m = fs::symlink_metadata(&p).ok()?;
     if m.file_type().is_symlink() {
         return None;
@@ -418,7 +422,7 @@ pub fn matched(p: PathBuf) -> Option<Matched> {
 }
 
 /// One matched target directory: its stale entries, or why it is skipped.
-pub struct Target {
+pub(crate) struct Target {
     pub root: PathBuf,
     pub rule: String,
     pub entries: Vec<PathBuf>,
@@ -479,7 +483,7 @@ fn workspace_root(manifest: &Path) -> Option<PathBuf> {
 /// once, with the manifest that named it: `build.target-dir` (default `<workspace>/target`) and
 /// `build.build-dir` of the Cargo config. Only directories carrying Cargo's `CACHEDIR.TAG` are
 /// kept.
-pub fn target_dirs(manifests: &[PathBuf], home: &Path) -> Vec<(PathBuf, String)> {
+pub(crate) fn target_dirs(manifests: &[PathBuf], home: &Path) -> Vec<(PathBuf, String)> {
     let mut out: Vec<(PathBuf, String)> = Vec::new();
     for m in manifests {
         let Some(ws) = workspace_root(m) else {
@@ -524,7 +528,7 @@ fn excluded_at_or_above(p: &Path, matcher: &Matcher) -> bool {
 
 /// Collects the stale entries (not used for `max_age_secs`) of every target directory; entries
 /// an exclude matches are left out.
-pub fn collect(
+pub(crate) fn collect(
     targets: Vec<(PathBuf, String)>,
     matcher: &Matcher,
     max_age_secs: u64,
@@ -603,7 +607,7 @@ mod tests {
     struct Tmp(PathBuf);
     impl Drop for Tmp {
         fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
+            fs::remove_dir_all(&self.0).ok();
         }
     }
 
@@ -613,7 +617,7 @@ mod tests {
             std::process::id(),
             std::thread::current().id()
         ));
-        let _ = fs::remove_dir_all(&d);
+        fs::remove_dir_all(&d).ok();
         fs::create_dir_all(&d).unwrap();
         Tmp(d)
     }
@@ -762,7 +766,7 @@ mod tests {
         // Used now: the whole unit `a` stays.
         file(&p.join("deps/liba-0123456789abcdef.rmeta"));
         let cutoff = SystemTime::now() - Duration::from_secs(30 * 86_400);
-        let got = stale_entries(&[(p.clone(), false)], cutoff, KEEP).unwrap();
+        let got = stale_entries(&[(p, false)], cutoff, KEEP).unwrap();
         assert!(
             !got.iter()
                 .any(|x| x.to_string_lossy().contains("0123456789abcdef"))
@@ -878,6 +882,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::format_collect, reason = "test fixture: a hex fingerprint")]
     fn a_dependency_of_a_fresh_unit_stays() {
         let d = tmp("graph");
         let t = target(&d.0);
@@ -901,7 +906,7 @@ mod tests {
         );
         // An unparseable JSON of a fresh unit: nothing of the profile is listed.
         fs::write(p.join(".fingerprint/b-fedcba9876543210/lib-b.json"), "{").unwrap();
-        assert!(stale_entries(&[(p.clone(), false)], cutoff(), KEEP).is_err());
+        assert!(stale_entries(&[(p, false)], cutoff(), KEEP).is_err());
     }
 
     #[test]
@@ -957,6 +962,11 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::format_collect,
+        clippy::many_single_char_names,
+        reason = "test fixture: a hex fingerprint and short path names"
+    )]
     fn the_graph_spans_the_profiles_of_a_target() {
         let d = tmp("cross");
         let t = target(&d.0);

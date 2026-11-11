@@ -11,10 +11,10 @@ const S_ISGID: u32 = 0o2000;
 /// Largest file ditto compresses. Measured on current macOS: `ditto --hfsCompression` leaves
 /// files larger than this uncompressed, and ditto has no option to change it; a ditto range
 /// of the routing may not go above it (applesauce ranges may).
-pub const MAX_SIZE: u64 = 512 << 20;
+pub(crate) const MAX_SIZE: u64 = 512 << 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Class {
+pub(crate) enum Class {
     AlreadyCompressed,
     /// uchg/uappnd/schg/sappnd/restricted set (the protected bits of the flags); never touched.
     Flagged(u32),
@@ -37,7 +37,7 @@ pub enum Class {
     Compress(Backend),
 }
 
-pub struct Rules<'a> {
+pub(crate) struct Rules<'a> {
     pub euid: u32,
     /// Which backend compresses which sizes ([`config::Config::routing`]).
     pub routing: &'a [SizeRange],
@@ -48,12 +48,12 @@ pub struct Rules<'a> {
 
 /// The `TooSmall` test of `Rules::classify`, with the flag checks that come before it: the
 /// walk uses it to count such files without keeping them.
-pub fn too_small(flags: u32, size: u64, min_size: u64) -> bool {
+pub(crate) fn too_small(flags: u32, size: u64, min_size: u64) -> bool {
     flags & (UF_COMPRESSED | PROTECTED_FLAGS | SF_DATALESS) == 0 && size < min_size
 }
 
 impl Rules<'_> {
-    pub fn classify(&self, c: &Candidate) -> Class {
+    pub(crate) fn classify(&self, c: &Candidate) -> Class {
         if c.flags & UF_COMPRESSED != 0 {
             Class::AlreadyCompressed
         } else if c.flags & PROTECTED_FLAGS != 0 {
@@ -110,7 +110,7 @@ mod tests {
             atime_sec: 0,
             atime_nsec: 0,
             blocks: 8,
-            mode: 0o100644,
+            mode: 0o100_644,
             nlink: 1,
             uid: 501,
             gid: 20,
@@ -203,7 +203,7 @@ mod tests {
             c.flags = SF_RESTRICTED;
             out.push(r.classify(&c));
             let mut c = cand();
-            c.mode = 0o104755;
+            c.mode = 0o104_755;
             out.push(r.classify(&c));
             let mut c = cand();
             c.key.mtime_sec = 2001;

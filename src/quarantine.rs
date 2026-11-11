@@ -12,7 +12,7 @@ use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-pub const QUARANTINE_NAME: &str = "quarantine.txt";
+pub(crate) const QUARANTINE_NAME: &str = "quarantine.txt";
 
 const HEADER: &str = "\
 # auto-compress-apfs quarantine: files that kept being rewritten on several consecutive run
@@ -24,7 +24,7 @@ const HEADER: &str = "\
 ";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Entry {
+pub(crate) struct Entry {
     /// When the file was quarantined (empty for lines added by hand without one).
     pub stamp: String,
     pub path: PathBuf,
@@ -63,19 +63,19 @@ fn lines(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
 }
 
 /// Entries in file order; a missing file is an empty quarantine.
-pub fn load(file: &Path) -> io::Result<Vec<Entry>> {
+pub(crate) fn load(file: &Path) -> io::Result<Vec<Entry>> {
     Ok(read(file)?
         .map(|b| lines(&b).filter_map(parse_line).collect())
         .unwrap_or_default())
 }
 
-pub fn paths(entries: &[Entry]) -> HashSet<PathBuf> {
+pub(crate) fn paths(entries: &[Entry]) -> HashSet<PathBuf> {
     entries.iter().map(|e| e.path.clone()).collect()
 }
 
 /// Appends `new` entries not listed yet, re-reading the file at write time so concurrent edits
 /// by the user are kept; a new file starts with the explanatory header. Returns the number added.
-pub fn append(file: &Path, new: &[Entry]) -> io::Result<usize> {
+pub(crate) fn append(file: &Path, new: &[Entry]) -> io::Result<usize> {
     let existing = read(file)?;
     let listed: HashSet<PathBuf> = existing
         .as_deref()
@@ -112,13 +112,13 @@ pub fn append(file: &Path, new: &[Entry]) -> io::Result<usize> {
 
 /// What `quarantine clear` releases.
 #[derive(Debug, Clone, Copy)]
-pub enum Release<'a> {
+pub(crate) enum Release<'a> {
     Path(&'a Path),
     All,
 }
 
 /// Removes the matching entry lines (comments and other lines stay); returns the released paths.
-pub fn clear(file: &Path, what: Release<'_>) -> io::Result<Vec<PathBuf>> {
+pub(crate) fn clear(file: &Path, what: Release<'_>) -> io::Result<Vec<PathBuf>> {
     let Some(bytes) = read(file)? else {
         return Ok(Vec::new());
     };
@@ -130,7 +130,7 @@ pub fn clear(file: &Path, what: Release<'_>) -> io::Result<Vec<PathBuf>> {
                 if matches!(what, Release::All)
                     || matches!(what, Release::Path(p) if p == e.path) =>
             {
-                released.push(e.path)
+                released.push(e.path);
             }
             _ => kept.push(line),
         }
@@ -161,7 +161,7 @@ mod tests {
     #[test]
     fn roundtrip_preserves_comments_and_user_lines() {
         let dir = std::env::temp_dir().join(format!("acz-quar-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        fs::remove_dir_all(&dir).ok();
         let file = dir.join(QUARANTINE_NAME);
         assert!(load(&file).unwrap().is_empty());
         assert!(clear(&file, Release::All).unwrap().is_empty());
@@ -178,7 +178,7 @@ mod tests {
         let b = entry("2026-10-09T09:00:00.000+03:00", "/w/b.py");
         assert_eq!(append(&file, &[a.clone(), b.clone()]).unwrap(), 1);
         let got = load(&file).unwrap();
-        assert_eq!(got, [a.clone(), entry("", "/w/by hand.py"), b.clone()]);
+        assert_eq!(got, [a.clone(), entry("", "/w/by hand.py"), b]);
         let text = fs::read_to_string(&file).unwrap();
         assert!(
             text.contains("# keep this note\n\n/w/by hand.py  \n2026-10-09"),

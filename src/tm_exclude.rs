@@ -19,10 +19,10 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 /// The sticky Time Machine exclusion xattr.
-pub const XATTR: &CStr = c"com.apple.metadata:com_apple_backup_excludeItem";
+pub(crate) const XATTR: &CStr = c"com.apple.metadata:com_apple_backup_excludeItem";
 
 /// Its value as `tmutil addexclusion` writes it: the binary plist string `com.apple.backupd`.
-pub const VALUE: [u8; 61] = [
+pub(crate) const VALUE: [u8; 61] = [
     0x62, 0x70, 0x6C, 0x69, 0x73, 0x74, 0x30, 0x30, 0x5F, 0x10, 0x11, 0x63, 0x6F, 0x6D, 0x2E, 0x61,
     0x70, 0x70, 0x6C, 0x65, 0x2E, 0x62, 0x61, 0x63, 0x6B, 0x75, 0x70, 0x64, 0x08, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
@@ -36,7 +36,7 @@ const UNDO: &str = "Exclusions are never removed by this tool; undo one with \
 
 /// What the checks found for a matched directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum State {
+pub(crate) enum State {
     /// Would be (or will be) excluded.
     Pending,
     /// Already carries the exclusion xattr (whatever its value).
@@ -49,7 +49,7 @@ pub enum State {
 
 /// A matched directory with what the checks found.
 #[derive(Debug)]
-pub struct Item {
+pub(crate) struct Item {
     pub path: PathBuf,
     dev: u64,
     ino: u64,
@@ -103,7 +103,7 @@ fn open_checked(path: &Path, dev: u64, ino: u64, euid: u32) -> Result<(File, Met
 
 /// Checks every matched directory (files are dropped); nothing is changed. A directory inside
 /// an earlier one that is or will be excluded is dropped: the exclusion covers it.
-pub fn plan(
+pub(crate) fn plan(
     matched: Vec<Matched>,
     matcher: &Matcher,
     guard: &Guard,
@@ -162,16 +162,17 @@ fn check(m: &Matched, guard: &Guard, checker: &Checker<'_>, euid: u32) -> State 
 
 /// The preview: every directory that would be excluded, blocked ones and errors with the
 /// reason, totals and the command that would do it.
-pub fn render(items: &[Item], home: &Path, apply_cmd: &str) -> String {
+pub(crate) fn render(items: &[Item], home: &Path, apply_cmd: &str) -> String {
     use std::fmt::Write as _;
     let mut s = String::new();
     for i in items.iter().filter(|i| i.state == State::Pending) {
-        let _ = writeln!(
+        writeln!(
             s,
             "would exclude from Time Machine: {}   rule {}",
             abbreviate_home(&i.path, Some(home)),
             i.rule
-        );
+        )
+        .ok();
     }
     for i in items {
         let (tag, why) = match &i.state {
@@ -179,25 +180,26 @@ pub fn render(items: &[Item], home: &Path, apply_cmd: &str) -> String {
             State::Error(why) => ("ERROR", why),
             _ => continue,
         };
-        let _ = writeln!(s, "{tag} {}: {why}", abbreviate_home(&i.path, Some(home)));
+        writeln!(s, "{tag} {}: {why}", abbreviate_home(&i.path, Some(home))).ok();
     }
     let o = tally(items);
     let pending = items.iter().filter(|i| i.state == State::Pending).count();
-    let _ = writeln!(
+    writeln!(
         s,
         "\nwould be excluded from Time Machine: {pending} directories \
          ({} already, {} blocked, {} errors)",
         o.already, o.blocked, o.errors
-    );
+    )
+    .ok();
     if pending > 0 {
-        let _ = writeln!(s, "Nothing changed. Run '{apply_cmd}' to do it.");
+        writeln!(s, "Nothing changed. Run '{apply_cmd}' to do it.").ok();
     }
-    let _ = writeln!(s, "{UNDO}");
+    writeln!(s, "{UNDO}").ok();
     s
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
-pub struct Outcome {
+pub(crate) struct Outcome {
     pub excluded: u64,
     pub already: u64,
     pub blocked: u64,
@@ -205,7 +207,7 @@ pub struct Outcome {
 }
 
 /// The counts of a plan as it stands (nothing excluded yet).
-pub fn tally(items: &[Item]) -> Outcome {
+pub(crate) fn tally(items: &[Item]) -> Outcome {
     let mut o = Outcome::default();
     for i in items {
         match i.state {
@@ -222,7 +224,7 @@ pub fn tally(items: &[Item]) -> Outcome {
 /// same unflagged directory (device, inode); the xattr is then created, never replaced (a value
 /// set meanwhile counts as already), and read back. One INFO line per directory excluded, a
 /// WARN (also on stderr) per error.
-pub fn apply(items: &[Item], euid: u32, log: &Logger) -> Outcome {
+pub(crate) fn apply(items: &[Item], euid: u32, log: &Logger) -> Outcome {
     let mut out = tally(items);
     for i in items.iter().filter(|i| i.state == State::Pending) {
         let result =
@@ -282,11 +284,12 @@ mod tests {
     impl Tmp {
         fn new(tag: &str) -> Self {
             let dir = std::env::temp_dir().join(format!("acz-tmx-{tag}-{}", std::process::id()));
-            let _ = std::process::Command::new("/usr/bin/chflags")
+            std::process::Command::new("/usr/bin/chflags")
                 .args(["-R", "nouchg"])
                 .arg(&dir)
-                .status();
-            let _ = fs::remove_dir_all(&dir);
+                .status()
+                .ok();
+            fs::remove_dir_all(&dir).ok();
             fs::create_dir_all(&dir).unwrap();
             let log = Logger::open(&dir.join("log"), 1 << 20, 1, false).unwrap();
             Self { dir, log }
@@ -333,11 +336,12 @@ mod tests {
 
     impl Drop for Tmp {
         fn drop(&mut self) {
-            let _ = std::process::Command::new("/usr/bin/chflags")
+            std::process::Command::new("/usr/bin/chflags")
                 .args(["-R", "nouchg"])
                 .arg(&self.dir)
-                .status();
-            let _ = fs::remove_dir_all(&self.dir);
+                .status()
+                .ok();
+            fs::remove_dir_all(&self.dir).ok();
         }
     }
 
@@ -497,7 +501,7 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).unwrap();
         let tm = fs::metadata(&target).unwrap();
         let extra = vec![Matched {
-            path: link.clone(),
+            path: link,
             is_dir: true,
             dev: tm.dev(),
             ino: tm.ino(),

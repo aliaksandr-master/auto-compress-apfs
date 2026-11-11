@@ -24,12 +24,12 @@ use std::sync::{Arc, Condvar, Mutex};
 /// `EDEADLK`: returned instead of materializing a dataless file once that is turned off.
 const EDEADLK: i32 = 11;
 
-pub const STAGING_PREFIX: &str = ".acz-staging-";
-pub const RESCUE_PREFIX: &str = ".acz-rescue-";
+pub(crate) const STAGING_PREFIX: &str = ".acz-staging-";
+pub(crate) const RESCUE_PREFIX: &str = ".acz-rescue-";
 
 /// Identity of a file version: same key means same inode with unchanged size and mtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct FileKey {
+pub(crate) struct FileKey {
     pub dev: u64,
     pub ino: u64,
     pub size: u64,
@@ -38,7 +38,7 @@ pub struct FileKey {
 }
 
 impl FileKey {
-    pub fn of(m: &Metadata) -> Self {
+    pub(crate) fn of(m: &Metadata) -> Self {
         Self {
             dev: m.dev(),
             ino: m.ino(),
@@ -51,7 +51,7 @@ impl FileKey {
 
 /// A regular file found below a pattern match, with the `lstat` data taken during the walk.
 #[derive(Debug, Clone)]
-pub struct Candidate {
+pub(crate) struct Candidate {
     pub path: PathBuf,
     /// The matched directory (or the parent of a matched file); staging happens there.
     pub match_root: Arc<Path>,
@@ -67,7 +67,7 @@ pub struct Candidate {
 }
 
 impl Candidate {
-    pub fn new(path: PathBuf, match_root: Arc<Path>, m: &Metadata) -> Self {
+    pub(crate) fn new(path: PathBuf, match_root: Arc<Path>, m: &Metadata) -> Self {
         Self {
             path,
             match_root,
@@ -83,18 +83,18 @@ impl Candidate {
         }
     }
 
-    pub fn size(&self) -> u64 {
+    pub(crate) fn size(&self) -> u64 {
         self.key.size
     }
 
     /// Allocated bytes (`st_blocks * 512`).
-    pub fn allocated(&self) -> u64 {
+    pub(crate) fn allocated(&self) -> u64 {
         self.blocks * 512
     }
 }
 
 /// Compiled patterns, excludes and the R1 "descend" set that bounds the search.
-pub struct Matcher {
+pub(crate) struct Matcher {
     patterns: GlobSet,
     /// Excludes without `/`: matched against the entry name.
     exclude_name: GlobSet,
@@ -164,7 +164,7 @@ fn split_pattern(pattern: &str) -> (Vec<&str>, usize) {
 }
 
 /// Walk root of an absolute pattern: its leading components without glob metacharacters.
-pub fn literal_prefix(pattern: &str) -> PathBuf {
+pub(crate) fn literal_prefix(pattern: &str) -> PathBuf {
     let (comps, prefix_len) = split_pattern(pattern);
     let mut root = PathBuf::from("/");
     root.extend(&comps[..prefix_len]);
@@ -180,7 +180,7 @@ impl Matcher {
     /// entry names at any depth, one with `/` the full path. With `scope` the walk is limited to
     /// that directory's subtree: a pattern root above it is replaced by `scope`, a root below it
     /// is kept, any other root dropped.
-    pub fn new(
+    pub(crate) fn new(
         patterns: &[String],
         exclude: &[String],
         scope: Option<&Path>,
@@ -235,13 +235,13 @@ impl Matcher {
     }
 
     /// True when an exclude matches `path` (name or full path), as during the walk.
-    pub fn excludes(&self, path: &Path, is_dir: bool) -> bool {
+    pub(crate) fn excludes(&self, path: &Path, is_dir: bool) -> bool {
         let name = path.file_name().unwrap_or(path.as_os_str());
         self.excluded(&globset::Candidate::new(path), name, is_dir)
     }
 
     /// The first pattern matching `path`.
-    pub fn matching_pattern(&self, path: &Path) -> Option<&str> {
+    pub(crate) fn matching_pattern(&self, path: &Path) -> Option<&str> {
         let i = *self.patterns.matches(path).first()?;
         self.pattern_strs.get(i).map(String::as_str)
     }
@@ -258,7 +258,7 @@ type Probe = dyn Fn(&Path) -> io::Result<FsInfo> + Sync;
 
 /// Hard limits of the walk that no config can lift: the allowed filesystems, subtrees that are
 /// never entered, and privacy-protected folders entered only by a root inside them.
-pub struct Guard {
+pub(crate) struct Guard {
     /// `f_fsid` of the data volume and of the accepted `allow_volumes`.
     allowed: Vec<[i32; 2]>,
     /// Accepted `allow_volumes` mount points (exempt from the `/Volumes` exclusion).
@@ -275,7 +275,7 @@ const DATA_VOLUME: &str = "/System/Volumes/Data";
 const ANCESTOR_FLAGS: u32 = PROTECTED_FLAGS & !sys::SF_RESTRICTED;
 
 /// The nearest real (non-symlink) ancestor of `canon` with an [`ANCESTOR_FLAGS`] bit;
-/// `lstat` gives (is symlink, st_flags) of a path.
+/// `lstat` gives (is symlink, `st_flags`) of a path.
 fn flagged_ancestor_with(
     canon: &Path,
     lstat: impl Fn(&Path) -> Option<(bool, u32)>,
@@ -303,7 +303,7 @@ fn local_apfs(fs: &FsInfo) -> bool {
 
 impl Guard {
     /// The data volume plus every `allow_volumes` entry that is a local apfs mount point.
-    pub fn new(home: &Path, allow_volumes: &[String], log: &Logger) -> Result<Self, String> {
+    pub(crate) fn new(home: &Path, allow_volumes: &[String], log: &Logger) -> Result<Self, String> {
         let data = sys::statfs(Path::new(DATA_VOLUME))
             .map_err(|e| format!("cannot statfs {DATA_VOLUME}: {e}"))?;
         if !local_apfs(&data) {
@@ -412,14 +412,14 @@ impl Guard {
     }
 
     /// Accepted `allow_volumes` mount points.
-    pub fn allowed_mounts(&self) -> &[PathBuf] {
+    pub(crate) fn allowed_mounts(&self) -> &[PathBuf] {
         &self.allowed_mounts
     }
 
     /// Why `path` (a matched entry) must never be trashed or purged: it lies in a never-walked
     /// subtree, or it is a protected location or an ancestor of one (lexical, data prefix
     /// stripped).
-    pub fn removal_refused(&self, path: &Path) -> Option<String> {
+    pub(crate) fn removal_refused(&self, path: &Path) -> Option<String> {
         let p = without_data_prefix(path);
         if self.hard_excluded(&p) {
             return Some("lies in a protected location".into());
@@ -501,12 +501,12 @@ fn is_tool_dir_name(name: &[u8], prefix: &str) -> bool {
 }
 
 /// True for names produced by this tool for staging dirs: `^\.acz-staging-\d+-\d+$`.
-pub fn is_stale_staging_name(name: &[u8]) -> bool {
+pub(crate) fn is_stale_staging_name(name: &[u8]) -> bool {
     is_tool_dir_name(name, STAGING_PREFIX)
 }
 
 /// True for names produced by this tool for rescue dirs: `^\.acz-rescue-\d+-\d+$`.
-pub fn is_rescue_name(name: &[u8]) -> bool {
+pub(crate) fn is_rescue_name(name: &[u8]) -> bool {
     is_tool_dir_name(name, RESCUE_PREFIX)
 }
 
@@ -539,7 +539,10 @@ struct Queue {
 
 impl Queue {
     fn pop(&self) -> Option<Job> {
-        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut s = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         loop {
             if let Some(job) = s.jobs.pop() {
                 s.in_flight += 1;
@@ -548,13 +551,19 @@ impl Queue {
             if s.in_flight == 0 {
                 return None;
             }
-            s = self.cv.wait(s).unwrap_or_else(|e| e.into_inner());
+            s = self
+                .cv
+                .wait(s)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
     }
 
     /// Publishes the children of a finished job and marks the job done.
     fn finish(&self, children: &mut Vec<Job>) {
-        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut s = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         s.jobs.append(children);
         s.in_flight -= 1;
         if !s.jobs.is_empty() || s.in_flight == 0 {
@@ -564,7 +573,7 @@ impl Queue {
 }
 
 #[derive(Default)]
-pub struct WalkResult {
+pub(crate) struct WalkResult {
     /// Deduplicated by (dev, ino), sorted by path. From [`walk_reduced`]: without the too-small
     /// files below a walk root (a too-small literal file root is still in it).
     pub candidates: Vec<Candidate>,
@@ -603,14 +612,14 @@ pub struct WalkResult {
 impl WalkResult {
     /// Walk roots that exist but could not be read (an access problem the user can fix).
     /// Roots refused by the guard and refused filesystem crossings are not counted.
-    pub fn inaccessible_roots(&self) -> u64 {
+    pub(crate) fn inaccessible_roots(&self) -> u64 {
         self.unreadable_roots
     }
 }
 
 /// A file or directory matched by a pattern, as the walk saw it (`lstat`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Matched {
+pub(crate) struct Matched {
     pub path: PathBuf,
     pub is_dir: bool,
     pub dev: u64,
@@ -629,7 +638,7 @@ impl Matched {
 }
 
 /// Makes [`walk_reduced`] count too-small files instead of keeping them as candidates.
-pub struct Reduce<'a> {
+pub(crate) struct Reduce<'a> {
     pub min_size: u64,
     /// The caller needs this path back (to mark its state row `seen`).
     pub tracked: &'a (dyn Fn(&Path) -> bool + Sync),
@@ -656,7 +665,7 @@ impl Walker<'_> {
             .metadata()
             .inspect_err(|e| {
                 // Gone since the directory was read (a cache churning): not a problem to show.
-                if e.kind() == std::io::ErrorKind::NotFound {
+                if e.kind() == io::ErrorKind::NotFound {
                     self.log.info(format_args!(
                         "{} vanished during the scan: {e}",
                         path.display()
@@ -781,7 +790,7 @@ impl Walker<'_> {
                     continue;
                 }
                 let root = match inside {
-                    Some(root) => root.clone(),
+                    Some(root) => Arc::clone(root),
                     None => Arc::from(job.dir.as_path()),
                 };
                 out.candidates.push(Candidate::new(path, root, &m));
@@ -1025,7 +1034,7 @@ impl Walker<'_> {
         }
         let matched = matched && !self.entries;
         if matched && meta.is_file() && !symlink {
-            let parent: Arc<Path> = Arc::from(root.parent().unwrap_or(Path::new("/")));
+            let parent: Arc<Path> = Arc::from(root.parent().unwrap_or_else(|| Path::new("/")));
             out.candidates
                 .push(Candidate::new(root.to_path_buf(), parent, &meta));
             return None;
@@ -1046,7 +1055,7 @@ impl Walker<'_> {
 /// Walks every pattern root that passes the guard on `threads` workers. Read/stat errors are
 /// logged as WARN and skipped. Of `track_dirs` (parents of state rows, when this run prunes
 /// state) the completely read ones are returned in `read_dirs`.
-pub fn walk(
+pub(crate) fn walk(
     matcher: &Matcher,
     guard: &Guard,
     one_file_system: bool,
@@ -1070,14 +1079,14 @@ pub fn walk(
 /// Like [`walk`], but a file below a walk root that `classify::too_small` accepts is only
 /// counted in `too_small` (its path kept in `too_small_tracked` when `reduce.tracked` accepts
 /// it) and is not a candidate.
-pub fn walk_reduced(
+pub(crate) fn walk_reduced(
     matcher: &Matcher,
     guard: &Guard,
     one_file_system: bool,
     threads: usize,
     log: &Logger,
     track_dirs: Option<&HashSet<PathBuf>>,
-    reduce: &Reduce,
+    reduce: &Reduce<'_>,
 ) -> WalkResult {
     walk_with_fault(
         matcher,
@@ -1094,7 +1103,7 @@ pub fn walk_reduced(
 
 /// Like [`walk`], but collects the files and directories matched by a pattern (for `trash`
 /// and `purge`); a matched directory is not entered.
-pub fn walk_entries(
+pub(crate) fn walk_entries(
     matcher: &Matcher,
     guard: &Guard,
     one_file_system: bool,
@@ -1114,7 +1123,10 @@ pub fn walk_entries(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the walk entry point with its test fault hook; callers pass each option positionally"
+)]
 fn walk_with_fault(
     matcher: &Matcher,
     guard: &Guard,
@@ -1124,7 +1136,7 @@ fn walk_with_fault(
     track_dirs: Option<&HashSet<PathBuf>>,
     fault: Option<&Path>,
     entries: bool,
-    reduce: Option<&Reduce>,
+    reduce: Option<&Reduce<'_>>,
 ) -> WalkResult {
     let walker = Walker {
         matcher,
@@ -1162,7 +1174,7 @@ fn walk_with_fault(
             .collect();
         handles
             .into_iter()
-            .map(|h| h.join().expect("walk worker panicked"))
+            .map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
             .collect()
     });
 
@@ -1412,16 +1424,17 @@ mod tests {
         fn cleanup(dir: &Path) {
             if dir.exists() {
                 let run = |cmd: &str, args: &[&str]| {
-                    let _ = std::process::Command::new(cmd)
+                    std::process::Command::new(cmd)
                         .args(args)
                         .arg(dir)
                         .stderr(std::process::Stdio::null())
-                        .status();
+                        .status()
+                        .ok();
                 };
                 run("/bin/chmod", &["-R", "u+rwx"]);
                 run("/usr/bin/chflags", &["-R", "nouchg"]);
                 run("/bin/chmod", &["-R", "u+rwx"]);
-                let _ = fs::remove_dir_all(dir);
+                fs::remove_dir_all(dir).ok();
             }
         }
 
@@ -1513,7 +1526,7 @@ mod tests {
         t.file("home/Library/CloudStorage/Drive/cloud.txt");
         t.file("home/Work/.venv/w.py");
         let link = |target: &str, name: &str| {
-            std::os::unix::fs::symlink(home.join(target), home.join(name)).unwrap()
+            std::os::unix::fs::symlink(home.join(target), home.join(name)).unwrap();
         };
         link("Documents", "docs");
         link("Library/CloudStorage", "cl");
@@ -1920,7 +1933,7 @@ mod tests {
         std::os::unix::fs::symlink(home.join("Documents"), home.join("docs")).unwrap();
         t.lock("home/Documents");
         let calls = Arc::new(Mutex::new(Vec::<PathBuf>::new()));
-        let seen = calls.clone();
+        let seen = Arc::clone(&calls);
         let guard = Guard::with_probe(
             &home,
             vec![[1, 1]],

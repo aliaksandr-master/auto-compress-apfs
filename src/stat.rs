@@ -8,15 +8,19 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 
 /// Rows shown without `--top`/`--all`.
-pub const DEFAULT_TOP: usize = 30;
+pub(crate) const DEFAULT_TOP: usize = 30;
 /// Width when `COLUMNS` is not set.
-pub const DEFAULT_WIDTH: usize = 160;
+pub(crate) const DEFAULT_WIDTH: usize = 160;
 
 const NUM: usize = 10;
 const RATIO: usize = 6;
 const WHEN: usize = 16;
 
 /// `orig / disk` with two decimals, `inf` for nothing on disk.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "a display ratio with two decimals"
+)]
 fn ratio(orig: u64, disk: u64) -> String {
     if disk == 0 {
         "inf".to_owned()
@@ -46,7 +50,12 @@ pub(crate) fn when(secs: i64) -> String {
 }
 
 /// The whole `stat` output. `top = None` lists every row; `width` bounds each table line.
-pub fn render(state: &State, quarantine: &[Entry], top: Option<usize>, width: usize) -> String {
+pub(crate) fn render(
+    state: &State,
+    quarantine: &[Entry],
+    top: Option<usize>,
+    width: usize,
+) -> String {
     let (orig, disk) = state.rows.values().fold((0u64, 0u64), |(o, d), r| {
         (o + r.orig_size, d + r.disk_after)
     });
@@ -54,13 +63,13 @@ pub fn render(state: &State, quarantine: &[Entry], top: Option<usize>, width: us
     let last = state
         .last_run_day
         .map_or_else(|| "-".to_owned(), |d| d.to_string());
-    let _ = writeln!(out, "files          {}", state.rows.len());
-    let _ = writeln!(out, "original       {}", human(orig));
-    let _ = writeln!(out, "on disk        {}", human(disk));
-    let _ = writeln!(out, "saved          {}", saved(orig, disk));
-    let _ = writeln!(out, "ratio          {}", ratio(orig, disk));
-    let _ = writeln!(out, "quarantined    {}", quarantine.len());
-    let _ = writeln!(out, "last run day   {last}");
+    writeln!(out, "files          {}", state.rows.len()).ok();
+    writeln!(out, "original       {}", human(orig)).ok();
+    writeln!(out, "on disk        {}", human(disk)).ok();
+    writeln!(out, "saved          {}", saved(orig, disk)).ok();
+    writeln!(out, "ratio          {}", ratio(orig, disk)).ok();
+    writeln!(out, "quarantined    {}", quarantine.len()).ok();
+    writeln!(out, "last run day   {last}").ok();
 
     let mut rows: Vec<(&PathBuf, &Row)> = state.rows.iter().collect();
     rows.sort_unstable_by(|a, b| b.1.orig_size.cmp(&a.1.orig_size).then_with(|| a.0.cmp(b.0)));
@@ -74,11 +83,11 @@ pub fn render(state: &State, quarantine: &[Entry], top: Option<usize>, width: us
             "{:>idx$}  {:>NUM$}  {:>NUM$}  {:>NUM$}  {:>RATIO$}  {:<WHEN$}  PATH",
             "#", "ORIGINAL", "ON DISK", "SAVED", "RATIO", "COMPRESSED AT"
         );
-        let _ = writeln!(out, "\n{header}");
-        let _ = writeln!(out, "{}", "-".repeat((fixed + path_w).min(width)));
+        writeln!(out, "\n{header}").ok();
+        writeln!(out, "{}", "-".repeat((fixed + path_w).min(width))).ok();
         for (i, (path, r)) in rows.iter().take(shown).enumerate() {
             let p = truncate_left(&path.to_string_lossy(), path_w);
-            let _ = writeln!(
+            writeln!(
                 out,
                 "{:>idx$}  {:>NUM$}  {:>NUM$}  {:>NUM$}  {:>RATIO$}  {:<WHEN$}  {p}",
                 i + 1,
@@ -87,21 +96,23 @@ pub fn render(state: &State, quarantine: &[Entry], top: Option<usize>, width: us
                 saved(r.orig_size, r.disk_after),
                 ratio(r.orig_size, r.disk_after),
                 when(r.compressed_at),
-            );
+            )
+            .ok();
         }
         if shown < rows.len() {
-            let _ = writeln!(
+            writeln!(
                 out,
                 "... {} more files (--top N or --all to list them)",
                 rows.len() - shown
-            );
+            )
+            .ok();
         }
     }
     if !quarantine.is_empty() {
-        let _ = writeln!(out, "\nquarantine ({}):", quarantine.len());
+        writeln!(out, "\nquarantine ({}):", quarantine.len()).ok();
         for e in quarantine {
             let stamp = if e.stamp.is_empty() { "-" } else { &e.stamp };
-            let _ = writeln!(out, "  {stamp}  {}", e.path.display());
+            writeln!(out, "  {stamp}  {}", e.path.display()).ok();
         }
     }
     out

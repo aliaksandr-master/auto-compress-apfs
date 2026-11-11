@@ -1,0 +1,10 @@
+# The only clippy.toml in the repository; no msrv key, clippy reads rust-version.
+avoid-breaking-exported-api = false
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
+allow-dbg-in-tests = true
+allow-print-in-tests = true
+doc-valid-idents = ["..", "APFS", "LZFSE", "LZVN", "decmpfs", "macOS"]
+allowed-duplicate-crates = []

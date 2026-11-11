@@ -13,17 +13,17 @@ use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
-pub const LABEL: &str = "local.auto-compress-apfs";
+pub(crate) const LABEL: &str = "local.auto-compress-apfs";
 const LAUNCHCTL: &str = "/bin/launchctl";
 /// The generated script, next to the config.
-pub const SCRIPT_NAME: &str = "run.sh";
+pub(crate) const SCRIPT_NAME: &str = "run.sh";
 /// In the state dir: the local day (`YYYY-MM-DD`) of the last run the script started.
-pub const LAST_RUN_NAME: &str = "last-run-day";
+pub(crate) const LAST_RUN_NAME: &str = "last-run-day";
 /// Local hour of the daily run; the script starts nothing earlier in the day.
 const RUN_HOUR: u32 = 9;
 
 /// Everything the agent and its script refer to, all absolute.
-pub struct Agent {
+pub(crate) struct Agent {
     pub bin: PathBuf,
     /// Passed to the binary as `--config` (only when not the default).
     pub config: Option<PathBuf>,
@@ -117,15 +117,14 @@ fn render_plist(a: &Agent) -> String {
 /// Directory of the plist: `~/Library/LaunchAgents`, or `ACZ_LAUNCH_AGENTS_DIR` (tests: writing
 /// into a `Library/LaunchAgents` path, even below a temporary HOME, trips endpoint security
 /// persistence detection).
-pub fn agents_dir(home: &Path) -> PathBuf {
+pub(crate) fn agents_dir(home: &Path) -> PathBuf {
     std::env::var_os("ACZ_LAUNCH_AGENTS_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join("Library/LaunchAgents"))
+        .map_or_else(|| home.join("Library/LaunchAgents"), PathBuf::from)
 }
 
 /// Whether launchctl is left out: set `ACZ_SKIP_LAUNCHCTL` (tests must never load an agent into
 /// the real login session, in any build).
-pub fn skip_launchctl() -> bool {
+pub(crate) fn skip_launchctl() -> bool {
     std::env::var_os("ACZ_SKIP_LAUNCHCTL").is_some()
 }
 
@@ -165,7 +164,7 @@ fn write_file(path: &Path, text: &str, mode: u32) -> Result<(), String> {
         .and_then(|()| fs::set_permissions(&tmp, fs::Permissions::from_mode(mode)))
         .and_then(|()| fs::rename(&tmp, path))
         .map_err(|e| {
-            let _ = fs::remove_file(&tmp);
+            fs::remove_file(&tmp).ok();
             err(e)
         })
 }
@@ -180,7 +179,7 @@ fn remove(path: &Path) -> Result<bool, String> {
 
 /// Writes the script and the plist, then (re)loads the agent: a loaded agent with this label is
 /// booted out first, so a reinstall replaces it.
-pub fn install(a: &Agent) -> Result<(), String> {
+pub(crate) fn install(a: &Agent) -> Result<(), String> {
     if sys::effective_uid() == 0 {
         return Err("install-launchd installs a per-user agent: run it as your user".into());
     }
@@ -196,7 +195,7 @@ pub fn install(a: &Agent) -> Result<(), String> {
         return Ok(());
     }
     let domain = domain();
-    let _ = launchctl(&["bootout", &format!("{domain}/{LABEL}")]);
+    launchctl(&["bootout", &format!("{domain}/{LABEL}")]).ok();
     let plist = a.plist.to_string_lossy();
     let bootstrap = ["bootstrap", domain.as_str(), &plist];
     // bootout finishes asynchronously: an immediate bootstrap may fail once with EIO.
@@ -215,7 +214,7 @@ pub fn install(a: &Agent) -> Result<(), String> {
 
 /// What `check-launchd` concludes.
 #[derive(Debug, PartialEq, Eq)]
-pub enum Verdict {
+pub(crate) enum Verdict {
     UpToDate,
     /// Nothing is installed or loaded.
     Install(String),
@@ -245,7 +244,7 @@ fn installed_params(script: &str) -> Option<(PathBuf, Option<PathBuf>)> {
 }
 
 /// The script an installed plist starts (the argument after `/bin/sh`).
-pub fn plist_script(plist: &str) -> Option<PathBuf> {
+pub(crate) fn plist_script(plist: &str) -> Option<PathBuf> {
     let rest = plist.split_once("<string>/bin/sh</string>")?.1;
     let arg = rest.split_once("<string>")?.1.split_once("</string>")?.0;
     let arg = arg
@@ -257,7 +256,11 @@ pub fn plist_script(plist: &str) -> Option<PathBuf> {
 
 /// The `--config` an installed script passes (`Some(None)`: the default config); `None` when
 /// the script cannot be read or parsed.
-pub fn installed_config(script: &Path) -> Option<Option<PathBuf>> {
+#[expect(
+    clippy::option_option,
+    reason = "outer None: script unreadable or unparsed; Some(None): the default config"
+)]
+pub(crate) fn installed_config(script: &Path) -> Option<Option<PathBuf>> {
     let text = fs::read_to_string(script).ok()?;
     installed_params(&text).map(|(_, c)| c)
 }
@@ -276,7 +279,7 @@ fn loaded_from(plist: &Path) -> bool {
 /// Read-only check of an installation. The installed script names the binary and config it
 /// runs; `agent_for` turns them into the [`Agent`] this version would install, whose script and
 /// plist must equal the installed files byte for byte. `ask_launchd` is false in tests.
-pub fn check(
+pub(crate) fn check(
     plist: &Path,
     script: &Path,
     ask_launchd: bool,
@@ -339,7 +342,7 @@ pub fn check(
 }
 
 /// Unloads the agent and removes `plist` and `script`; anything already gone is fine.
-pub fn uninstall(plist: &Path, script: &Path) -> Result<(), String> {
+pub(crate) fn uninstall(plist: &Path, script: &Path) -> Result<(), String> {
     if !skip_launchctl() {
         match launchctl(&["bootout", &format!("{}/{LABEL}", domain())]) {
             Ok(()) => println!("unloaded {LABEL}"),
@@ -371,7 +374,7 @@ mod tests {
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("acz-launchd-{tag}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        fs::remove_dir_all(&dir).ok();
         fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -432,7 +435,7 @@ mod tests {
         );
         a.config = None;
         let s = render_script(&a, RUN_HOUR);
-        assert_eq!(installed_params(&s), Some((a.bin.clone(), None)));
+        assert_eq!(installed_params(&s), Some((a.bin, None)));
         assert_eq!(installed_params("#!/bin/sh\n"), None);
         fs::remove_dir_all(&dir).unwrap();
     }

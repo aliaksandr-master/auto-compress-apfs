@@ -22,11 +22,11 @@ use std::path::{Path, PathBuf};
 /// Record of the incompressible cache for this backend: the compressor and the exact versions
 /// pinned in Cargo.toml (`applesauce-core`, `lzfse-sys`); another version may compress
 /// differently, so a change drops the cache.
-pub const CACHE_ARGS: [&str; 4] = ["applesauce", "lzfse", "0.4.14", "2.0.0"];
+pub(crate) const CACHE_ARGS: [&str; 4] = ["applesauce", "lzfse", "0.4.14", "2.0.0"];
 /// Directory inside a staging dir holding the copies being written. A directory, so it can
 /// never be a user's original swapped out into staging (only regular files are swapped):
 /// stale cleanup deletes it as ours.
-pub const PART_DIR: &str = ".acz-part";
+pub(crate) const PART_DIR: &str = ".acz-part";
 /// Allocation unit the saving rule rounds to.
 const ALLOC: u64 = 4096;
 /// Largest resource fork (block table plus blocks): the writer's block offsets are 32-bit.
@@ -39,12 +39,12 @@ const RFORK_BUF: usize = 1 << 20;
 ///   cannot be written: its presence and value follow the process, not the original;
 /// - `com.apple.quarantine` is rewritten by copyfile (new timestamp, agent dropped): its
 ///   presence and flags field (before the first `;`) must match, the rest need not.
-pub const XATTR_NOT_COPIED: &CStr = c"com.apple.provenance";
-pub const XATTR_VALUE_REWRITTEN: &CStr = c"com.apple.quarantine";
+pub(crate) const XATTR_NOT_COPIED: &CStr = c"com.apple.provenance";
+pub(crate) const XATTR_VALUE_REWRITTEN: &CStr = c"com.apple.quarantine";
 
 /// Outcome of [`stage`].
 #[derive(Debug, PartialEq, Eq)]
-pub enum Staged {
+pub(crate) enum Staged {
     /// A compressed copy at this path (in the staging dir, named like the original).
     Copy(PathBuf),
     /// Read in full, unchanged, and compression would not save an allocation unit.
@@ -60,12 +60,12 @@ pub enum Staged {
 
 /// `st_flags` of the copy: the original's user-settable flags (`UF_SETTABLE`) plus
 /// `UF_COMPRESSED`; system flags (`SF_*`) are never carried over.
-pub fn copy_flags(orig: u32) -> u32 {
+pub(crate) fn copy_flags(orig: u32) -> u32 {
     (orig & 0x0000_ffff) | UF_COMPRESSED
 }
 
 /// Reusable per-worker buffers: one source block and its compressed form.
-pub struct Buffers {
+pub(crate) struct Buffers {
     src: Vec<u8>,
     dst: Vec<u8>,
     lzfse: Compressor,
@@ -84,7 +84,7 @@ impl Default for Buffers {
 
 /// True when compression saves at least one allocation unit: `stored` (resource fork length,
 /// or the inline decmpfs xattr bytes) rounded up to 4 KiB is below `size` rounded up.
-pub fn saves_space(stored: u64, size: u64) -> bool {
+pub(crate) fn saves_space(stored: u64, size: u64) -> bool {
     round_to_block_size(stored, ALLOC) < round_to_block_size(size, ALLOC)
 }
 
@@ -114,7 +114,7 @@ enum Written {
 /// blocks -> saving rule -> decmpfs xattr -> ACL -> mode -> birthtime -> `UF_COMPRESSED` ->
 /// fsync. atime/mtime are not set here: the commit sets them on every staged copy, after
 /// this, as for a ditto copy, and then restores the birthtime they may have lowered.
-pub fn stage(c: &Candidate, staging: &Path, bufs: &mut Buffers) -> io::Result<Staged> {
+pub(crate) fn stage(c: &Candidate, staging: &Path, bufs: &mut Buffers) -> io::Result<Staged> {
     stage_with(c, staging, bufs, FORK_MAX, &mut || {})
 }
 
@@ -176,7 +176,7 @@ fn stage_with(
         Err(e) => Err(e),
     };
     if !matches!(r, Ok(Staged::Copy(_))) {
-        let _ = fs::remove_file(&part);
+        fs::remove_file(&part).ok();
     }
     r
 }
@@ -219,6 +219,10 @@ fn write_copy(
     let fork_header = Kind::Lzfse.header_size(num_blocks(size));
     let mut stored = 0u64;
     let mut read = 0u64;
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a capacity hint; 64-bit macOS target: usize holds every u64"
+    )]
     let mut block_lens = Vec::with_capacity(num_blocks(size) as usize);
     loop {
         let n = read_full(&mut orig, &mut bufs.src)?;
@@ -273,7 +277,7 @@ mod tests {
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("acz-as-{tag}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        fs::remove_dir_all(&dir).ok();
         fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -284,6 +288,10 @@ mod tests {
     }
 
     /// About 4 bits of entropy per byte: compresses, but a 64 KiB block not into the xattr.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "test noise: keeps the low byte on purpose"
+    )]
     fn mixed(n: usize) -> Vec<u8> {
         let mut x: u64 = 0x2545_f491_4f6c_dd1d;
         (0..n)
@@ -503,6 +511,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "test noise: keeps the low byte on purpose"
+    )]
     fn incompressible_and_empty_files_leave_nothing_behind() {
         let dir = temp_dir("incomp");
         let mut bufs = Buffers::default();

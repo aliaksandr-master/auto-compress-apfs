@@ -17,10 +17,10 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 /// Journal of every item trashed or purged, in the log dir.
-pub const JOURNAL_NAME: &str = "removed.tsv";
+pub(crate) const JOURNAL_NAME: &str = "removed.tsv";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Action {
+pub(crate) enum Action {
     Trash,
     Purge,
     /// Stale build units of Cargo target directories, deleted for good.
@@ -28,7 +28,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Action::Trash => "trash",
             Action::Purge => "purge",
@@ -46,7 +46,7 @@ impl Action {
 
 /// A matched item with what the checks found.
 #[derive(Debug)]
-pub struct Item {
+pub(crate) struct Item {
     pub path: PathBuf,
     pub is_dir: bool,
     dev: u64,
@@ -64,7 +64,7 @@ pub struct Item {
 /// Where items may be and what they must not be or contain, besides the guard's protected
 /// locations. Compared on their on-disk form (symlinks resolved, `/System/Volumes/Data`
 /// stripped) ignoring case.
-pub struct Keep<'a> {
+pub(crate) struct Keep<'a> {
     /// An item must lie strictly below one of these: the home directory and the accepted
     /// `allow_volumes` mount points.
     pub scope: &'a [PathBuf],
@@ -89,8 +89,8 @@ fn folded(real: PathBuf) -> PathBuf {
     PathBuf::from(real.to_string_lossy().to_lowercase())
 }
 
-/// The checks of [`location_refused`], [`refused`] and [`foreign`] for many items: the on-disk
-/// forms of `keep` are resolved once, an item's realpath is its parent's (resolved once per
+/// The checks of [`location_refused`](Self::location_refused), `refused` and [`foreign`] for
+/// many items: the on-disk forms of `keep` are resolved once, an item's realpath is its parent's (resolved once per
 /// directory) plus its name, and the filesystem check is done once per parent directory (an
 /// item on another filesystem than its parent is refused before it). Same answers
 /// as resolving everything per item, for items that are not symlinks (the walk and cargo-clean
@@ -111,8 +111,8 @@ impl<'a> Checker<'a> {
             scope: keep.scope.iter().map(|p| disk_form(p)).collect(),
             own: keep.own.iter().map(|p| disk_form(p)).collect(),
             trash: disk_form(keep.trash_dir),
-            parents: Default::default(),
-            filesystems: Default::default(),
+            parents: std::cell::RefCell::default(),
+            filesystems: std::cell::RefCell::default(),
         }
     }
 
@@ -143,7 +143,8 @@ impl<'a> Checker<'a> {
         real
     }
 
-    /// [`location_refused`] plus the Trash checks of [`refused`] when `action` is given.
+    /// [`location_refused`](Self::location_refused) plus the Trash checks of `refused` when
+    /// `action` is given.
     fn refused(&self, path: &Path, guard: &Guard, action: Option<Action>) -> Option<String> {
         use std::path::Component::{CurDir, ParentDir};
         if path.components().any(|c| matches!(c, CurDir | ParentDir)) {
@@ -208,7 +209,7 @@ impl<'a> Checker<'a> {
 
 /// Checks every matched item (sorted by path, as the walk and cargo-clean give them); nothing
 /// is changed.
-pub fn plan(
+pub(crate) fn plan(
     matched: Vec<Matched>,
     matcher: &Matcher,
     guard: &Guard,
@@ -333,7 +334,7 @@ pub(crate) fn location_refused(path: &Path, guard: &Guard, keep: &Keep<'_>) -> O
 /// point), or on a filesystem the guard does not allow. The per-item reference [`Checker`] is
 /// tested against.
 fn foreign(path: &Path, dev: u64, guard: &Guard) -> Option<String> {
-    let parent = path.parent().unwrap_or(Path::new("/"));
+    let parent = path.parent().unwrap_or_else(|| Path::new("/"));
     match fs::symlink_metadata(parent) {
         Ok(pm) if pm.dev() != dev => {
             return Some("is on another filesystem than its parent (a mount point)".into());
@@ -371,7 +372,7 @@ fn measure(item: &mut Item, matcher: &Matcher) -> Option<String> {
         let rd = match fs::read_dir(&dir) {
             Ok(rd) => rd,
             Err(e) => {
-                blocked.get_or_insert(format!("cannot read {}: {e}", dir.display()));
+                blocked.get_or_insert_with(|| format!("cannot read {}: {e}", dir.display()));
                 continue;
             }
         };
@@ -379,7 +380,7 @@ fn measure(item: &mut Item, matcher: &Matcher) -> Option<String> {
             let entry = match entry {
                 Ok(e) => e,
                 Err(e) => {
-                    blocked.get_or_insert(format!("cannot read {}: {e}", dir.display()));
+                    blocked.get_or_insert_with(|| format!("cannot read {}: {e}", dir.display()));
                     break;
                 }
             };
@@ -388,7 +389,7 @@ fn measure(item: &mut Item, matcher: &Matcher) -> Option<String> {
             let m = match entry.metadata() {
                 Ok(m) => m,
                 Err(e) => {
-                    blocked.get_or_insert(format!("cannot stat {}: {e}", p.display()));
+                    blocked.get_or_insert_with(|| format!("cannot stat {}: {e}", p.display()));
                     continue;
                 }
             };
@@ -397,10 +398,9 @@ fn measure(item: &mut Item, matcher: &Matcher) -> Option<String> {
             if name.starts_with(STAGING_PREFIX.as_bytes())
                 || name.starts_with(RESCUE_PREFIX.as_bytes())
             {
-                blocked.get_or_insert(format!(
-                    "contains {} (left by compress; see `clean`)",
-                    p.display()
-                ));
+                blocked.get_or_insert_with(|| {
+                    format!("contains {} (left by compress; see `clean`)", p.display())
+                });
             }
             if let Some(why) = flag_reason(&p, &m) {
                 blocked.get_or_insert(why);
@@ -413,10 +413,10 @@ fn measure(item: &mut Item, matcher: &Matcher) -> Option<String> {
             if matcher.excludes(&p, m.is_dir())
                 || real_p.is_some_and(|rp| matcher.excludes(&rp, m.is_dir()))
             {
-                blocked.get_or_insert(format!("contains excluded {}", p.display()));
+                blocked.get_or_insert_with(|| format!("contains excluded {}", p.display()));
             }
             if m.dev() != item.dev {
-                blocked.get_or_insert(format!("{} is on another filesystem", p.display()));
+                blocked.get_or_insert_with(|| format!("{} is on another filesystem", p.display()));
                 continue;
             }
             item.bytes += m.blocks() * 512;
@@ -434,7 +434,7 @@ fn measure(item: &mut Item, matcher: &Matcher) -> Option<String> {
 /// The preview: every item with its size, blocked ones with the reason, totals and the command
 /// that would do it.
 /// Without `verbose` only the totals (and how to list the items).
-pub fn render(
+pub(crate) fn render(
     items: &[Item],
     home: &Path,
     action: Action,
@@ -447,43 +447,46 @@ pub fn render(
         items.iter().partition(|i| i.blocked.is_none());
     for i in ready.iter().filter(|_| verbose) {
         let kind = if i.is_dir { "dir " } else { "file" };
-        let _ = writeln!(
+        writeln!(
             s,
             "{kind} {}   {} ({} files)   rule {}",
             abbreviate_home(&i.path, Some(home)),
             human(i.bytes),
             i.files,
             i.rule
-        );
+        )
+        .ok();
     }
     for i in blocked.iter().filter(|_| verbose) {
-        let _ = writeln!(
+        writeln!(
             s,
             "BLOCKED {}: {}",
             abbreviate_home(&i.path, Some(home)),
             i.blocked.as_deref().unwrap_or_default()
-        );
+        )
+        .ok();
     }
     let total: u64 = ready.iter().map(|i| i.bytes).sum();
-    let _ = writeln!(
+    writeln!(
         s,
         "\nwould be {}: {} items, {} ({} blocked)",
         action.done(),
         ready.len(),
         human(total),
         blocked.len()
-    );
+    )
+    .ok();
     if !verbose && !items.is_empty() {
-        let _ = writeln!(s, "Add -v to list every item (and why one is blocked).");
+        writeln!(s, "Add -v to list every item (and why one is blocked).").ok();
     }
     if !ready.is_empty() {
-        let _ = writeln!(s, "Nothing changed. Run '{apply_cmd}' to do it.");
+        writeln!(s, "Nothing changed. Run '{apply_cmd}' to do it.").ok();
     }
     s
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
-pub struct Outcome {
+pub(crate) struct Outcome {
     pub done: u64,
     pub failed: u64,
     pub blocked: u64,
@@ -513,7 +516,7 @@ fn move_to_trash(path: &Path, trash_dir: &Path) -> io::Result<PathBuf> {
         let dest = trash_dest(trash_dir, name, &stamp, attempt);
         match sys::rename_excl(path, &dest) {
             Ok(()) => return Ok(dest),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e),
         }
     }
@@ -548,7 +551,7 @@ fn count_entries(path: &Path) -> u64 {
 /// and never follows a symlink. Nothing is done when the journal cannot be opened. Every item
 /// attempted gets a journal line (status `done`, `failed: ...` or `partial: ...`), one INFO line
 /// when done, one WARN when not.
-pub fn apply(
+pub(crate) fn apply(
     items: &[Item],
     action: Action,
     trash_dir: &Path,
@@ -734,11 +737,12 @@ mod tests {
     impl Tmp {
         fn new(tag: &str) -> Self {
             let dir = std::env::temp_dir().join(format!("acz-remove-{tag}-{}", std::process::id()));
-            let _ = std::process::Command::new("/usr/bin/chflags")
+            std::process::Command::new("/usr/bin/chflags")
                 .args(["-R", "nouchg"])
                 .arg(&dir)
-                .status();
-            let _ = fs::remove_dir_all(&dir);
+                .status()
+                .ok();
+            fs::remove_dir_all(&dir).ok();
             fs::create_dir_all(&dir).unwrap();
             let log = Logger::open(&dir.join("log"), 1 << 20, 1, false).unwrap();
             Self { dir, log }
@@ -762,7 +766,7 @@ mod tests {
                 .iter()
                 .map(|p| self.dir.join(p).to_string_lossy().into_owned())
                 .collect();
-            let exc: Vec<String> = exclude.iter().map(|s| s.to_string()).collect();
+            let exc: Vec<String> = exclude.iter().map(ToString::to_string).collect();
             let m = Matcher::new(&pat, &exc, None).unwrap();
             let guard = Guard::new(Path::new("/nonexistent-home"), &[], &self.log).unwrap();
             let w = walk::walk_entries(&m, &guard, true, 2, &self.log);
@@ -779,11 +783,12 @@ mod tests {
 
     impl Drop for Tmp {
         fn drop(&mut self) {
-            let _ = std::process::Command::new("/usr/bin/chflags")
+            std::process::Command::new("/usr/bin/chflags")
                 .args(["-R", "nouchg"])
                 .arg(&self.dir)
-                .status();
-            let _ = fs::remove_dir_all(&self.dir);
+                .status()
+                .ok();
+            fs::remove_dir_all(&self.dir).ok();
         }
     }
 
@@ -848,7 +853,7 @@ mod tests {
                 p.display()
             );
         }
-        let _ = fs::remove_dir_all(&outside);
+        fs::remove_dir_all(&outside).ok();
     }
 
     fn names(items: &[Item], root: &Path) -> Vec<String> {
@@ -1043,6 +1048,6 @@ mod tests {
                 .removal_refused(Path::new("/Users/someone/Downloads/x.dmg"))
                 .is_none()
         );
-        let _ = fs::remove_dir_all(&log_dir);
+        fs::remove_dir_all(&log_dir).ok();
     }
 }

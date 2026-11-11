@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Bytes hashed at each end of a file for the partial hash.
-pub const HEAD_TAIL: u64 = 64 * 1024;
+pub(crate) const HEAD_TAIL: u64 = 64 * 1024;
 /// Read buffer of the hashes and compares.
 const BUF: usize = 1 << 20;
 /// Xattrs that may differ between a target and its reference: the last-used date Finder keeps
@@ -52,7 +52,7 @@ static STAGING_NO: AtomicUsize = AtomicUsize::new(1 << 20);
 
 /// A candidate with what the funnel adds: its ctime and clone id at scan time.
 #[derive(Debug, Clone)]
-pub struct Member {
+pub(crate) struct Member {
     pub c: Candidate,
     pub ctime: (i64, i64),
     /// `None` when the filesystem did not report it (then never collapsed with another file).
@@ -61,7 +61,7 @@ pub struct Member {
 
 impl Member {
     /// The identity the scan saw (dev, inode, ctime).
-    pub fn identity(&self) -> Identity {
+    pub(crate) fn identity(&self) -> Identity {
         Identity {
             dev: self.c.key.dev,
             ino: self.c.key.ino,
@@ -73,7 +73,7 @@ impl Member {
 
 /// What happens to a target.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum State {
+pub(crate) enum State {
     /// Would be (or will be) replaced by a clone of the reference.
     Pending,
     /// Never touched, with the reason.
@@ -85,14 +85,14 @@ pub enum State {
 
 /// Files with identical content: one reference, the rest targets.
 #[derive(Debug)]
-pub struct Group {
+pub(crate) struct Group {
     pub reference: Member,
     pub targets: Vec<(Member, State)>,
 }
 
 /// The groups found and how many candidates the funnel let through at each step.
 #[derive(Debug, Default)]
-pub struct Plan {
+pub(crate) struct Plan {
     pub groups: Vec<Group>,
     /// Regular files the walk found.
     pub walked: u64,
@@ -108,7 +108,7 @@ pub struct Plan {
 
 impl Plan {
     /// Targets already listed in the quarantine, and those this run quarantines.
-    pub fn quarantined(&self) -> (u64, u64) {
+    pub(crate) fn quarantined(&self) -> (u64, u64) {
         let mut n = (0, 0);
         for (_, s) in self.groups.iter().flat_map(|g| &g.targets) {
             match s {
@@ -120,7 +120,7 @@ impl Plan {
         n
     }
 
-    pub fn pending(&self) -> impl Iterator<Item = (&Member, &Member)> {
+    pub(crate) fn pending(&self) -> impl Iterator<Item = (&Member, &Member)> {
         self.groups.iter().flat_map(|g| {
             g.targets
                 .iter()
@@ -132,7 +132,7 @@ impl Plan {
 
 /// Funnel step 1: drops files below `min_size`, hardlinked, flagged (uchg/uappnd/schg/sappnd/
 /// restricted), dataless, owned by another user than `euid` or modified after `mtime_cutoff`.
-pub fn eligible(
+pub(crate) fn eligible(
     cands: Vec<Candidate>,
     min_size: u64,
     euid: u32,
@@ -152,17 +152,16 @@ pub fn eligible(
 
 /// Groups `items` by `key`, keeping groups of at least two, each in input order; groups are
 /// ordered by their first item's position.
-pub fn regroup<T, K: Hash + Eq>(items: Vec<T>, key: impl Fn(&T) -> K) -> Vec<Vec<T>> {
+pub(crate) fn regroup<T, K: Hash + Eq>(items: Vec<T>, key: impl Fn(&T) -> K) -> Vec<Vec<T>> {
     let mut index: HashMap<K, usize> = HashMap::new();
     let mut groups: Vec<Vec<T>> = Vec::new();
     for it in items {
         let k = key(&it);
-        match index.get(&k) {
-            Some(&i) => groups[i].push(it),
-            None => {
-                index.insert(k, groups.len());
-                groups.push(vec![it]);
-            }
+        if let Some(&i) = index.get(&k) {
+            groups[i].push(it);
+        } else {
+            index.insert(k, groups.len());
+            groups.push(vec![it]);
         }
     }
     groups.retain(|g| g.len() >= 2);
@@ -183,7 +182,7 @@ fn reference_order(m: &Member) -> (bool, i64, i64, &Path) {
 /// Funnel step 3: of files with the same clone id only the first in reference order stays;
 /// returns the kept members (in reference order), how many were left out and the paths of
 /// every member (kept or not) whose clone id another member shares.
-pub fn collapse_clones(mut members: Vec<Member>) -> (Vec<Member>, u64, Vec<PathBuf>) {
+pub(crate) fn collapse_clones(mut members: Vec<Member>) -> (Vec<Member>, u64, Vec<PathBuf>) {
     members.sort_by(|a, b| reference_order(a).cmp(&reference_order(b)));
     let mut ids: HashMap<u64, usize> = HashMap::new();
     for id in members.iter().filter_map(|m| m.clone_id) {
@@ -245,7 +244,7 @@ fn type_text(t: Option<u32>) -> String {
 }
 
 /// What [`plan`] needs besides the candidates.
-pub struct PlanOptions<'a> {
+pub(crate) struct PlanOptions<'a> {
     pub verify: VerifyMode,
     /// Paths listed in the quarantine: never targets.
     pub quarantined: &'a HashSet<PathBuf>,
@@ -264,7 +263,7 @@ enum VerifySkip {
 /// Precedence: quarantined, then a verify skip of `verify = "extended"`, then the metadata gate.
 fn split_group(
     mut members: Vec<Member>,
-    opts: &PlanOptions,
+    opts: &PlanOptions<'_>,
     type_of: impl Fn(&Member) -> io::Result<u32>,
     gate: impl Fn(&Member, &Member) -> io::Result<Option<String>>,
 ) -> Group {
@@ -343,7 +342,7 @@ fn split_group(
 
 /// True when `m` (an `fstat`/`lstat` of the member's path) is still the version the scan saw:
 /// same dev, inode, size, mtime and ctime.
-pub fn unchanged(member: &Member, m: &Metadata) -> bool {
+pub(crate) fn unchanged(member: &Member, m: &Metadata) -> bool {
     m.is_file() && FileKey::of(m) == member.c.key && (m.ctime(), m.ctime_nsec()) == member.ctime
 }
 
@@ -369,12 +368,20 @@ fn partial_hash(m: &Member, buf: &mut [u8]) -> io::Result<Option<[u8; 32]>> {
     };
     let size = m.c.size();
     let mut h = blake3::Hasher::new();
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "at most HEAD_TAIL after `min`"
+    )]
     let head = HEAD_TAIL.min(size) as usize;
     let n = read_full(&f, &mut buf[..head])?;
     h.update(&buf[..n]);
     if size > HEAD_TAIL {
         let from = (size - HEAD_TAIL).max(HEAD_TAIL);
         f.seek(SeekFrom::Start(from))?;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "size - from <= HEAD_TAIL: `from >= size - HEAD_TAIL`"
+        )]
         let n = read_full(&f, &mut buf[..(size - from) as usize])?;
         h.update(&buf[..n]);
     }
@@ -404,7 +411,7 @@ fn full_hash(m: &Member, buf: &mut [u8]) -> io::Result<Option<[u8; 32]>> {
 fn xattrs(f: &File, skip_provenance: bool) -> io::Result<Vec<(CString, Option<Vec<u8>>)>> {
     let mut names = sys::flist_xattr(f)?;
     names.retain(|n| {
-        !IGNORED_XATTRS.contains(&n.as_c_str()) && !(skip_provenance && n.as_c_str() == PROVENANCE)
+        !IGNORED_XATTRS.contains(&n.as_c_str()) && (!skip_provenance || n.as_c_str() != PROVENANCE)
     });
     names.sort();
     names
@@ -464,7 +471,12 @@ fn gate(r: &Member, t: &Member) -> io::Result<Option<String>> {
 }
 
 /// Funnel steps 2 to 6 on the walked candidates (see the module doc).
-pub fn plan(cands: Vec<Candidate>, walked: u64, opts: &PlanOptions, log: &Logger) -> Plan {
+pub(crate) fn plan(
+    cands: Vec<Candidate>,
+    walked: u64,
+    opts: &PlanOptions<'_>,
+    log: &Logger,
+) -> Plan {
     let mut out = Plan {
         walked,
         verify: opts.verify,
@@ -573,7 +585,7 @@ fn scan(c: Candidate) -> Result<Option<Member>, (PathBuf, io::Error)> {
 }
 
 /// The run days and threshold of the dedup quarantine streak.
-pub struct Streaks {
+pub(crate) struct Streaks {
     pub today: Day,
     pub prev: Option<Day>,
     /// `quarantine_after`; 0 disables.
@@ -589,7 +601,12 @@ pub struct Streaks {
 /// streak and quarantines only a row already at the threshold whose streak is current
 /// ([`state::streak_current`]). A shared file with a row ends
 /// its streak. Returns the paths quarantined by this run.
-pub fn track(plan: &mut Plan, st: &mut DedupState, s: &Streaks, reason: &str) -> Vec<PathBuf> {
+pub(crate) fn track(
+    plan: &mut Plan,
+    st: &mut DedupState,
+    s: &Streaks,
+    reason: &str,
+) -> Vec<PathBuf> {
     let mut new = Vec::new();
     let mut pending = HashSet::new();
     for (t, state) in plan.groups.iter_mut().flat_map(|g| &mut g.targets) {
@@ -628,28 +645,29 @@ pub fn track(plan: &mut Plan, st: &mut DedupState, s: &Streaks, reason: &str) ->
 /// The preview: every group with its reference and targets (skipped ones with the reason),
 /// the totals and the command that would do it.
 /// The groups are listed only when `verbose`; the totals always.
-pub fn render(plan: &Plan, home: &Path, apply_cmd: &str, verbose: bool) -> String {
+pub(crate) fn render(plan: &Plan, home: &Path, apply_cmd: &str, verbose: bool) -> String {
     use std::fmt::Write as _;
     let mut s = String::new();
     let path = |m: &Member| abbreviate_home(&m.c.path, Some(home));
     for g in plan.groups.iter().filter(|_| verbose) {
-        let _ = writeln!(
+        writeln!(
             s,
             "identical: {} files of {}",
             g.targets.len() + 1,
             human(g.reference.c.size())
-        );
-        let _ = writeln!(s, "  keep  {}", path(&g.reference));
+        )
+        .ok();
+        writeln!(s, "  keep  {}", path(&g.reference)).ok();
         for (t, state) in &g.targets {
             match state {
                 State::Pending => {
-                    let _ = writeln!(s, "  clone {}", path(t));
+                    writeln!(s, "  clone {}", path(t)).ok();
                 }
                 State::Skipped(why) | State::Quarantined(Some(why)) => {
-                    let _ = writeln!(s, "  skip  {}: skipped: {why}", path(t));
+                    writeln!(s, "  skip  {}: skipped: {why}", path(t)).ok();
                 }
                 State::Quarantined(None) => {
-                    let _ = writeln!(s, "  skip  {}: skipped: quarantined", path(t));
+                    writeln!(s, "  skip  {}: skipped: quarantined", path(t)).ok();
                 }
             }
         }
@@ -657,28 +675,30 @@ pub fn render(plan: &Plan, home: &Path, apply_cmd: &str, verbose: bool) -> Strin
     let (files, bytes) = plan
         .pending()
         .fold((0u64, 0u64), |(n, b), (_, t)| (n + 1, b + t.c.allocated()));
-    let _ = writeln!(
+    writeln!(
         s,
         "\ndedup: groups={} files={files} would_free={} (allocated blocks of targets, approx.)",
         plan.groups.len(),
         human(bytes)
-    );
+    )
+    .ok();
     if files > 0 {
-        let _ = writeln!(
+        writeln!(
             s,
             "Nothing changed. Run '{apply_cmd}' to replace duplicates by APFS clones."
-        );
+        )
+        .ok();
     }
-    let _ = writeln!(s, "{SNAPSHOT_NOTE}");
+    writeln!(s, "{SNAPSHOT_NOTE}").ok();
     s
 }
 
 /// Freed blocks may stay allocated while a snapshot references them.
-pub const SNAPSHOT_NOTE: &str =
+pub(crate) const SNAPSHOT_NOTE: &str =
     "Time Machine local snapshots may keep the freed blocks until they expire.";
 
 #[derive(Debug, Default, PartialEq, Eq)]
-pub struct Outcome {
+pub(crate) struct Outcome {
     pub deduped: u64,
     /// Every deduplicated path with the identity of the clone now at it.
     pub deduped_paths: Vec<(PathBuf, Identity)>,
@@ -699,7 +719,7 @@ enum Miss {
 
 /// Replaces every pending target by a clone of its reference (see [`replace`]). Quarantined
 /// targets are not counted as skipped; only those quarantined by this run are logged.
-pub fn apply(plan: &Plan, log: &Logger) -> Outcome {
+pub(crate) fn apply(plan: &Plan, log: &Logger) -> Outcome {
     let mut out = Outcome::default();
     let mut bufs = Buffers::default();
     for g in &plan.groups {
@@ -768,7 +788,7 @@ fn make_staging(dir: &Path) -> io::Result<PathBuf> {
         let no = STAGING_NO.fetch_add(1, Ordering::Relaxed);
         let staging = dir.join(format!("{STAGING_PREFIX}{}-{no}", std::process::id()));
         match DirBuilder::new().mode(0o700).create(&staging) {
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
             other => return other.map(|()| staging),
         }
     }
@@ -795,7 +815,7 @@ fn replace(
     let (Some(fr), Some(ft)) = (fr, ft) else {
         return Err(changed());
     };
-    let parent = t.c.path.parent().unwrap_or(Path::new("/"));
+    let parent = t.c.path.parent().unwrap_or_else(|| Path::new("/"));
     let name = t.c.path.file_name().unwrap_or_default();
     let cname = CString::new(name.as_bytes())
         .map_err(|_| Miss::Fail("file name contains a NUL byte".into()))?;
@@ -811,9 +831,9 @@ fn replace(
     if !matches!(result, Err(Miss::Kept(_))) {
         // The marker first: a crash in between leaves a plain staging dir that stale
         // cleanup handles, never a marked one kept forever.
-        let _ = fs::remove_dir(staging.join(KEEP_MARKER));
-        let _ = fs::remove_file(&clone);
-        let _ = fs::remove_dir(&staging);
+        fs::remove_dir(staging.join(KEEP_MARKER)).ok();
+        fs::remove_file(&clone).ok();
+        fs::remove_dir(&staging).ok();
     }
     result
 }
@@ -904,7 +924,7 @@ fn swap_in(
         }
         Err(e) => return Err(io_fail("cannot compare with the clone", e)),
     }
-    mark_keep(clone.parent().unwrap_or(Path::new("/")))
+    mark_keep(clone.parent().unwrap_or_else(|| Path::new("/")))
         .map_err(|e| io_fail("cannot mark the staging dir", e))?;
     swap(clone, &t.c.path).map_err(|e| io_fail("cannot swap in the clone", e))?;
     // The old file is at `clone` now, the clone at the path.
@@ -1025,8 +1045,8 @@ fn recheck(t: &Member, ft: &File, cm: &Metadata, old: &Path, bufs: &mut Buffers)
 /// `.acz-rescue-<pid>-<n>`, which no command but `clean --apply` removes. Returns the failure
 /// text: `why`, then `held` followed by where the file is now.
 fn keep_original(old: &Path, why: &str, held: &str) -> String {
-    let staging = old.parent().unwrap_or(Path::new("/"));
-    let _ = mark_keep(staging);
+    let staging = old.parent().unwrap_or_else(|| Path::new("/"));
+    mark_keep(staging).ok();
     let name = staging
         .file_name()
         .map(|n| {
@@ -1069,7 +1089,7 @@ mod tests {
                 atime_sec: 0,
                 atime_nsec: 0,
                 blocks: size.div_ceil(512),
-                mode: 0o100644,
+                mode: 0o100_644,
                 nlink: 1,
                 uid: 501,
                 gid: 20,
@@ -1153,7 +1173,7 @@ mod tests {
     #[test]
     fn recheck_sees_a_target_modified_after_the_scan() {
         let dir = std::env::temp_dir().join(format!("acz-dedup-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        fs::remove_dir_all(&dir).ok();
         fs::create_dir_all(&dir).unwrap();
         let p = dir.join("t");
         fs::write(&p, vec![1u8; 4096]).unwrap();
@@ -1180,7 +1200,7 @@ mod tests {
     #[test]
     fn partial_hash_reads_head_and_tail_only() {
         let dir = std::env::temp_dir().join(format!("acz-dedup-ph-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        fs::remove_dir_all(&dir).ok();
         fs::create_dir_all(&dir).unwrap();
         let mut data = vec![3u8; 300_000];
         let (a, b) = (dir.join("a"), dir.join("b"));
@@ -1217,7 +1237,7 @@ mod tests {
     /// A reference and an identical target in a fresh temp dir, scanned.
     fn pair(tag: &str) -> (PathBuf, Member, Member) {
         let dir = std::env::temp_dir().join(format!("acz-dedup-{tag}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        fs::remove_dir_all(&dir).ok();
         fs::create_dir_all(&dir).unwrap();
         let data = vec![5u8; 300_000];
         let snap = |name: &str| {
@@ -1258,7 +1278,7 @@ mod tests {
 
     fn temp(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("acz-dedup-{tag}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        fs::remove_dir_all(&dir).ok();
         fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -1329,9 +1349,10 @@ mod tests {
         fs::write(&tp, &data).unwrap();
         let (r, t) = (snap(&out, &rp), snap(&out, &tp));
         let mut bufs = Buffers::default();
-        let ident = match replace(&r, &t, &mut bufs, VerifyMode::Extended, &sys::rename_swap) {
-            Ok(Done::Deduped(ident)) => ident,
-            _ => panic!("not deduped"),
+        let Ok(Done::Deduped(ident)) =
+            replace(&r, &t, &mut bufs, VerifyMode::Extended, &sys::rename_swap)
+        else {
+            panic!("not deduped")
         };
         let m = fs::symlink_metadata(&tp).unwrap();
         assert_eq!(ident, Identity::of(&m));
@@ -1628,7 +1649,7 @@ mod tests {
         assert_eq!(track(&mut p, &mut st, &s(false, 2), "why").len(), 1);
         // An already listed target: no move.
         let mut st = state_with(row(&t, 1, Some(d1)));
-        let mut p = one_group(vec![(rewritten.clone(), State::Quarantined(None))]);
+        let mut p = one_group(vec![(rewritten, State::Quarantined(None))]);
         assert!(track(&mut p, &mut st, &s(true, 2), "why").is_empty());
         assert_eq!(st.rows[Path::new("/r/t")].streak, 1);
         assert_eq!(p.quarantined(), (1, 0));
@@ -1716,12 +1737,12 @@ mod tests {
         let swap = |a: &Path, b: &Path| {
             marked
                 .borrow_mut()
-                .push(crate::compress::has_keep_marker(a.parent().unwrap()));
+                .push(compress::has_keep_marker(a.parent().unwrap()));
             sys::rename_swap(a, b)?;
             if marked.borrow().len() == 1 {
                 // A write through an fd of the old file, now in staging.
                 let f = File::options().append(true).open(a).unwrap();
-                std::io::Write::write_all(&mut &f, b"x").unwrap();
+                io::Write::write_all(&mut &f, b"x").unwrap();
             }
             Ok(())
         };
@@ -1773,13 +1794,12 @@ mod tests {
             sys::rename_swap(a, b)?;
             // A write through an fd of the old file, now in staging: the recheck swaps back.
             let f = File::options().append(true).open(a).unwrap();
-            std::io::Write::write_all(&mut &f, b"x").unwrap();
+            io::Write::write_all(&mut &f, b"x").unwrap();
             Ok(())
         };
         let mut bufs = Buffers::default();
-        let why = match replace(&r, &t, &mut bufs, VerifyMode::Compare, &swap) {
-            Err(Miss::Kept(why)) => why,
-            _ => panic!("not kept"),
+        let Err(Miss::Kept(why)) = replace(&r, &t, &mut bufs, VerifyMode::Compare, &swap) else {
+            panic!("not kept")
         };
         assert_eq!(calls.get(), 2);
         assert!(why.contains("the swap back failed"), "{why}");
@@ -1791,7 +1811,7 @@ mod tests {
         let rescue = &left[0];
         let name = rescue.file_name().unwrap().to_string_lossy().into_owned();
         assert!(name.starts_with(RESCUE_PREFIX), "{name}");
-        assert!(crate::compress::has_keep_marker(rescue));
+        assert!(compress::has_keep_marker(rescue));
         let kept = rescue.join("t");
         assert!(why.ends_with(&kept.display().to_string()), "{why}");
         assert_eq!(fs::symlink_metadata(&kept).unwrap().ino(), t.c.key.ino);

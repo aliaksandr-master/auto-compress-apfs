@@ -16,21 +16,21 @@ use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-pub const STATE_NAME: &str = "state.tsv";
-pub const DEDUP_STATE_NAME: &str = "dedup.tsv";
+pub(crate) const STATE_NAME: &str = "state.tsv";
+pub(crate) const DEDUP_STATE_NAME: &str = "dedup.tsv";
 
 /// A local calendar day, stored as `yyyymmdd`; only compared for equality.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Day(u32);
+pub(crate) struct Day(u32);
 
 impl Day {
-    pub fn new(year: i32, month: u32, day: u32) -> Option<Self> {
+    pub(crate) fn new(year: i32, month: u32, day: u32) -> Option<Self> {
         let ok = (0..=9999).contains(&year) && (1..=12).contains(&month) && (1..=31).contains(&day);
-        ok.then(|| Self(year as u32 * 10_000 + month * 100 + day))
+        ok.then(|| Self(year.cast_unsigned() * 10_000 + month * 100 + day))
     }
 
     /// Parses `YYYY-MM-DD`.
-    pub fn parse(s: &str) -> Option<Self> {
+    pub(crate) fn parse(s: &str) -> Option<Self> {
         let b = s.as_bytes();
         if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
             return None;
@@ -41,7 +41,7 @@ impl Day {
                 .all(|c| c.is_ascii_digit())
                 .then(|| part.parse().ok())?
         };
-        Self::new(num(0..4)? as i32, num(5..7)?, num(8..10)?)
+        Self::new(num(0..4)?.cast_signed(), num(5..7)?, num(8..10)?)
     }
 }
 
@@ -54,7 +54,7 @@ impl fmt::Display for Day {
 
 /// One file compressed by this tool (or found compressed under the patterns).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Row {
+pub(crate) struct Row {
     pub dev: u64,
     pub ino: u64,
     /// Logical size.
@@ -72,7 +72,13 @@ pub struct Row {
 }
 
 impl Row {
-    pub fn new(dev: u64, ino: u64, orig_size: u64, disk_after: u64, compressed_at: i64) -> Self {
+    pub(crate) fn new(
+        dev: u64,
+        ino: u64,
+        orig_size: u64,
+        disk_after: u64,
+        compressed_at: i64,
+    ) -> Self {
         Self {
             dev,
             ino,
@@ -87,14 +93,14 @@ impl Row {
 }
 
 #[derive(Debug, Default)]
-pub struct State {
+pub(crate) struct State {
     pub last_run_day: Option<Day>,
     pub prev_run_day: Option<Day>,
     pub rows: HashMap<PathBuf, Row>,
 }
 
 /// Paths with TAB or LF cannot be stored in the TSV.
-pub fn storable(path: &Path) -> bool {
+pub(crate) fn storable(path: &Path) -> bool {
     !path
         .as_os_str()
         .as_bytes()
@@ -102,6 +108,10 @@ pub fn storable(path: &Path) -> bool {
         .any(|&b| b == b'\t' || b == b'\n')
 }
 
+#[expect(
+    clippy::option_option,
+    reason = "outer None: a malformed field; Some(None): the `-` placeholder"
+)]
 fn day_field(s: &[u8]) -> Option<Option<Day>> {
     match s {
         b"-" => Some(None),
@@ -205,7 +215,7 @@ fn keep(path: &Path, seen: bool, read_dirs: &HashSet<PathBuf>) -> bool {
 
 impl State {
     /// Parses state text; malformed rows and unknown header fields are ignored.
-    pub fn parse(bytes: &[u8]) -> Self {
+    pub(crate) fn parse(bytes: &[u8]) -> Self {
         let mut st = State::default();
         let mut rows = HashMap::new();
         parse_lines(bytes, &mut st.last_run_day, &mut st.prev_run_day, |line| {
@@ -219,24 +229,24 @@ impl State {
 
     /// Loads the state; a missing or empty file is an empty state. A file without the `#v1`
     /// header is an error (`InvalidData`): it is not ours or not this version, never overwritten.
-    pub fn load(path: &Path) -> io::Result<Self> {
+    pub(crate) fn load(path: &Path) -> io::Result<Self> {
         Ok(read_tagged(path, "#v1")?.map_or_else(Self::default, |b| Self::parse(&b)))
     }
 
     /// The run day before `today`: `prev_run_day` when a run already happened today, else
     /// `last_run_day`.
-    pub fn previous_run_day(&self, today: Day) -> Option<Day> {
+    pub(crate) fn previous_run_day(&self, today: Day) -> Option<Day> {
         previous_run_day(self.last_run_day, self.prev_run_day, today)
     }
 
     /// Records that a run happened on `today` (shifts the header days once per day).
-    pub fn mark_run(&mut self, today: Day) {
+    pub(crate) fn mark_run(&mut self, today: Day) {
         mark_run(&mut self.last_run_day, &mut self.prev_run_day, today);
     }
 
     /// Upserts the row of a file just compressed: identity and sizes are replaced, the streak
     /// history is kept. Returns false (nothing stored) for paths with TAB/LF.
-    pub fn record_compressed(&mut self, path: &Path, row: Row) -> bool {
+    pub(crate) fn record_compressed(&mut self, path: &Path, row: Row) -> bool {
         if !storable(path) {
             return false;
         }
@@ -256,7 +266,11 @@ impl State {
     }
 
     /// Atomically writes the state, streaming the rows; with `read_dirs` rows are pruned.
-    pub fn store(&self, path: &Path, read_dirs: Option<&HashSet<PathBuf>>) -> io::Result<()> {
+    pub(crate) fn store(
+        &self,
+        path: &Path,
+        read_dirs: Option<&HashSet<PathBuf>>,
+    ) -> io::Result<()> {
         write_atomic(path, |w| {
             writeln!(
                 w,
@@ -287,7 +301,7 @@ impl State {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Decision {
+pub(crate) enum Decision {
     Compress,
     Quarantine,
 }
@@ -295,7 +309,7 @@ pub enum Decision {
 /// A file with a row (compressed by us before) is found decompressed again on `today`.
 /// The streak counts consecutive run days: unchanged when already counted today, +1 when the
 /// previous count was on the previous run day, else restarts at 1. `threshold` 0 disables.
-pub fn on_redecompressed(
+pub(crate) fn on_redecompressed(
     row: &mut Row,
     today: Day,
     previous_run_day: Option<Day>,
@@ -312,7 +326,7 @@ pub fn on_redecompressed(
 
 /// A file with a row is found compressed: the streak ends, unless it was counted today (a
 /// second run on the same day sees the file this day's first run compressed).
-pub fn on_compressed(row: &mut Row, today: Day) {
+pub(crate) fn on_compressed(row: &mut Row, today: Day) {
     end_streak(&mut row.streak, row.last_found_day, today);
 }
 
@@ -346,7 +360,7 @@ fn decide(streak: u32, threshold: u32) -> Decision {
 /// Identity of a file as found by a walk or after a swap: a rewrite or replacement of the file
 /// changes it (as does any metadata change, through ctime).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Identity {
+pub(crate) struct Identity {
     pub dev: u64,
     pub ino: u64,
     pub ctime_sec: i64,
@@ -354,7 +368,7 @@ pub struct Identity {
 }
 
 impl Identity {
-    pub fn of(m: &fs::Metadata) -> Self {
+    pub(crate) fn of(m: &fs::Metadata) -> Self {
         use std::os::unix::fs::MetadataExt as _;
         Self {
             dev: m.dev(),
@@ -367,7 +381,7 @@ impl Identity {
 
 /// One file this tool deduplicated (made a clone of an identical file).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DedupRow {
+pub(crate) struct DedupRow {
     /// The clone swapped in, or the file as last counted unshared.
     pub ident: Identity,
     /// Unix seconds of the last dedup.
@@ -380,7 +394,7 @@ pub struct DedupRow {
 }
 
 impl DedupRow {
-    pub fn new(ident: Identity, deduped_at: i64) -> Self {
+    pub(crate) fn new(ident: Identity, deduped_at: i64) -> Self {
         Self {
             ident,
             deduped_at,
@@ -394,7 +408,7 @@ impl DedupRow {
 /// `dedup.tsv`: the files deduplicated by this tool, with their own run days (dedup runs on
 /// its own schedule, separate from compress).
 #[derive(Debug, Default)]
-pub struct DedupState {
+pub(crate) struct DedupState {
     pub last_run_day: Option<Day>,
     pub prev_run_day: Option<Day>,
     pub rows: HashMap<PathBuf, DedupRow>,
@@ -422,7 +436,7 @@ fn parse_dedup_row(line: &[u8]) -> Option<(PathBuf, DedupRow)> {
 
 impl DedupState {
     /// Parses dedup state text; malformed rows and unknown header fields are ignored.
-    pub fn parse(bytes: &[u8]) -> Self {
+    pub(crate) fn parse(bytes: &[u8]) -> Self {
         let mut st = DedupState::default();
         let mut rows = HashMap::new();
         parse_lines(bytes, &mut st.last_run_day, &mut st.prev_run_day, |line| {
@@ -436,23 +450,23 @@ impl DedupState {
 
     /// Loads `dedup.tsv`; missing or empty is empty, any header but `#dedup-v1` is
     /// `InvalidData` (never overwritten).
-    pub fn load(path: &Path) -> io::Result<Self> {
+    pub(crate) fn load(path: &Path) -> io::Result<Self> {
         Ok(read_tagged(path, "#dedup-v1")?.map_or_else(Self::default, |b| Self::parse(&b)))
     }
 
     /// See [`State::previous_run_day`].
-    pub fn previous_run_day(&self, today: Day) -> Option<Day> {
+    pub(crate) fn previous_run_day(&self, today: Day) -> Option<Day> {
         previous_run_day(self.last_run_day, self.prev_run_day, today)
     }
 
     /// See [`State::mark_run`].
-    pub fn mark_run(&mut self, today: Day) {
+    pub(crate) fn mark_run(&mut self, today: Day) {
         mark_run(&mut self.last_run_day, &mut self.prev_run_day, today);
     }
 
     /// Upserts the row of a file just deduplicated: identity and time are replaced, the streak
     /// history is kept. Returns false (nothing stored) for paths with TAB/LF.
-    pub fn record_deduped(&mut self, path: &Path, row: DedupRow) -> bool {
+    pub(crate) fn record_deduped(&mut self, path: &Path, row: DedupRow) -> bool {
         if !storable(path) {
             return false;
         }
@@ -472,7 +486,11 @@ impl DedupState {
     }
 
     /// Atomically writes the dedup state; with `read_dirs` rows are pruned (see [`State::store`]).
-    pub fn store(&self, path: &Path, read_dirs: Option<&HashSet<PathBuf>>) -> io::Result<()> {
+    pub(crate) fn store(
+        &self,
+        path: &Path,
+        read_dirs: Option<&HashSet<PathBuf>>,
+    ) -> io::Result<()> {
         write_atomic(path, |w| {
             writeln!(
                 w,
@@ -509,7 +527,7 @@ impl DedupState {
 /// once however many re-dedups fail. An unchanged file is quarantined only while its streak is
 /// current (counted today or on the previous run day: an append that failed is retried).
 /// `threshold` 0 disables.
-pub fn on_unshared(
+pub(crate) fn on_unshared(
     row: &mut DedupRow,
     now: Identity,
     today: Day,
@@ -532,13 +550,13 @@ pub fn on_unshared(
 
 /// Whether the row's streak still counts: last counted today or on the previous run day (an
 /// older count is stale, a later rewrite restarts it).
-pub fn streak_current(row: &DedupRow, today: Day, previous_run_day: Option<Day>) -> bool {
+pub(crate) fn streak_current(row: &DedupRow, today: Day, previous_run_day: Option<Day>) -> bool {
     row.last_found_day == Some(today) || row.last_found_day == previous_run_day
 }
 
 /// A deduplicated file is found sharing its data again: the streak ends, unless it was
 /// counted today.
-pub fn on_shared(row: &mut DedupRow, today: Day) {
+pub(crate) fn on_shared(row: &mut DedupRow, today: Day) {
     end_streak(&mut row.streak, row.last_found_day, today);
 }
 
@@ -552,7 +570,7 @@ mod tests {
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("acz-state-{tag}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        fs::remove_dir_all(&dir).ok();
         dir
     }
 

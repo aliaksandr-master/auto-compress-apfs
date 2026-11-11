@@ -25,6 +25,108 @@ lzfse-sys = "=2.0.0"
 serde = { version = "1", features = ["derive"] }
 toml = "1"
 
+
+
+[lints.rust]
+rust_2018_idioms = { level = "warn", priority = -1 }
+unknown_lints = "deny"
+renamed_and_removed_lints = "deny"
+unfulfilled_lint_expectations = "deny"
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+improper_ctypes = "deny"
+improper_ctypes_definitions = "deny"
+let_underscore_drop = "deny"
+unused_must_use = "deny"
+dropping_references = "deny"
+unconditional_recursion = "deny"
+non_ascii_idents = "deny"
+missing_debug_implementations = "warn"
+missing_docs = "warn"
+unreachable_pub = "warn"
+unused_lifetimes = "warn"
+redundant_lifetimes = "warn"
+single_use_lifetimes = "warn"
+unused_qualifications = "warn"
+trivial_numeric_casts = "warn"
+macro_use_extern_crate = "warn"
+meta_variable_misuse = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage)", "cfg(coverage_nightly)", "cfg(fuzzing)", "cfg(kani)"] }
+
+[lints.clippy]
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+style = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+similar_names = "allow"
+too_many_lines = "allow"
+
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"
+missing_safety_doc = "deny"
+unnecessary_safety_doc = "warn"
+unnecessary_safety_comment = "warn"
+mem_forget = "deny"
+
+let_underscore_must_use = "deny"
+let_underscore_future = "deny"
+await_holding_lock = "deny"
+await_holding_refcell_ref = "deny"
+significant_drop_in_scrutinee = "warn"
+significant_drop_tightening = "warn"
+mutex_atomic = "warn"
+mutex_integer = "warn"
+declare_interior_mutable_const = "deny"
+borrow_interior_mutable_const = "deny"
+rc_mutex = "warn"
+arc_with_non_send_sync = "deny"
+
+redundant_clone = "warn"
+needless_collect = "warn"
+or_fun_call = "warn"
+large_types_passed_by_value = "warn"
+large_stack_arrays = "warn"
+large_futures = "warn"
+trivially_copy_pass_by_ref = "warn"
+needless_pass_by_value = "warn"
+implicit_clone = "warn"
+cloned_instead_of_copied = "warn"
+box_collection = "warn"
+vec_box = "warn"
+rc_buffer = "warn"
+clone_on_ref_ptr = "warn"
+format_collect = "warn"
+string_add = "warn"
+inline_always = "warn"
+
+unwrap_used = "warn"
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+print_stdout = "warn"
+print_stderr = "warn"
+exit = "warn"
+panic_in_result_fn = "warn"
+
+[lints.rustdoc]
+broken_intra_doc_links = "deny"
+private_intra_doc_links = "deny"
+invalid_codeblock_attributes = "deny"
+invalid_rust_codeblocks = "deny"
+invalid_html_tags = "warn"
+bare_urls = "warn"
+missing_crate_level_docs = "warn"
+
 [profile.release]
 lto = "fat"
 codegen-units = 1
