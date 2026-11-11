@@ -6,6 +6,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-11
+
+### Fixed
+
+- The check whether compression saves space can no longer overflow for sizes within 4 KiB of
+  `u64::MAX`.
+- An internal backend routing error now ends `compress --apply` with a message before anything is
+  touched, instead of a panic.
+
+### Changed
+
+- Building from source: the toolchain is pinned in `rust-toolchain.toml`, `make release` builds
+  the `dist` profile (the same settings as `release`), and `make lint` also runs `cargo doc` and
+  `cargo deny check`.
+
 ## [0.4.0] - 2026-11-10
 
 ### Added
@@ -175,7 +190,8 @@ First public release.
 - Archives and other already-compressed formats are excluded by default.
 - Example configs in `examples/`.
 
-[Unreleased]: https://github.com/aliaksandr-master/auto-compress-apfs/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/aliaksandr-master/auto-compress-apfs/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/aliaksandr-master/auto-compress-apfs/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/aliaksandr-master/auto-compress-apfs/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/aliaksandr-master/auto-compress-apfs/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/aliaksandr-master/auto-compress-apfs/releases/tag/v0.2.0
