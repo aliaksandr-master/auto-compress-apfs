@@ -2472,3 +2472,39 @@ fn clean_finds_dedup_leftovers() {
         "{out:?}"
     );
 }
+
+#[test]
+fn cargo_clean_leaves_an_excluded_target_out_of_time_machine() {
+    let env = Env::new("cargo-tmex", "");
+    let proj = env.home.join("src").join("a");
+    let t = proj.join("target");
+    fs::create_dir_all(t.join("debug/.fingerprint/x-0123456789abcdef")).unwrap();
+    fs::write(t.join("debug/.cargo-lock"), "").unwrap();
+    fs::write(proj.join("Cargo.toml"), "[package]\nname = \"a\"\n").unwrap();
+    fs::write(
+        t.join("CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55\n# created by cargo.\n",
+    )
+    .unwrap();
+    let body = fs::read_to_string(&env.config).unwrap();
+    fs::write(
+        &env.config,
+        format!(
+            "{body}\n[cargo_clean]\nroots = [\"{h}/src\"]\nexclude = [\"**/src/a/target\"]\n\
+             exclude_time_machine = true\n",
+            h = env.home.display()
+        ),
+    )
+    .unwrap();
+    let out = env.exec(&["cargo-clean", "--apply"], None);
+    assert!(out.status.success(), "{out:?}");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("excluded 0 target dirs"), "{text}");
+    let x = Command::new("/usr/bin/xattr")
+        .args(["-p", "com.apple.metadata:com_apple_backup_excludeItem"])
+        .arg(&t)
+        .output()
+        .unwrap();
+    assert!(!x.status.success());
+    force_remove(&env.base);
+}

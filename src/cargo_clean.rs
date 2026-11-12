@@ -607,6 +607,13 @@ fn excluded_below(p: &Path, root: &Path, matcher: &Matcher) -> bool {
     false
 }
 
+/// Whether an exclude keeps the whole target at `root` (as `collect` checks it): the root, its
+/// realpath or one of their ancestors.
+pub(crate) fn root_excluded(root: &Path, matcher: &Matcher) -> bool {
+    excluded_at_or_above(root, matcher)
+        || fs::canonicalize(root).is_ok_and(|r| excluded_at_or_above(&r, matcher))
+}
+
 /// Whether an exclude matches `p` or one of its ancestors.
 fn excluded_at_or_above(p: &Path, matcher: &Matcher) -> bool {
     p.ancestors()

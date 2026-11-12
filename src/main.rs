@@ -965,14 +965,15 @@ fn run_remove(
         own: &own,
         trash_dir: &trash_dir,
     };
-    // cargo-clean: the walk finds target directories; their stale entries are the items. The
-    // targets hold the profile locks until the deletes are done.
-    let (matched, targets) = if action == remove::Action::CargoClean {
+    // cargo-clean: the walk finds target directories; their stale entries are the items. One
+    // target at a time is collected, planned and applied, holding only its own profile locks
+    // until its deletes are done (all targets' locks at once exhaust the descriptor limit).
+    let (found, keep_final) = if action == remove::Action::CargoClean {
         let (tags, manifests): (Vec<PathBuf>, Vec<PathBuf>) = walked
             .matched
-            .into_iter()
+            .iter()
             .filter(|m| !m.is_dir)
-            .map(|m| m.path)
+            .map(|m| m.path.clone())
             .partition(|p| p.file_name().is_some_and(|n| n == "CACHEDIR.TAG"));
         let (mut found, untagged) = cargo_clean::target_dirs(&manifests, home);
         for d in &untagged {
@@ -992,44 +993,103 @@ fn run_remove(
             release: cfg.cargo_clean.keep_final_release,
             others: true,
         };
-        let targets =
-            cargo_clean::collect(found, &matcher, cfg.cargo_clean.max_age_secs, keep_final);
-        let mut matched = Vec::new();
-        for t in &targets {
-            for (profile, why) in &t.skipped {
-                log.info(format_args!("{name}: skipped {}: {why}", profile.display()));
-                print_painted(&format!(
-                    "SKIPPED {}: {why}\n",
-                    abbreviate_home(profile, Some(home))
-                ));
-            }
-            matched.extend(t.entries.iter().cloned().filter_map(cargo_clean::matched));
-        }
-        matched.sort_by(|a, b| a.path.cmp(&b.path));
-        (matched, targets)
+        (found, keep_final)
     } else {
-        (walked.matched, Vec::new())
+        (
+            Vec::new(),
+            cargo_clean::KeepFinal {
+                debug: true,
+                release: true,
+                others: true,
+            },
+        )
     };
     if action == remove::Action::CargoClean && cfg.cargo_clean.exclude_time_machine {
-        exclude_targets_from_tm(&targets, &matcher, &guard, &keep, args.apply, log);
-    }
-    log.start_compress(matched.len() as u64, 0);
-    let mut items = remove::plan(matched, &matcher, &guard, &keep, action, &|| log.advance(0));
-    for i in &mut items {
-        if let Some(t) = targets
+        // A target an exclude keeps is left alone here too, as `collect` leaves it.
+        let kept: Vec<(PathBuf, String)> = found
             .iter()
-            .filter(|t| i.path.starts_with(&t.root))
-            .max_by_key(|t| t.root.components().count())
-        {
-            i.rule.clone_from(&t.rule);
-        }
+            .filter(|(r, _)| !cargo_clean::root_excluded(r, &matcher))
+            .cloned()
+            .collect();
+        exclude_targets_from_tm(&kept, &matcher, &guard, &keep, args.apply, log);
     }
+    // The batches: one per target for cargo-clean, else the whole walk.
+    let batches: Vec<Option<(PathBuf, String)>> = if action == remove::Action::CargoClean {
+        found.iter().cloned().map(Some).collect()
+    } else {
+        vec![None]
+    };
+    let mut walked_matched = Some(walked.matched);
+    let journal = cfg.log_dir().join(remove::JOURNAL_NAME);
+    let mut items: Vec<remove::Item> = Vec::new();
+    let mut out = remove::Outcome::default();
+    let mut failed_late = false;
+    for batch in batches {
+        let mut targets = Vec::new();
+        let matched = match batch {
+            Some(t) => {
+                targets = cargo_clean::collect(
+                    vec![t],
+                    &matcher,
+                    cfg.cargo_clean.max_age_secs,
+                    keep_final,
+                );
+                let mut matched = Vec::new();
+                for t in &targets {
+                    for (profile, why) in &t.skipped {
+                        log.info(format_args!("{name}: skipped {}: {why}", profile.display()));
+                        print_painted(&format!(
+                            "SKIPPED {}: {why}\n",
+                            abbreviate_home(profile, Some(home))
+                        ));
+                    }
+                    matched.extend(t.entries.iter().cloned().filter_map(cargo_clean::matched));
+                }
+                matched.sort_by(|a, b| a.path.cmp(&b.path));
+                matched
+            }
+            None => walked_matched.take().unwrap_or_default(),
+        };
+        if matched.is_empty() && action == remove::Action::CargoClean {
+            continue;
+        }
+        log.start_compress(matched.len() as u64, 0);
+        let mut part = remove::plan(matched, &matcher, &guard, &keep, action, &|| log.advance(0));
+        for i in &mut part {
+            if let Some(t) = targets.first() {
+                i.rule.clone_from(&t.rule);
+            }
+        }
+        if args.apply {
+            let o = match remove::apply(&part, action, &trash_dir, &journal, log) {
+                Ok(o) => o,
+                // Earlier targets were already deleted: keep their totals, stop here.
+                Err(e) if out.done + out.failed > 0 => {
+                    log.error(format_args!(
+                        "{name}: stopped after {} items: {e}",
+                        out.done
+                    ));
+                    failed_late = true;
+                    items.extend(part);
+                    break;
+                }
+                Err(e) => {
+                    log.finish_progress(None);
+                    return Err(e);
+                }
+            };
+            out.done += o.done;
+            out.failed += o.failed;
+            out.blocked += o.blocked;
+            out.bytes += o.bytes;
+        }
+        // Releases this target's locks before the next one is taken.
+        drop(targets);
+        items.extend(part);
+    }
+    log.finish_progress(None);
     let blocked = items.iter().filter(|i| i.blocked.is_some()).count() as u64;
-    let out = if args.apply {
-        let journal = cfg.log_dir().join(remove::JOURNAL_NAME);
-        let out = remove::apply(&items, action, &trash_dir, &journal, log);
-        log.finish_progress(None);
-        let out = out?;
+    if args.apply {
         println!(
             "{name}: {} done ({}), {} failed, {} blocked; journal {}",
             out.done,
@@ -1038,9 +1098,8 @@ fn run_remove(
             out.blocked,
             journal.display()
         );
-        out
     } else {
-        log.finish_progress(None);
+        items.sort_by(|a, b| a.path.cmp(&b.path));
         let extra = args.config.as_ref().map_or_else(String::new, |p| {
             format!(" --config {}", shell_quote(&p.display().to_string()))
         });
@@ -1051,12 +1110,11 @@ fn run_remove(
             &format!("{NAME} {name} --apply{extra}"),
             args.verbose,
         ));
-        remove::Outcome {
+        out = remove::Outcome {
             blocked,
             ..Default::default()
-        }
-    };
-    drop(targets);
+        };
+    }
     let (count, bytes) = if args.apply {
         (out.done, out.bytes)
     } else {
@@ -1096,7 +1154,7 @@ fn run_remove(
         out.bytes,
         !args.apply
     ));
-    Ok(if out.failed > 0 {
+    Ok(if out.failed > 0 || failed_late {
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
@@ -1773,7 +1831,7 @@ fn print_painted(text: &str) {
 /// from Time Machine (with `apply`; a preview counts them), as `tm-exclude` does it: the
 /// sticky xattr is created, never replaced or removed.
 fn exclude_targets_from_tm(
-    targets: &[cargo_clean::Target],
+    targets: &[(PathBuf, String)],
     matcher: &walk::Matcher,
     guard: &walk::Guard,
     keep: &remove::Keep<'_>,
@@ -1782,7 +1840,7 @@ fn exclude_targets_from_tm(
 ) {
     let roots: Vec<walk::Matched> = targets
         .iter()
-        .filter_map(|t| cargo_clean::matched(t.root.clone()))
+        .filter_map(|(root, _)| cargo_clean::matched(root.clone()))
         .collect();
     let euid = sys::effective_uid();
     let items = tm_exclude::plan(roots, matcher, guard, keep, euid, log);
