@@ -6,6 +6,27 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-11-12
+
+### Added
+
+- `cargo-clean` finds target directories no manifest names (a `CARGO_TARGET_DIR`) by Cargo's
+  `CACHEDIR.TAG`: below the roots, and one or two levels below a found target.
+- Inside a linked git worktree, `cargo-clean` also removes the stale final artifacts of every
+  profile, release included.
+
+### Changed
+
+- A target directory a manifest names but that lacks Cargo's `CACHEDIR.TAG` is now logged as a
+  warning instead of being skipped silently.
+
+### Fixed
+
+- `cargo-clean` no longer fails with "Too many open files" on many targets: each target is
+  cleaned and its Cargo locks released before the next one.
+- With `exclude_time_machine`, a target directory an `exclude` keeps is no longer excluded from
+  Time Machine.
+
 ## [0.4.1] - 2026-11-11
 
 ### Fixed
@@ -190,7 +211,8 @@ First public release.
 - Archives and other already-compressed formats are excluded by default.
 - Example configs in `examples/`.
 
-[Unreleased]: https://github.com/aliaksandr-master/auto-compress-apfs/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/aliaksandr-master/auto-compress-apfs/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/aliaksandr-master/auto-compress-apfs/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/aliaksandr-master/auto-compress-apfs/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/aliaksandr-master/auto-compress-apfs/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/aliaksandr-master/auto-compress-apfs/compare/v0.2.0...v0.3.0
