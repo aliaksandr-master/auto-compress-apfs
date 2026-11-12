@@ -304,11 +304,13 @@ fn profile_units(
 }
 
 /// Which final artifacts `cargo-clean` keeps whatever their age: those of the `debug` (dev)
-/// and the `release` profile. Other profiles' final artifacts always stay.
+/// and the `release` profile, and those of every other profile (kept outside a git worktree).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct KeepFinal {
     pub debug: bool,
     pub release: bool,
+    /// Every other profile (`false` only inside a git worktree).
+    pub others: bool,
 }
 
 impl KeepFinal {
@@ -317,7 +319,7 @@ impl KeepFinal {
         match profile.file_name().and_then(|n| n.to_str()) {
             Some("debug") => self.debug,
             Some("release") => self.release,
-            _ => true,
+            _ => self.others,
         }
     }
 }
@@ -483,8 +485,14 @@ fn workspace_root(manifest: &Path) -> Option<PathBuf> {
 /// once, with the manifest that named it: `build.target-dir` (default `<workspace>/target`) and
 /// `build.build-dir` of the Cargo config. Only directories carrying Cargo's `CACHEDIR.TAG` are
 /// kept.
-pub(crate) fn target_dirs(manifests: &[PathBuf], home: &Path) -> Vec<(PathBuf, String)> {
+/// The second value lists the existing directories a manifest names that lack the tag (never
+/// cleaned, reported so the skip is visible).
+pub(crate) fn target_dirs(
+    manifests: &[PathBuf],
+    home: &Path,
+) -> (Vec<(PathBuf, String)>, Vec<PathBuf>) {
     let mut out: Vec<(PathBuf, String)> = Vec::new();
+    let mut untagged: Vec<PathBuf> = Vec::new();
     for m in manifests {
         let Some(ws) = workspace_root(m) else {
             continue;
@@ -495,13 +503,93 @@ pub(crate) fn target_dirs(manifests: &[PathBuf], home: &Path) -> Vec<(PathBuf, S
             let Ok(real) = fs::canonicalize(&d) else {
                 continue;
             };
-            if is_cargo_target(&real) && !out.iter().any(|(p, _)| *p == real) {
+            if !is_cargo_target(&real) {
+                if is_real_dir(&real) && !untagged.contains(&real) {
+                    untagged.push(real);
+                }
+            } else if !out.iter().any(|(p, _)| *p == real) {
                 out.push((real, ws.join("Cargo.toml").display().to_string()));
             }
         }
     }
     out.sort();
-    out
+    untagged.sort();
+    (out, untagged)
+}
+
+/// Adds the Cargo target directories no manifest names (a `CARGO_TARGET_DIR`): the parents of
+/// the `CACHEDIR.TAG` files `tags` the walk found, then tagged directories one or two levels
+/// below any found target (`target/dev-stand/<name>`). Each is named by its own tag file. Only
+/// directories with Cargo's tag are added, and never one that holds or lies in a profile of an
+/// already found target (Cargo also tags `target/<triple>`, a part of its target).
+pub(crate) fn add_tagged_targets(found: &mut Vec<(PathBuf, String)>, tags: &[PathBuf]) {
+    let mut profiles: Vec<PathBuf> = found.iter().flat_map(|(r, _)| profile_dirs(r)).collect();
+    let add = |found: &mut Vec<(PathBuf, String)>, profiles: &mut Vec<PathBuf>, d: &Path| {
+        let Ok(real) = fs::canonicalize(d) else {
+            return;
+        };
+        if !is_cargo_target(&real)
+            || found.iter().any(|(p, _)| *p == real)
+            || profiles
+                .iter()
+                .any(|p| p.starts_with(&real) || real.starts_with(p))
+        {
+            return;
+        }
+        profiles.extend(profile_dirs(&real));
+        let rule = real.join("CACHEDIR.TAG").display().to_string();
+        found.push((real, rule));
+    };
+    // Ancestors first: an outer tagged dir is never dropped for holding a nested one's profile.
+    let mut dirs: Vec<&Path> = tags.iter().filter_map(|t| t.parent()).collect();
+    dirs.sort_by_key(|d| d.components().count());
+    for d in dirs {
+        add(found, &mut profiles, d);
+    }
+    let mut i = 0;
+    while i < found.len() {
+        let root = found[i].0.clone();
+        for d in child_dirs(&root) {
+            add(found, &mut profiles, &d);
+            for c in child_dirs(&d) {
+                add(found, &mut profiles, &c);
+            }
+        }
+        i += 1;
+    }
+    found.sort();
+}
+
+/// Whether `dir` lies in a linked git worktree: the nearest `.git` at or above it is a file
+/// whose `gitdir:` names a directory inside a `worktrees` directory that holds `commondir`.
+pub(crate) fn in_worktree(dir: &Path) -> bool {
+    let Some(git) = dir
+        .ancestors()
+        .map(|a| a.join(".git"))
+        .find(|g| fs::symlink_metadata(g).is_ok())
+    else {
+        return false;
+    };
+    if !fs::symlink_metadata(&git).is_ok_and(|m| m.is_file()) {
+        return false;
+    }
+    let mut text = String::new();
+    if File::open(&git)
+        .and_then(|f| f.take(4096).read_to_string(&mut text))
+        .is_err()
+    {
+        return false;
+    }
+    text.lines()
+        .next()
+        .and_then(|l| l.strip_prefix("gitdir:"))
+        .is_some_and(|p| {
+            // Only a linked worktree's gitdir holds `commondir` (a submodule's does not).
+            let g = git.parent().unwrap_or(dir).join(p.trim());
+            g.join("commondir").is_file()
+                && g.parent()
+                    .is_some_and(|d| d.file_name().is_some_and(|n| n == "worktrees"))
+        })
 }
 
 /// Whether an exclude matches `p` or a directory between `root` (not included) and `p`.
@@ -572,6 +660,16 @@ pub(crate) fn collect(
             out.push(t);
             continue;
         }
+        // A worktree's builds are throwaway: every profile's stale final artifacts go too.
+        let keep = if in_worktree(&t.root) {
+            KeepFinal {
+                debug: false,
+                release: false,
+                others: false,
+            }
+        } else {
+            keep
+        };
         match stale_entries(&profiles, cutoff, keep) {
             Err(why) => t.skipped.push((t.root.clone(), why)),
             Ok(entries) => {
@@ -602,6 +700,7 @@ mod tests {
     const KEEP: KeepFinal = KeepFinal {
         debug: true,
         release: true,
+        others: true,
     };
 
     struct Tmp(PathBuf);
@@ -707,11 +806,13 @@ mod tests {
         let rel = KeepFinal {
             debug: true,
             release: false,
+            others: true,
         };
         assert!(finals(rel).is_empty());
         let dbg = KeepFinal {
             debug: false,
             release: true,
+            others: true,
         };
         assert_eq!(finals(dbg), ["app", "app.d", "examples/demo"]);
     }
@@ -840,7 +941,7 @@ mod tests {
         fs::create_dir_all(q.join("target")).unwrap();
         fs::write(q.join("Cargo.toml"), "[package]\nname = \"q\"\n").unwrap();
         file(&d.0.join("z/Cargo.toml"));
-        let got = target_dirs(
+        let (got, untagged) = target_dirs(
             &[
                 ws.join("crates/m/Cargo.toml"),
                 ws.join("Cargo.toml"),
@@ -864,6 +965,7 @@ mod tests {
                 ),
             ]
         );
+        assert_eq!(untagged, vec![real(q.join("target"))]);
     }
 
     const CUTOFF: u64 = 30 * 86_400;
@@ -1017,5 +1119,147 @@ mod tests {
         held.lock().unwrap();
         let got = collect(vec![(t, "r".into())], &m, CUTOFF, KEEP);
         assert!(got[0].entries.is_empty() && got[0].locks.is_empty());
+    }
+
+    #[test]
+    fn untagged_targets_are_reported() {
+        let d = tmp("untagged");
+        let q = d.0.join("q");
+        fs::create_dir_all(q.join("target")).unwrap();
+        fs::write(q.join("Cargo.toml"), "[package]\nname = \"q\"\n").unwrap();
+        let (got, untagged) = target_dirs(&[q.join("Cargo.toml")], &d.0);
+        assert!(got.is_empty());
+        assert_eq!(untagged, vec![fs::canonicalize(q.join("target")).unwrap()]);
+    }
+
+    #[test]
+    fn tagged_dirs_below_a_target_and_from_the_walk_are_added() {
+        let d = tmp("tagged");
+        let outer = target(&d.0);
+        // `target/dev-stand/cargo` (two levels): a tagged target; `target/n` holds a profile, so
+        // it is part of the outer target (like a `<triple>` dir).
+        let nested = target(&outer.join("dev-stand"));
+        fs::rename(&nested, outer.join("dev-stand/cargo")).unwrap();
+        let one = target(&outer.join("tmp"));
+        fs::rename(&one, outer.join("n")).unwrap();
+        fs::remove_dir_all(outer.join("tmp")).unwrap();
+        // A dir with a foreign tag is not Cargo's.
+        file(&outer.join("other/CACHEDIR.TAG"));
+        // A tag the walk found elsewhere (`.var/x`).
+        let var = target(&d.0.join(".var"));
+        fs::rename(&var, d.0.join(".var/x")).unwrap();
+        let real = |x: PathBuf| fs::canonicalize(x).unwrap();
+        let mut found = vec![(real(outer.clone()), "m".to_owned())];
+        add_tagged_targets(&mut found, &[d.0.join(".var/x/CACHEDIR.TAG")]);
+        let roots: Vec<PathBuf> = found.iter().map(|(p, _)| p.clone()).collect();
+        let mut want = vec![
+            real(d.0.join(".var/x")),
+            real(outer.clone()),
+            real(outer.join("dev-stand/cargo")),
+        ];
+        want.sort();
+        assert_eq!(roots, want);
+        // Profiles of the outer target are never taken as nested targets.
+        assert!(!roots.contains(&real(outer.join("debug"))));
+    }
+
+    #[test]
+    fn worktree_detection() {
+        let d = tmp("wt");
+        let main = d.0.join("main");
+        fs::create_dir_all(main.join(".git/worktrees/w")).unwrap();
+        fs::write(main.join(".git/worktrees/w/commondir"), "../..\n").unwrap();
+        let wt = d.0.join("w");
+        fs::create_dir_all(wt.join("sub")).unwrap();
+        fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}\n", main.join(".git/worktrees/w").display()),
+        )
+        .unwrap();
+        assert!(in_worktree(&wt.join("sub")));
+        assert!(!in_worktree(&main));
+        // A submodule's `.git` file points into `modules`, not `worktrees`.
+        let sm = d.0.join("sm");
+        fs::create_dir_all(&sm).unwrap();
+        fs::write(sm.join(".git"), "gitdir: ../main/.git/modules/sm\n").unwrap();
+        assert!(!in_worktree(&sm));
+    }
+
+    #[test]
+    fn a_worktree_target_loses_stale_finals_of_every_profile() {
+        let d = tmp("wtfinal");
+        let main = d.0.join("main");
+        fs::create_dir_all(main.join(".git/worktrees/w")).unwrap();
+        fs::write(main.join(".git/worktrees/w/commondir"), "../..\n").unwrap();
+        let wt = d.0.join("w");
+        fs::create_dir_all(&wt).unwrap();
+        fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}\n", main.join(".git/worktrees/w").display()),
+        )
+        .unwrap();
+        let t = target(&wt);
+        for prof in ["release", "dist"] {
+            let p = t.join(prof);
+            file(&p.join(".fingerprint/x-00000000000000aa/f"));
+            file(&p.join(".cargo-lock"));
+            file(&p.join("bin"));
+            old(&p.join("bin"));
+        }
+        let m = Matcher::new(&[], &[], None).unwrap();
+        let got = collect(vec![(t.clone(), "r".into())], &m, CUTOFF, KEEP);
+        for prof in ["debug", "release", "dist"] {
+            let fin = if prof == "debug" { "app" } else { "bin" };
+            assert!(
+                got[0]
+                    .entries
+                    .contains(&fs::canonicalize(&t).unwrap().join(prof).join(fin))
+                    || got[0].entries.contains(&t.join(prof).join(fin)),
+                "{prof}: {:?}",
+                got[0].entries
+            );
+        }
+        // Outside a worktree the same finals stay.
+        fs::remove_file(wt.join(".git")).unwrap();
+        let got = collect(vec![(t, "r".into())], &m, CUTOFF, KEEP);
+        assert!(
+            !got[0]
+                .entries
+                .iter()
+                .any(|e| e.ends_with("bin") || e.ends_with("app"))
+        );
+    }
+
+    #[test]
+    fn a_tagged_triple_dir_is_not_a_second_target() {
+        let d = tmp("triple");
+        let t = target(&d.0);
+        // Cargo tags `target/<triple>`; its profiles belong to the outer target.
+        let tr = target(&d.0.join("x"));
+        fs::rename(&tr, t.join("aarch64-apple-darwin")).unwrap();
+        // A tag the walk found inside the outer target's profile is not a target either.
+        let inner = target(&d.0.join("y"));
+        fs::create_dir_all(t.join("debug/build/z-0123456789abcdef")).unwrap();
+        fs::rename(&inner, t.join("debug/build/z-0123456789abcdef/out")).unwrap();
+        let real = fs::canonicalize(&t).unwrap();
+        let mut found = vec![(real.clone(), "m".to_owned())];
+        add_tagged_targets(
+            &mut found,
+            &[t.join("debug/build/z-0123456789abcdef/out/CACHEDIR.TAG")],
+        );
+        assert_eq!(found, vec![(real, "m".to_owned())]);
+        let m = Matcher::new(&[], &[], None).unwrap();
+        let got = collect(found, &m, CUTOFF, KEEP);
+        assert!(got.iter().all(|t| t.skipped.is_empty()));
+    }
+
+    #[test]
+    fn a_submodule_named_worktrees_is_not_a_worktree() {
+        let d = tmp("smwt");
+        let sm = d.0.join("worktrees/x");
+        fs::create_dir_all(d.0.join(".git/modules/worktrees/x")).unwrap();
+        fs::create_dir_all(&sm).unwrap();
+        fs::write(sm.join(".git"), "gitdir: ../../.git/modules/worktrees/x\n").unwrap();
+        assert!(!in_worktree(&sm));
     }
 }

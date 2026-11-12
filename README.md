@@ -344,7 +344,13 @@ auto-compress-apfs -h|--help | -V|--version
   `~/.cargo/config.toml`) names another directory, relative to the directory holding `.cargo`;
   `build.build-dir` is cleaned too (a value with a `{...}` template is not resolved, and
   `CARGO_TARGET_DIR` is not read). Such a configured directory is cleaned even when it lies
-  outside the roots. Only directories with the `CACHEDIR.TAG` Cargo writes are touched. In
+  outside the roots. Only directories with the `CACHEDIR.TAG` Cargo writes are touched; a
+  directory a manifest names that lacks the tag is logged as a WARN and left alone. Target dirs
+  no manifest names (a `CARGO_TARGET_DIR`) are found by their tag: a Cargo `CACHEDIR.TAG` met
+  while walking the roots, and tagged directories one or two levels below a found target that
+  are not its profiles (`target/dev-stand/<name>`). Inside a linked git worktree (the nearest
+  `.git` is a file whose `gitdir:` points into a `worktrees` directory and holds `commondir`) the stale final
+  artifacts of every profile go too, whatever `keep_final_*` says. In
   every profile directory (`debug`, `release`, `<triple>/<profile>`, recognised by its
   `.fingerprint`) a build unit is `.fingerprint/<name>-<hash>` plus `build/<name>-<hash>` and
   every `deps` entry with `-<hash>` in its name. A unit is fresh when one of these (or their

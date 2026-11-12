@@ -123,7 +123,10 @@ run = false
 # node_modules are not entered) and reads it: the workspace root (a [workspace] manifest at or
 # above it) gives `<workspace>/target`, unless `build.target-dir` of the nearest
 # .cargo/config.toml (or ~/.cargo/config.toml) says otherwise; `build.build-dir` is cleaned as
-# well. Only directories with Cargo's CACHEDIR.TAG are touched. In each profile dir
+# well. Only directories with Cargo's CACHEDIR.TAG are touched (a named one without it is a
+# WARN). Target dirs no manifest names (CARGO_TARGET_DIR) are found by that tag: below the
+# roots, and one or two levels below a found target (target/dev-stand/<name>). In a git
+# worktree the stale final artifacts of every profile go, whatever keep_final_*. In each profile dir
 # (debug, release, <triple>/<profile>) a build unit, `.fingerprint/<name>-<hash>` with
 # `build/<name>-<hash>` and the `deps` entries of that hash, is deleted when none of them was
 # modified (or a file read) for max_age_secs and no fresh unit was built against it (its

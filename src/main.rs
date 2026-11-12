@@ -106,7 +106,9 @@ their target and build dirs (workspace root, build.target-dir / build.build-dir 
 .cargo/config.toml, only with Cargo's CACHEDIR.TAG) the build units (.fingerprint, build,
 deps, incremental entries) not used for max_age_secs are listed, plus the final debug /
 release artifacts when keep_final_debug / keep_final_release is false; with --apply deleted
-for good, the rest stays. A profile whose .cargo-lock a build holds is skipped.
+for good, the rest stays. A profile whose .cargo-lock a build holds is skipped. Target dirs
+no manifest names (CARGO_TARGET_DIR) are found by their tag; in a git worktree the stale
+final artifacts of every profile go too.
 trash / purge / cargo-clean / dedup show a progress line on a terminal and the totals; -v
 lists every item (and why one is blocked) and mirrors the log to stderr; run -v passes it on.
 tm-exclude: directories matched by the [tm_exclude] patterns are listed; with --apply excluded
@@ -933,7 +935,11 @@ fn run_remove(
     let manifest_matcher = if action == remove::Action::CargoClean {
         let globs: Vec<String> = patterns
             .iter()
-            .map(|r| format!("{}/**/Cargo.toml", r.trim_end_matches('/')))
+            .flat_map(|r| {
+                let r = r.trim_end_matches('/');
+                // A tag names a target dir no manifest does (`CARGO_TARGET_DIR`).
+                [format!("{r}/**/Cargo.toml"), format!("{r}/**/CACHEDIR.TAG")]
+            })
             .collect();
         let mut skip = exclude.to_vec();
         skip.extend(["target", ".git", "node_modules"].map(String::from));
@@ -962,13 +968,20 @@ fn run_remove(
     // cargo-clean: the walk finds target directories; their stale entries are the items. The
     // targets hold the profile locks until the deletes are done.
     let (matched, targets) = if action == remove::Action::CargoClean {
-        let manifests: Vec<PathBuf> = walked
+        let (tags, manifests): (Vec<PathBuf>, Vec<PathBuf>) = walked
             .matched
             .into_iter()
             .filter(|m| !m.is_dir)
             .map(|m| m.path)
-            .collect();
-        let found = cargo_clean::target_dirs(&manifests, home);
+            .partition(|p| p.file_name().is_some_and(|n| n == "CACHEDIR.TAG"));
+        let (mut found, untagged) = cargo_clean::target_dirs(&manifests, home);
+        for d in &untagged {
+            log.warn(format_args!(
+                "{name}: skipped {}: no Cargo CACHEDIR.TAG (not cleaned)",
+                d.display()
+            ));
+        }
+        cargo_clean::add_tagged_targets(&mut found, &tags);
         log.info(format_args!(
             "{name}: {} manifests, {} target dirs",
             manifests.len(),
@@ -977,6 +990,7 @@ fn run_remove(
         let keep_final = cargo_clean::KeepFinal {
             debug: cfg.cargo_clean.keep_final_debug,
             release: cfg.cargo_clean.keep_final_release,
+            others: true,
         };
         let targets =
             cargo_clean::collect(found, &matcher, cfg.cargo_clean.max_age_secs, keep_final);
@@ -1002,7 +1016,11 @@ fn run_remove(
     log.start_compress(matched.len() as u64, 0);
     let mut items = remove::plan(matched, &matcher, &guard, &keep, action, &|| log.advance(0));
     for i in &mut items {
-        if let Some(t) = targets.iter().find(|t| i.path.starts_with(&t.root)) {
+        if let Some(t) = targets
+            .iter()
+            .filter(|t| i.path.starts_with(&t.root))
+            .max_by_key(|t| t.root.components().count())
+        {
             i.rule.clone_from(&t.rule);
         }
     }
